@@ -430,6 +430,8 @@ class Qwen3VLTextAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        image_placeholder_ids_ranges: Optional[list[tuple[int, int]]] = None,
+        num_image_tokens_per_frame: Optional[int] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
@@ -448,10 +450,6 @@ class Qwen3VLTextAttention(nn.Module):
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            image_placeholder_ids_ranges = kwargs.get("image_placeholder_ids_ranges", None)
-            traj_and_text_placeholder_ids_range = kwargs.get("traj_and_text_placeholder_ids_range", None)
-            num_image_tokens_per_frame = kwargs.get("num_image_tokens_per_frame", None)
-
             if image_placeholder_ids_ranges is None:
                 key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
             else:
@@ -463,10 +461,15 @@ class Qwen3VLTextAttention(nn.Module):
                     past_key_values[self.layer_idx][0][:, :, image_placeholder_start:image_placeholder_end, :].copy_(key_states[:, :, new_kv_cache_start:new_kv_cache_end, :])
                     past_key_values[self.layer_idx][1][:, :, image_placeholder_start:image_placeholder_end, :].copy_(value_states[:, :, new_kv_cache_start:new_kv_cache_end, :])
                 
+                print("kv len: ", past_key_values.get_seq_length())
                 total_image_tokens = len(image_placeholder_ids_ranges) * num_image_tokens_per_frame
-                past_key_values[self.layer_idx][0][:, :, traj_and_text_placeholder_ids_range[0]:traj_and_text_placeholder_ids_range[1], :].copy_(key_states[:, :, total_image_tokens:, :])
-                past_key_values[self.layer_idx][1][:, :, traj_and_text_placeholder_ids_range[0]:traj_and_text_placeholder_ids_range[1], :].copy_(value_states[:, :, total_image_tokens:, :])              
+                # past_key_values[self.layer_idx][0] = torch.cat([past_key_values[self.layer_idx][0], key_states[:, :, total_image_tokens:, :]], dim=2)
+                # past_key_values[self.layer_idx][1] = torch.cat([past_key_values[self.layer_idx][1], value_states[:, :, total_image_tokens:, :]], dim=2)
+                key_states, value_states = past_key_values.update(key_states[:, :, total_image_tokens:, :], value_states[:, :, total_image_tokens:, :], self.layer_idx, cache_kwargs)
+
+                # key_states, value_states = past_key_values[self.layer_idx]             
         
+        print(f"key_states: {key_states.shape}, value_states: {value_states.shape}")
         query_states = apply_mrope_emb_single(query_states, cos_q, sin_q)
         key_states = apply_mrope_emb_single(key_states, cos, sin)
 
@@ -527,6 +530,9 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        image_placeholder_ids_ranges: Optional[list[tuple[int, int]]] = None,
+        traj_and_text_placeholder_ids_range: Optional[tuple[int, int]] = None,
+        num_image_tokens_per_frame: Optional[int] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -540,6 +546,9 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            image_placeholder_ids_ranges=image_placeholder_ids_ranges,
+            traj_and_text_placeholder_ids_range=traj_and_text_placeholder_ids_range,
+            num_image_tokens_per_frame=num_image_tokens_per_frame,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -826,6 +835,9 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         # args for deepstack
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+        image_placeholder_ids_ranges: Optional[list[tuple[int, int]]] = None,
+        traj_and_text_placeholder_ids_range: Optional[tuple[int, int]] = None,
+        num_image_tokens_per_frame: Optional[int] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
         r"""
@@ -858,7 +870,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-        print("position_ids: ", position_ids.shape)
+        
 
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             text_position_ids = position_ids[0]
@@ -870,6 +882,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         last_token_id = cache_position[-1]
         position_ids = torch.arange(0, last_token_id + 1, dtype=torch.long).to(cache_position.device)
         position_ids = position_ids.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+        print("position_ids: ", position_ids.shape)
 
         attention_mask = create_causal_mask(
             config=self.config,
@@ -895,6 +908,9 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                image_placeholder_ids_ranges=image_placeholder_ids_ranges,
+                traj_and_text_placeholder_ids_range=traj_and_text_placeholder_ids_range,
+                num_image_tokens_per_frame=num_image_tokens_per_frame,
                 **kwargs,
             )
             hidden_states = layer_outputs
@@ -1216,6 +1232,11 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+        visual_pos_masks: Optional[torch.Tensor] = None,
+        image_placeholder_ids_ranges: Optional[list[tuple[int, int]]] = None,
+        traj_and_text_placeholder_ids_range: Optional[tuple[int, int]] = None,
+        num_image_tokens_per_frame: Optional[int] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLModelOutputWithPast]:
         r"""
@@ -1230,48 +1251,48 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        image_mask = None
-        video_mask = None
+            image_mask = None
+            video_mask = None
 
-        if pixel_values is not None:
-            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            if pixel_values is not None:
+                image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+                image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                image_mask, _ = self.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        if pixel_values_videos is not None:
-            video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            if pixel_values_videos is not None:
+                video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+                video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                _, video_mask = self.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        visual_pos_masks = None
-        deepstack_visual_embeds = None
-        if image_mask is not None and video_mask is not None:
-            # aggregate visual_pos_masks and deepstack_visual_embeds
-            image_mask = image_mask[..., 0]
-            video_mask = video_mask[..., 0]
-            visual_pos_masks = image_mask | video_mask
-            deepstack_visual_embeds = []
-            image_mask_joint = image_mask[visual_pos_masks]
-            video_mask_joint = video_mask[visual_pos_masks]
-            for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
-                embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
-                embed_joint[image_mask_joint, :] = img_embed
-                embed_joint[video_mask_joint, :] = vid_embed
-                deepstack_visual_embeds.append(embed_joint)
-        elif image_mask is not None:
-            image_mask = image_mask[..., 0]
-            visual_pos_masks = image_mask
-            deepstack_visual_embeds = deepstack_image_embeds
-        elif video_mask is not None:
-            video_mask = video_mask[..., 0]
-            visual_pos_masks = video_mask
-            deepstack_visual_embeds = deepstack_video_embeds
+            visual_pos_masks = None
+            deepstack_visual_embeds = None
+            if image_mask is not None and video_mask is not None:
+                # aggregate visual_pos_masks and deepstack_visual_embeds
+                image_mask = image_mask[..., 0]
+                video_mask = video_mask[..., 0]
+                visual_pos_masks = image_mask | video_mask
+                deepstack_visual_embeds = []
+                image_mask_joint = image_mask[visual_pos_masks]
+                video_mask_joint = video_mask[visual_pos_masks]
+                for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
+                    embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
+                    embed_joint[image_mask_joint, :] = img_embed
+                    embed_joint[video_mask_joint, :] = vid_embed
+                    deepstack_visual_embeds.append(embed_joint)
+            elif image_mask is not None:
+                image_mask = image_mask[..., 0]
+                visual_pos_masks = image_mask
+                deepstack_visual_embeds = deepstack_image_embeds
+            elif video_mask is not None:
+                video_mask = video_mask[..., 0]
+                visual_pos_masks = video_mask
+                deepstack_visual_embeds = deepstack_video_embeds
 
         if position_ids is None:
             attention_mask_tensor = (
@@ -1328,6 +1349,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             cache_position=cache_position,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
+            image_placeholder_ids_ranges=image_placeholder_ids_ranges,
+            traj_and_text_placeholder_ids_range=traj_and_text_placeholder_ids_range,
+            num_image_tokens_per_frame=num_image_tokens_per_frame,
             **kwargs,
         )
 
@@ -1428,6 +1452,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         video_grid_thw: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        visual_pos_masks: Optional[torch.Tensor] = None,
+        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+        image_placeholder_ids_ranges = None,
+        traj_and_text_placeholder_ids_range = None,
+        num_image_tokens_per_frame = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
         r"""
@@ -1443,6 +1472,9 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         Example:
             TODO: Add example
         """
+        if inputs_embeds is not None:
+            assert visual_pos_masks is not None and deepstack_visual_embeds is not None, "visual_pos_masks and deepstack_visual_embeds must be provided when inputs_embeds is provided"
+        
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -1454,6 +1486,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            image_placeholder_ids_ranges=image_placeholder_ids_ranges,
+            traj_and_text_placeholder_ids_range=traj_and_text_placeholder_ids_range,
+            num_image_tokens_per_frame=num_image_tokens_per_frame,
             **kwargs,
         )
 

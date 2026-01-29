@@ -120,6 +120,9 @@ class AlpamayoR1(ReasoningVLA):
 
         self.past_key_values = None
     
+    def _set_processor(self, processor):
+        self.processor = processor
+    
     def embed_tokens(self, 
         input_ids: torch.LongTensor, 
         pixel_values: torch.Tensor, 
@@ -188,11 +191,11 @@ class AlpamayoR1(ReasoningVLA):
             image_token_ids_per_view_ranges.append((image_token_start, image_token_end))
 
             image_placeholder_end = first_frame_start + num_image_tokens_per_view
-            image_placeholder_start = image_token_end - num_image_tokens_per_frame
+            image_placeholder_start = image_placeholder_end - num_image_tokens_per_frame
             image_placeholder_ids_ranges.append((image_placeholder_start, image_placeholder_end))
 
-        traj_and_text_ids_range = (all_image_end, input_ids.shape[1])
-        return first_frame_ids_ranges, image_token_ids_per_view_ranges, image_placeholder_ids_ranges, traj_and_text_ids_range, num_image_tokens_per_frame
+        traj_and_text_placeholder_ids_range = (all_image_end, input_ids.shape[1])
+        return first_frame_ids_ranges, image_token_ids_per_view_ranges, image_placeholder_ids_ranges, traj_and_text_placeholder_ids_range, num_image_tokens_per_frame
     
     def update_past_key_values(self, first_frame_ids_ranges, image_token_ids_per_view_ranges, image_placeholder_ids_ranges, traj_and_text_ids_range):
         """Update the past key values.
@@ -204,6 +207,9 @@ class AlpamayoR1(ReasoningVLA):
         """
         # Create mask once for all layers
         batch_size, num_kv_heads, seq_len, head_dim = self.past_key_values[0][0].shape
+        mask = torch.ones(seq_len, device=self.past_key_values[0][0].device, dtype=torch.bool)
+        last_image_token_id = image_token_ids_per_view_ranges[-1][1]
+        mask[last_image_token_id:] = False
 
         evicted_image_kv_len = first_frame_ids_ranges[0][1] - first_frame_ids_ranges[0][0]
         evicted_text_kv_len = traj_and_text_ids_range[1] - traj_and_text_ids_range[0]
@@ -218,8 +224,8 @@ class AlpamayoR1(ReasoningVLA):
             key_cache = self.past_key_values[layer_idx][0]  # shape [1, 20, seq_len, 128]
             value_cache = self.past_key_values[layer_idx][1]
 
-            new_key_cache = torch.empty_like(key_cache)
-            new_value_cache = torch.empty_like(value_cache)
+            new_key_cache = torch.empty_like(key_cache[:, :, mask, :])  # we discard the trajectory and text tokens after the last image token
+            new_value_cache = torch.empty_like(value_cache[:, :, mask, :])
 
             new_key_cache[:, :, :first_frame_ids_ranges[0][0], :].copy_(key_cache[:, :, :first_frame_ids_ranges[0][0], :])
             new_value_cache[:, :, :first_frame_ids_ranges[0][0], :].copy_(value_cache[:, :, :first_frame_ids_ranges[0][0], :])
@@ -236,9 +242,6 @@ class AlpamayoR1(ReasoningVLA):
                 image_place_holder_key_cache[:, :, place_holder_start:place_holder_end, :].copy_(image_place_holder_key_cache)
                 image_place_holder_value_cache[:, :, place_holder_start:place_holder_end, :].copy_(image_place_holder_value_cache)
 
-            new_key_cache[:, :, traj_and_text_ids_range[0]:traj_and_text_ids_range[1]].copy_(traj_and_text_place_holder_key_cache)
-            new_value_cache[:, :, traj_and_text_ids_range[0]:traj_and_text_ids_range[1]].copy_(traj_and_text_place_holder_value_cache)
-            
             new_past_key_values.append((new_key_cache, new_value_cache))
         self.past_key_values = tuple(new_past_key_values)
     
@@ -330,12 +333,12 @@ class AlpamayoR1(ReasoningVLA):
             ]
         )
 
-        first_frame_ids_ranges, image_token_ids_per_view_ranges, image_placeholder_ids_ranges, traj_and_text_ids_range, num_image_tokens_per_frame = self._retrieve_streaming_related_inputs(input_ids)
+        first_frame_ids_ranges, image_token_ids_per_view_ranges, image_placeholder_ids_ranges, traj_and_text_placeholder_ids_range, num_image_tokens_per_frame = self._retrieve_streaming_related_inputs(input_ids)
         if first_frame_ids_ranges is not None:
             print(f"first_frame_ids_ranges: {first_frame_ids_ranges}")
             print(f"image_token_ids_per_view_ranges: {image_token_ids_per_view_ranges}")
             print(f"image_placeholder_ids_ranges: {image_placeholder_ids_ranges}")
-            print(f"traj_and_text_ids_range: {traj_and_text_ids_range}")
+            print(f"traj_and_text_placeholder_ids_range: {traj_and_text_placeholder_ids_range}")
             print(f"num_image_tokens_per_frame: {num_image_tokens_per_frame}")
 
         inputs_embeds, deepstack_visual_embeds, visual_pos_masks = self.embed_tokens(
@@ -346,7 +349,7 @@ class AlpamayoR1(ReasoningVLA):
             video_grid_thw=tokenized_data.get("video_grid_thw", None),
         )
 
-        cache_position = self.create_cache_position(image_placeholder_ids_ranges, traj_and_text_ids_range)
+        cache_position = self.create_cache_position(image_placeholder_ids_ranges, traj_and_text_placeholder_ids_range)
         if cache_position is not None:
             cache_position = cache_position.to(device)
             print(f"cache_position: {cache_position}")
@@ -361,7 +364,7 @@ class AlpamayoR1(ReasoningVLA):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
             image_placeholder_ids_ranges=image_placeholder_ids_ranges,
-            traj_and_text_ids_range=traj_and_text_ids_range,
+            traj_and_text_placeholder_ids_range=traj_and_text_placeholder_ids_range,
             num_image_tokens_per_frame=num_image_tokens_per_frame,
             cache_position=cache_position,
         )
@@ -486,6 +489,11 @@ class AlpamayoR1(ReasoningVLA):
             pred_rot, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
         )
 
+        # update the past key values
+        print("before update the past key values: ", self.past_key_values[0][0].shape)
+        self.update_past_key_values(first_frame_ids_ranges, image_token_ids_per_view_ranges, image_placeholder_ids_ranges, traj_and_text_placeholder_ids_range)
+        print(f"after update the past key values: {self.past_key_values[0][0].shape}")
+
         # return the text tokens generated by the VLM
         if kwargs.get("return_extra", False):
             extra = extract_text_tokens(self.tokenizer, vlm_outputs.sequences)
@@ -495,13 +503,8 @@ class AlpamayoR1(ReasoningVLA):
                     [input_ids.shape[0], num_traj_sets, num_traj_samples]
                 )
             return pred_xyz, pred_rot, extra
-        
-        # update the past key values
-        print("update the past key values")
-        self.update_past_key_values(first_frame_ids_ranges, image_token_ids_per_view_ranges, image_placeholder_ids_ranges, traj_and_text_ids_range)
-
         return pred_xyz, pred_rot
-
-
+        
+        
 AutoConfig.register("alpamayo_r1", AlpamayoR1Config)
 AutoModel.register(AlpamayoR1Config, AlpamayoR1)
