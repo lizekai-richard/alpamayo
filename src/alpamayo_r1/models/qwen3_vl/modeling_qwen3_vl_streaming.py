@@ -437,7 +437,6 @@ class Qwen3VLTextAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         q_len = hidden_states.shape[1]
-        print("q_len: ", q_len)
 
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
@@ -450,9 +449,9 @@ class Qwen3VLTextAttention(nn.Module):
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            if image_placeholder_ids_ranges is None:
+            if image_placeholder_ids_ranges is None or q_len == 1:  # either first prefill or the decoding step
                 key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            else:
+            else:  # streaming prefill
                 for i in range(len(image_placeholder_ids_ranges)):
                     new_kv_cache_start = i * num_image_tokens_per_frame
                     new_kv_cache_end = new_kv_cache_start + num_image_tokens_per_frame
@@ -461,15 +460,9 @@ class Qwen3VLTextAttention(nn.Module):
                     past_key_values[self.layer_idx][0][:, :, image_placeholder_start:image_placeholder_end, :].copy_(key_states[:, :, new_kv_cache_start:new_kv_cache_end, :])
                     past_key_values[self.layer_idx][1][:, :, image_placeholder_start:image_placeholder_end, :].copy_(value_states[:, :, new_kv_cache_start:new_kv_cache_end, :])
                 
-                print("kv len: ", past_key_values.get_seq_length())
                 total_image_tokens = len(image_placeholder_ids_ranges) * num_image_tokens_per_frame
-                # past_key_values[self.layer_idx][0] = torch.cat([past_key_values[self.layer_idx][0], key_states[:, :, total_image_tokens:, :]], dim=2)
-                # past_key_values[self.layer_idx][1] = torch.cat([past_key_values[self.layer_idx][1], value_states[:, :, total_image_tokens:, :]], dim=2)
-                key_states, value_states = past_key_values.update(key_states[:, :, total_image_tokens:, :], value_states[:, :, total_image_tokens:, :], self.layer_idx, cache_kwargs)
-
-                # key_states, value_states = past_key_values[self.layer_idx]             
+                key_states, value_states = past_key_values.update(key_states[:, :, total_image_tokens:, :], value_states[:, :, total_image_tokens:, :], self.layer_idx, cache_kwargs)        
         
-        print(f"key_states: {key_states.shape}, value_states: {value_states.shape}")
         query_states = apply_mrope_emb_single(query_states, cos_q, sin_q)
         key_states = apply_mrope_emb_single(key_states, cos, sin)
 
@@ -882,7 +875,6 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         last_token_id = cache_position[-1]
         position_ids = torch.arange(0, last_token_id + 1, dtype=torch.long).to(cache_position.device)
         position_ids = position_ids.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
-        print("position_ids: ", position_ids.shape)
 
         attention_mask = create_causal_mask(
             config=self.config,
@@ -896,7 +888,6 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
-        print("last_token_id:", cache_position[-1])
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
@@ -1293,6 +1284,18 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 video_mask = video_mask[..., 0]
                 visual_pos_masks = video_mask
                 deepstack_visual_embeds = deepstack_video_embeds
+        # else:
+        #     # In this case, we always have visual_pos_masks and deepstack_visual_embeds
+        #     # We need to extract the visual_pos_masks and deepstack_visual_embeds corresponding to the inputs_embeds
+        #     effective_visual_pos_masks = []
+        #     effective_deepstack_visual_embeds = []
+        #     for i in range(len(image_placeholder_ids_ranges)):
+        #         image_token_start = image_placeholder_ids_ranges[i][0] + 1  # we have to exclude the <vision_start> token
+        #         image_token_end = image_placeholder_ids_ranges[i][1] - 1  # we have to exclude the <vision_end> token
+        #         effective_visual_pos_masks.append(visual_pos_masks[:, image_token_start:image_token_end])
+        #     visual_pos_masks = torch.cat(effective_visual_pos_masks, dim=1)
+            # num_image_embeddings = 
+
 
         if position_ids is None:
             attention_mask_tensor = (

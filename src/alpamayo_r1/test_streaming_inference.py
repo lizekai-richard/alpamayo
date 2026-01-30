@@ -139,12 +139,17 @@ def run_streaming_inference(streaming_inputs):
         ego_history_rot = pred_rot[0][:, :, :16, :, :]
         pred_xyzs.append(pred_xyz[0])
         pred_rots.append(pred_rot[0])
+        
+        gt_xy = data["ego_future_xyz"].cpu()[0, 0, :, :2].T.numpy()
+        pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
+        diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
+        min_ade = diff.min()
+        print("minADE:", min_ade, "meters")
     return pred_xyzs, pred_rots
 
 
 def test_streaming_inference():
     streaming_inputs = create_sliding_window_input(2, data)
-    print(torch.cuda.memory_summary(device="cuda", abbreviated=True))
     pred_xyzs, pred_rots = run_streaming_inference(streaming_inputs)
     # print("pred_xyzs: ", pred_xyzs.shape)
     # print("pred_rots: ", pred_rots.shape)
