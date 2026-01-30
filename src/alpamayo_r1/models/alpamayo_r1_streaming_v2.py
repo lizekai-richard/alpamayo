@@ -15,7 +15,6 @@
 
 import copy
 import logging
-from dataclasses import dataclass
 from typing import Any
 
 import einops
@@ -38,33 +37,225 @@ from alpamayo_r1.models.token_utils import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class StreamingState:
-    """Streaming inference state for KV cache management."""
+# ==============================================================================
+# Flex Attention Masks for Multi-View VLM
+# ==============================================================================
 
-    # Token ranges for each view (excluding <vision_start>/<vision_end>)
-    view_ranges: list[tuple[int, int]]  # [(start, end), ...] for each view
-    # Number of tokens per frame
-    tokens_per_frame: int
-    # Number of frames per view
-    frames_per_view: int
-    # Start position of trajectory and text tokens
-    traj_text_start: int
 
-    @property
-    def tokens_per_view(self) -> int:
-        """Total tokens per view."""
-        return self.tokens_per_frame * self.frames_per_view
+def create_causal_mask_mod():
+    """Create a standard causal mask_mod for first prefill."""
+    def mask_mod(_b, _h, q_idx, kv_idx):
+        return kv_idx <= q_idx
+    return mask_mod
 
-    def get_evict_range(self, view_idx: int) -> tuple[int, int]:
-        """Get the range of the first frame to evict for a view."""
-        start = self.view_ranges[view_idx][0]
-        return (start, start + self.tokens_per_frame)
 
-    def get_placeholder_range(self, view_idx: int) -> tuple[int, int]:
-        """Get the range for the new frame placeholder for a view."""
-        end = self.view_ranges[view_idx][1]
-        return (end - self.tokens_per_frame, end)
+def create_causal_block_mask(
+    q_len: int,
+    device: torch.device = None,
+    _compile: bool = False,
+):
+    """
+    Create a causal block mask for first prefill.
+
+    Args:
+        q_len: Total length of query sequence
+        device: Device to create the mask on
+        _compile: Whether to compile the mask function
+
+    Returns:
+        BlockMask for use with flex_attention
+
+    Example:
+        # First prefill with full sequence
+        mask = create_causal_block_mask(q_len=seq_len, device=device)
+    """
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+    except ImportError:
+        raise ImportError(
+            "flex_attention requires PyTorch 2.5+. "
+            "Please upgrade PyTorch to use flex attention."
+        )
+
+    mask_mod = create_causal_mask_mod()
+
+    block_mask = create_block_mask(
+        mask_mod,
+        B=None,
+        H=None,
+        Q_LEN=q_len,
+        KV_LEN=q_len,
+        device=device,
+        _compile=_compile,
+    )
+
+    return block_mask
+
+
+# ==============================================================================
+# Streaming Attention Mask
+# ==============================================================================
+#
+# Layout:
+#   KV Cache: [sys] [v0:f1-3] [v1:f1-3] [v2:f1-3] [v3:f1-3]
+#   Query:    [v0:f4] [v1:f4] [v2:f4] [v3:f4] [suffix]
+#
+# Attention rules:
+#   - v_i (new frame) → sys + v_0..v_{i-1} (full) + v_i (causal within)
+#   - suffix → sys + all images + suffix (causal within)
+#
+# ==============================================================================
+
+
+def create_streaming_mask_mod(
+    sys_len: int,
+    kv_len: int,
+    num_views: int = 4,
+    tokens_per_frame: int = 180,
+    frames_in_kv: int = 3,
+):
+    """
+    Create a mask_mod function for streaming multi-view attention.
+
+    Args:
+        sys_len: Length of system tokens in KV cache
+        kv_len: Total length of KV cache
+        num_views: Number of camera views (default: 4)
+        tokens_per_frame: Tokens per frame after spatial merge (default: 180)
+        frames_in_kv: Frames per view in KV cache (default: 3)
+
+    Returns:
+        A mask_mod function compatible with flex_attention
+    """
+    # KV cache layout: [sys] [v0: frames_in_kv frames] [v1: ...] ...
+    tokens_per_view_kv = frames_in_kv * tokens_per_frame
+
+    # Query layout: [v0:new_frame] [v1:new_frame] ... [suffix]
+    q_images_len = num_views * tokens_per_frame
+    q_suffix_start = q_images_len
+
+    def mask_mod(_b, _h, q_idx, kv_idx):
+        # ===== Determine query token type =====
+        q_is_image = q_idx < q_suffix_start
+        if q_is_image:
+            q_view = q_idx // tokens_per_frame
+            q_local = q_idx % tokens_per_frame
+        else:
+            q_view = -1
+            q_local = q_idx - q_suffix_start
+
+        # ===== KV in cache =====
+        if kv_idx < kv_len:
+            # Sys tokens: everyone can attend
+            if kv_idx < sys_len:
+                return True
+
+            # Image tokens in KV cache
+            kv_offset = kv_idx - sys_len
+            kv_view = kv_offset // tokens_per_view_kv
+
+            if q_is_image:
+                # Image query: can attend to views <= own view
+                return kv_view <= q_view
+            else:
+                # Suffix query: can attend to all images
+                return True
+
+        # ===== KV in query (Q-Q attention) =====
+        kv_q_idx = kv_idx - kv_len
+        kv_is_image = kv_q_idx < q_suffix_start
+
+        if q_is_image:
+            # Image query attending to query tokens
+            if kv_is_image:
+                kv_view = kv_q_idx // tokens_per_frame
+                kv_local = kv_q_idx % tokens_per_frame
+                if kv_view < q_view:
+                    return True  # Previous views: full attention
+                elif kv_view == q_view:
+                    return kv_local <= q_local  # Same view: causal
+                else:
+                    return False  # Future views: no attention
+            else:
+                return False  # Image cannot attend to suffix
+        else:
+            # Suffix query
+            if kv_is_image:
+                return True  # Suffix can see all images
+            else:
+                # Causal within suffix
+                kv_local = kv_q_idx - q_suffix_start
+                return kv_local <= q_local
+
+    return mask_mod
+
+
+def create_streaming_block_mask(
+    sys_len: int,
+    kv_len: int,
+    q_len: int,
+    num_views: int = 4,
+    tokens_per_frame: int = 180,
+    frames_in_kv: int = 3,
+    device: torch.device = None,
+    _compile: bool = False,
+):
+    """
+    Create a block mask for streaming multi-view attention.
+
+    Args:
+        sys_len: Length of system tokens in KV cache
+        kv_len: Total length of KV cache
+        q_len: Total length of query (new frames + suffix)
+        num_views: Number of camera views (default: 4)
+        tokens_per_frame: Tokens per frame after spatial merge (default: 180)
+        frames_in_kv: Frames per view in KV cache (default: 3)
+        device: Device to create the mask on
+        _compile: Whether to compile the mask function (for performance)
+
+    Returns:
+        BlockMask for use with flex_attention
+
+    Example:
+        # KV cache has sys (128) + 4 views × 3 frames × 180 tokens
+        # Query has 4 new frames + suffix (100)
+        mask = create_streaming_block_mask(
+            sys_len=128,
+            kv_len=128 + 4*3*180,  # 2288
+            q_len=4*180 + 100,      # 820
+            device=device,
+        )
+    """
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+    except ImportError:
+        raise ImportError(
+            "flex_attention requires PyTorch 2.5+. "
+            "Please upgrade PyTorch to use streaming attention."
+        )
+
+    mask_mod = create_streaming_mask_mod(
+        sys_len=sys_len,
+        kv_len=kv_len,
+        num_views=num_views,
+        tokens_per_frame=tokens_per_frame,
+        frames_in_kv=frames_in_kv,
+    )
+
+    # Total KV length = KV cache + query (for Q-Q attention)
+    total_kv_len = kv_len + q_len
+
+    block_mask = create_block_mask(
+        mask_mod,
+        B=None,
+        H=None,
+        Q_LEN=q_len,
+        KV_LEN=total_kv_len,
+        device=device,
+        _compile=_compile,
+    )
+
+    return block_mask
 
 
 class ExpertLogitsProcessor(LogitsProcessor):
@@ -148,182 +339,84 @@ class AlpamayoR1(ReasoningVLA):
 
         self.post_init()
 
-        # Streaming state
         self.past_key_values = None
-        self.streaming_state: StreamingState | None = None
-
-        # Constants for streaming
+        self.first_frames_ids_ranges = None
+        self.traj_and_text_ids_range = None
         self.num_views = 4
         self.num_frames_per_view = 4
-        self.tokens_per_frame = 180  # After spatial merge
+        self.num_image_tokens_per_frame = 180
     
     def _set_processor(self, processor):
+        """Set the processor for the model.
+        """
         self.processor = processor
     
-    def embed_tokens(
-        self,
-        input_ids: torch.LongTensor,
-        pixel_values: torch.Tensor,
+    @torch.inference_mode()
+    def embed_tokens(self, 
+        input_ids: torch.LongTensor, 
+        pixel_values: torch.Tensor, 
         image_grid_thw: torch.LongTensor,
-        pixel_values_videos: torch.Tensor,
-        video_grid_thw: torch.LongTensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed input tokens with visual features.
-
-        Args:
-            input_ids: The input IDs.
-            pixel_values: The pixel values.
-            image_grid_thw: The image grid THW.
-            pixel_values_videos: The pixel values of the videos.
-            video_grid_thw: The video grid THW.
-
-        Returns:
-            inputs_embeds: The inputs embeds.
-            deepstack_visual_embeds: The deepstack visual embeds.
-            visual_pos_masks: The visual pos masks.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed the input IDs, pixel values, and image grid THW into a tensor of shape (B, T, D).
         """
-        inputs_embeds, _, _, deepstack_visual_embeds, visual_pos_masks = self.vlm.embed_tokens(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
+        
+        inputs_embeds = self.vlm.get_input_embeddings()(input_ids)  # we only embed the new tokens
+
+        if self.past_key_values is not None:
+            vision_start_token_id = self.processor.tokenizer.encode('<|vision_start|>')[0]
+            first_image_token_position = torch.where(input_ids == vision_start_token_id)[1][0]
+            inputs_embeds = inputs_embeds[:, first_image_token_position:]  # exclude system prompt
+        image_embeds, deepstack_image_embeds = self.vlm.get_image_features(pixel_values, image_grid_thw)
+        image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        image_mask, _ = self.vlm.get_placeholder_mask(
+            input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
         )
-        return inputs_embeds, deepstack_visual_embeds, visual_pos_masks
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        image_mask = image_mask[..., 0]
+        visual_pos_masks = image_mask
+        return inputs_embeds, deepstack_image_embeds, visual_pos_masks
     
-    def _get_image_token_id(self) -> int:
-        """Get the image token ID from tokenizer."""
-        if hasattr(self.processor.tokenizer, "image_token"):
-            token = self.processor.tokenizer.image_token
-        else:
-            token = "<|image_pad|>"
-        return self.processor.tokenizer.encode(token)[0]
-
-    def _compute_streaming_state(self, input_ids: torch.Tensor) -> StreamingState:
-        """Compute streaming state from input_ids.
-
-        For the first generation step, we follow the original prefill logic.
-        For subsequent streaming steps, new KV cache (one frame per view) will be
-        inserted in every view range. The trajectory history and text will also be recomputed.
-
-        Args:
-            input_ids: The input IDs tensor.
-
-        Returns:
-            StreamingState containing view ranges and token counts.
+    def create_cache_position(self, input_ids: torch.LongTensor) -> torch.LongTensor:
+        """Create the cache position for the input IDs.
         """
-        image_token_id = self._get_image_token_id()
-        mask = input_ids == image_token_id
-        total_image_tokens = mask.sum().item()
-
-        # Calculate tokens per view and per frame
-        tokens_per_view = (total_image_tokens + self.num_views - 1) // self.num_views
-        tokens_per_frame = (tokens_per_view + self.num_frames_per_view - 1) // self.num_frames_per_view
-
-        # Get all positions where image tokens occur
-        image_token_positions = torch.where(mask)[1]
-        all_image_start = image_token_positions[0].item()
-        all_image_end = image_token_positions[-1].item()
-
-        # Calculate view ranges (including special tokens between frames)
-        # Each frame has 2 special tokens (<vision_end> + <vision_start>) between them
-        view_ranges = []
-        for i in range(self.num_views):
-            # Account for special tokens: each frame has 2 tokens except the last frame in view
-            special_tokens_offset = i * self.num_frames_per_view * 2
-            view_start = all_image_start + i * tokens_per_view + special_tokens_offset
-            view_end = view_start + tokens_per_view + (self.num_frames_per_view - 1) * 2
-            view_ranges.append((view_start, view_end))
-
-        traj_text_start = all_image_end + 1
-
-        return StreamingState(
-            view_ranges=view_ranges,
-            tokens_per_frame=tokens_per_frame,
-            frames_per_view=self.num_frames_per_view,
-            traj_text_start=traj_text_start,
+        past_seen_tokens = self.past_key_values.get_seq_length() if self.past_key_values is not None else 0
+        cache_position = torch.arange(
+            past_seen_tokens, past_seen_tokens + input_ids.shape[1], device=input_ids.device
         )
+        return cache_position
     
-    def _update_kv_cache(self, state: StreamingState) -> None:
-        """Update KV cache by evicting first frame and adding placeholder for new frame.
-
-        Args:
-            state: The streaming state containing view ranges and token counts.
+    def retrieve_streaming_related_info(self, input_ids: torch.LongTensor) -> tuple[torch.LongTensor, torch.LongTensor]:
+        """Retrieve the streaming related information for the input IDs.
         """
-        if self.past_key_values is None:
-            return
+        past_seen_tokens = self.past_key_values.get_seq_length() if self.past_key_values is not None else 0
+        vision_start_token, vision_end_token = '<|vision_start|>', '<|vision_end|>'
+        vision_start_token_id, vision_end_token_id = self.processor.tokenizer.encode(vision_start_token), self.processor.tokenizer.encode(vision_end_token)
 
-        batch_size, num_heads, seq_len, head_dim = self.past_key_values[0][0].shape
-        device = self.past_key_values[0][0].device
-        dtype = self.past_key_values[0][0].dtype
-
-        # Create mask to discard tokens after last view (traj/text tokens)
-        last_view_end = state.view_ranges[-1][1]
-        mask = torch.ones(seq_len, device=device, dtype=torch.bool)
-        mask[last_view_end:] = False
-
-        # Create placeholder for new frame
-        placeholder = torch.zeros(
-            batch_size, num_heads, state.tokens_per_frame, head_dim,
-            device=device, dtype=dtype
-        )
-
-        # Process all layers
-        new_kv_cache = []
-        for key, value in self.past_key_values:
-            new_key = torch.empty_like(key[:, :, mask, :])
-            new_value = torch.empty_like(value[:, :, mask, :])
-
-            # Copy system tokens (before first view)
-            sys_end = state.view_ranges[0][0]
-            new_key[:, :, :sys_end].copy_(key[:, :, :sys_end])
-            new_value[:, :, :sys_end].copy_(value[:, :, :sys_end])
-
-            # For each view: shift frames and add placeholder
-            for view_idx in range(self.num_views):
-                evict_start, evict_end = state.get_evict_range(view_idx)
-                _, view_end = state.view_ranges[view_idx]
-                placeholder_start, placeholder_end = state.get_placeholder_range(view_idx)
-
-                # Calculate shift positions
-                shift_dest_start = evict_start
-                shift_dest_end = view_end - state.tokens_per_frame
-                shift_src_start = evict_end
-                shift_src_end = view_end
-
-                # Copy shifted frames (frames 2-N become frames 1-(N-1))
-                new_key[:, :, shift_dest_start:shift_dest_end].copy_(key[:, :, shift_src_start:shift_src_end])
-                new_value[:, :, shift_dest_start:shift_dest_end].copy_(value[:, :, shift_src_start:shift_src_end])
-
-                # Add placeholder for new frame at the end
-                new_key[:, :, placeholder_start:placeholder_end].copy_(placeholder)
-                new_value[:, :, placeholder_start:placeholder_end].copy_(placeholder)
-
-            new_kv_cache.append((new_key, new_value))
-
-        self.past_key_values = tuple(new_kv_cache)
+        vision_start_token_positions = torch.where(input_ids == vision_start_token_id)[1][::self.num_frames_per_view]  # we extract the vision start token positions for the first frame of each view
+        vision_end_token_positions = torch.where(input_ids == vision_end_token_id)[1][::self.num_frames_per_view]  # we extract the vision end token positions for the last frame of each view
+        
+        first_frames_ids_ranges = [(start, end) for start, end in zip(vision_start_token_positions, vision_end_token_positions)]
+        traj_and_text_ids_range = (vision_end_token_positions[-1], past_seen_tokens)
+        return first_frames_ids_ranges, traj_and_text_ids_range
     
-    def _create_cache_position(self, state: StreamingState, seq_len: int) -> torch.Tensor:
-        """Create cache position for streaming prefill.
-
-        Args:
-            state: The streaming state containing view ranges and token counts.
-            seq_len: The total sequence length.
-
-        Returns:
-            Tensor of cache positions for placeholder frames and traj/text tokens.
+    def update_past_key_values(self, past_key_values, first_frames_ids_ranges, traj_and_text_ids_range):
+        """Update the past key values for the first frames and the traj and text tokens.
         """
-        positions = []
+        past_seen_tokens = self.past_key_values.get_seq_length() if self.past_key_values is not None else 0
+        mask = torch.ones(past_seen_tokens, device=self.past_key_values.device, dtype=torch.bool)
 
-        # Add positions for each view's placeholder (last frame position)
-        for view_idx in range(self.num_views):
-            start, end = state.get_placeholder_range(view_idx)
-            positions.append(torch.arange(start, end, dtype=torch.long))
+        for start, end in first_frames_ids_ranges:
+            mask[start:end] = False
+        mask[traj_and_text_ids_range[0]:traj_and_text_ids_range[1]] = False
+        
+        new_past_key_values = []
+        for layer in range(len(past_key_values)):
+            new_keys = past_key_values[layer][0][:, :, mask, :]
+            new_values = past_key_values[layer][1][:, :, mask, :]
 
-        # Add positions for trajectory and text tokens
-        positions.append(torch.arange(state.traj_text_start, seq_len, dtype=torch.long))
-
-        return torch.cat(positions)
+            new_past_key_values.append((new_keys, new_values))
+        
+        return new_past_key_values
     
     @torch.inference_mode()
     def sample_trajectories_from_data_with_streaming_vlm_rollout(
@@ -335,9 +428,10 @@ class AlpamayoR1(ReasoningVLA):
         num_traj_samples: int = 6,
         num_traj_sets: int = 1,
         diffusion_kwargs: dict[str, Any] | None = None,
+        *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample trajectories from the data with streaming VLM rollout.
+        """Sample trajectories from the data with VLM rollout.
 
         Args:
             data: The input data.
@@ -346,13 +440,13 @@ class AlpamayoR1(ReasoningVLA):
             temperature: The temperature for sampling.
             num_traj_samples: The number of trajectory samples.
             num_traj_sets: The number of trajectory sets.
-            diffusion_kwargs: Optional diffusion sampling kwargs.
+            *args: Variable length argument list.
             **kwargs: Arbitrary keyword arguments.
 
         Returns:
             pred_xyz: The predicted xyz.
             pred_rot: The predicted rotation.
-            extra: Optional extra info if return_extra=True.
+            logprob: The log probability.
         """
         n_samples_total = num_traj_samples * num_traj_sets
         ego_history_xyz = data["ego_history_xyz"]
@@ -395,59 +489,43 @@ class AlpamayoR1(ReasoningVLA):
                 )
             ]
         )
-
         inputs_embeds, deepstack_visual_embeds, visual_pos_masks = self.embed_tokens(
-            input_ids=input_ids,
-            pixel_values=tokenized_data.get("pixel_values", None),
-            image_grid_thw=tokenized_data.get("image_grid_thw", None),
-            pixel_values_videos=tokenized_data.get("pixel_values_videos", None),
-            video_grid_thw=tokenized_data.get("video_grid_thw", None),
+            input_ids=input_ids, 
+            pixel_values=tokenized_data["pixel_values"], 
+            image_grid_thw=tokenized_data["image_grid_thw"],
         )
+        cache_position = self.create_cache_position(input_ids=input_ids)
 
-        # Create cache position for streaming (if we have a previous streaming state)
-        cache_position = None
-        image_placeholder_ids_ranges = None
-        traj_and_text_placeholder_ids_range = None
+        logger.info(f"inputs_embeds: {inputs_embeds.shape}")
+        logger.info(f"cache_position: {cache_position.shape}")
 
-        if self.streaming_state is not None:
-            state = self.streaming_state
-            cache_position = self._create_cache_position(state, input_ids.shape[1]).to(device)
-
-            # Build placeholder ranges for VLM generate
-            image_placeholder_ids_ranges = [
-                state.get_placeholder_range(i) for i in range(self.num_views)
-            ]
-            traj_and_text_placeholder_ids_range = (state.traj_text_start, input_ids.shape[1])
-
-            # Update visual pos masks for streaming
-            visual_pos_masks = torch.zeros(B, cache_position.shape[0], device=device, dtype=torch.bool)
-            tokens_per_view = state.tokens_per_frame * state.frames_per_view
-            visual_pos_masks[:, : tokens_per_view] = True
-
-            # Extract only last frame embeddings for streaming
-            effective_deepstack_visual_embeds = []
-            for deepstack_visual_embed in deepstack_visual_embeds:
-                effective_deepstack_visual_embed = []
-                for i in range(self.num_views):
-                    last_frame_end = (i + 1) * tokens_per_view
-                    last_frame_start = last_frame_end - state.tokens_per_frame
-                    effective_deepstack_visual_embed.append(deepstack_visual_embed[last_frame_start:last_frame_end, :])
-                effective_deepstack_visual_embeds.append(torch.cat(effective_deepstack_visual_embed, dim=0))
-            deepstack_visual_embeds = effective_deepstack_visual_embeds
-
+        if self.past_key_values is None:
+            flex_attn_block_mask = create_causal_block_mask(
+                q_len=inputs_embeds.shape[1],
+                device=device,
+            )
+        else:
+            first_image_token_id = self.first_frames_ids_ranges[0][0]
+            kv_len = self.past_key_values[0][0].shape[2]
+            flex_attn_block_mask = create_streaming_block_mask(
+                sys_len=first_image_token_id,
+                kv_len=kv_len,
+                q_len=inputs_embeds.shape[1],
+                device=device
+            )
+        
         vlm_outputs = self.vlm.generate(
             input_ids=None,
             inputs_embeds=inputs_embeds,
+            flex_attn_block_mask=flex_attn_block_mask,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            visual_pos_masks=visual_pos_masks,
             generation_config=generation_config,
             stopping_criteria=stopping_criteria,
             logits_processor=logits_processor,
             past_key_values=self.past_key_values,
-            visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
-            image_placeholder_ids_ranges=image_placeholder_ids_ranges,
-            traj_and_text_placeholder_ids_range=traj_and_text_placeholder_ids_range,
-            num_image_tokens_per_frame=self.tokens_per_frame if self.streaming_state else None,
             cache_position=cache_position,
+            **tokenized_data,
         )
         vlm_outputs.rope_deltas = self.vlm.model.rope_deltas
 
@@ -457,9 +535,8 @@ class AlpamayoR1(ReasoningVLA):
             eos_token_id=eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
         )
-        self.past_key_values = vlm_outputs.past_key_values
-
-        prefill_seq_len = self.past_key_values.get_seq_length()  # past_key_values: [1, 8, seq_len, 128]
+        prompt_cache = vlm_outputs.past_key_values
+        prefill_seq_len = prompt_cache.get_seq_length()
 
         # find <traj_future_start> token position for each sequence, use last token if not found
         b_star = vlm_outputs.sequences.shape[0]
@@ -492,7 +569,7 @@ class AlpamayoR1(ReasoningVLA):
 
         # modify the attention_masks to remove padding tokens
         attention_mask = torch.zeros(
-            (b_star, 1, n_diffusion_tokens, self.past_key_values.get_seq_length() + n_diffusion_tokens),
+            (b_star, 1, n_diffusion_tokens, prompt_cache.get_seq_length() + n_diffusion_tokens),
             dtype=torch.float32,
             device=device,
         )
@@ -523,13 +600,13 @@ class AlpamayoR1(ReasoningVLA):
             expert_out_base = self.expert(
                 inputs_embeds=future_token_embeds,
                 position_ids=position_ids,
-                past_key_values=self.past_key_values,
+                past_key_values=prompt_cache,
                 attention_mask=attention_mask,
                 use_cache=True,
                 **forward_kwargs,
             )
             # crop the prompt cache to remove the newly added tokens
-            self.past_key_values.crop(prefill_seq_len)
+            prompt_cache.crop(prefill_seq_len)
             last_hidden = expert_out_base.last_hidden_state  # (b*, Tf, hidden_size)
             last_hidden = last_hidden[:, -n_diffusion_tokens:]
             pred = self.action_out_proj(last_hidden).view(
@@ -570,9 +647,13 @@ class AlpamayoR1(ReasoningVLA):
             pred_rot, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
         )
 
-        # Compute streaming state and update KV cache for next iteration
-        self.streaming_state = self._compute_streaming_state(input_ids)
-        self._update_kv_cache(self.streaming_state)
+        first_frames_ids_ranges, traj_and_text_ids_range = self.retrieve_streaming_related_info(input_ids=input_ids)
+        self.first_frames_ids_ranges = first_frames_ids_ranges
+        self.traj_and_text_ids_range = traj_and_text_ids_range
+        logger.info(f"first_frames_ids_ranges: {first_frames_ids_ranges}")
+        logger.info(f"traj_and_text_ids_range: {traj_and_text_ids_range}")
+        self.past_key_values = self.update_past_key_values(past_key_values=prompt_cache, first_frames_ids_ranges=first_frames_ids_ranges, traj_and_text_ids_range=traj_and_text_ids_range)
+        logger.info(f"past_key_values: {self.past_key_values[0][0].shape}")
 
         # return the text tokens generated by the VLM
         if kwargs.get("return_extra", False):
@@ -584,7 +665,7 @@ class AlpamayoR1(ReasoningVLA):
                 )
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
-        
-        
+
+
 AutoConfig.register("alpamayo_r1", AlpamayoR1Config)
 AutoModel.register(AlpamayoR1Config, AlpamayoR1)

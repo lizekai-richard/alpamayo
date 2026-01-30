@@ -31,7 +31,8 @@ from transformers.cache_utils import Cache, DynamicCache
 # from transformers.generation import GenerationMixin
 from alpamayo_r1.models.generation.utils import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import create_causal_mask
+# from transformers.masking_utils import create_causal_mask
+from alpamayo_r1.models.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
@@ -443,8 +444,23 @@ class Qwen3VLTextAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        cos_q, sin_q = cos[:, -q_len:, :], sin[:, -q_len:, :]
 
+        if image_placeholder_ids_ranges is None or q_len == 1:
+            cos_q, sin_q = cos[:, -q_len:, :], sin[:, -q_len:, :]
+        else:
+            cos_q, sin_q = [], []
+            for i in range(len(image_placeholder_ids_ranges)):
+                image_placeholder_start = image_placeholder_ids_ranges[i][0]
+                image_placeholder_end = image_placeholder_ids_ranges[i][1]
+                cos_q.append(cos[:, image_placeholder_start:image_placeholder_end, :])
+                sin_q.append(sin[:, image_placeholder_start:image_placeholder_end, :])
+            last_image_token_id = image_placeholder_ids_ranges[-1][1]
+            cos_q.append(cos[:, last_image_token_id:, :])
+            sin_q.append(sin[:, last_image_token_id:, :])
+
+            cos_q = torch.cat(cos_q, dim=1)
+            sin_q = torch.cat(sin_q, dim=1)
+            
         # store the un-roped keys and values
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -857,7 +873,6 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
-        print("cache_position: ", cache_position.shape)
         # the hard coded `3` is for temporal, height and width.
         if position_ids is None:
             position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
@@ -1167,6 +1182,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         image_mask = None
         video_mask = None
 
+        image_embeds = None
+        video_embeds = None
+
         if pixel_values is not None:
             image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
@@ -1207,7 +1225,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             visual_pos_masks = video_mask
             deepstack_visual_embeds = deepstack_video_embeds
         
-        return inputs_embeds, deepstack_visual_embeds, visual_pos_masks
+        return inputs_embeds, image_embeds, video_embeds, deepstack_visual_embeds, visual_pos_masks
     
     @auto_docstring
     @check_model_inputs
@@ -1284,17 +1302,6 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 video_mask = video_mask[..., 0]
                 visual_pos_masks = video_mask
                 deepstack_visual_embeds = deepstack_video_embeds
-        # else:
-        #     # In this case, we always have visual_pos_masks and deepstack_visual_embeds
-        #     # We need to extract the visual_pos_masks and deepstack_visual_embeds corresponding to the inputs_embeds
-        #     effective_visual_pos_masks = []
-        #     effective_deepstack_visual_embeds = []
-        #     for i in range(len(image_placeholder_ids_ranges)):
-        #         image_token_start = image_placeholder_ids_ranges[i][0] + 1  # we have to exclude the <vision_start> token
-        #         image_token_end = image_placeholder_ids_ranges[i][1] - 1  # we have to exclude the <vision_end> token
-        #         effective_visual_pos_masks.append(visual_pos_masks[:, image_token_start:image_token_end])
-        #     visual_pos_masks = torch.cat(effective_visual_pos_masks, dim=1)
-            # num_image_embeddings = 
 
 
         if position_ids is None:

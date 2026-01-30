@@ -43,6 +43,7 @@ inputs = processor.apply_chat_template(
     return_dict=True,
     return_tensors="pt",
 )
+print((inputs.attention_mask == False).any())
 model_inputs = {
     "tokenized_data": inputs,
     "ego_history_xyz": data["ego_history_xyz"],
@@ -75,4 +76,17 @@ print(
     "Note: VLA-reasoning models produce nondeterministic outputs due to trajectory sampling, "
     "hardware differences, etc. With num_traj_samples=1 (set for GPU memory compatibility), "
     "variance in minADE is expected. For visual sanity checks, see notebooks/inference.ipynb"
+)
+
+
+data = load_physical_aiavdataset(clip_id, t0_us=5_100_100)
+print("Dataset loaded.")
+messages = helper.create_message(data["image_frames"].flatten(0, 1))
+inputs = processor.apply_chat_template(
+    messages,
+    tokenize=True,
+    add_generation_prompt=False,
+    continue_final_message=True,
+    return_dict=True,
+    return_tensors="pt",
 )

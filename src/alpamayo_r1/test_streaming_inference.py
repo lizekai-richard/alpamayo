@@ -17,88 +17,75 @@
 # This script loads a dataset, runs inference, and computes the minADE.
 # It can be used to test the inference pipeline.
 
+import logging
 import torch
-import numpy as np
 
-from alpamayo_r1.models.alpamayo_r1_streaming import AlpamayoR1
+from alpamayo_r1.models.alpamayo_r1_streaming_v2 import AlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
+
+# Configure logging to show INFO level messages
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 
 # Example clip ID
 clip_id = "030c760c-ae38-49aa-9ad8-f5650a545d26"
-print(f"Loading dataset for clip_id: {clip_id}...")
-data = load_physical_aiavdataset(clip_id, t0_us=5_100_000)
-print("Dataset loaded.")
 
+# Load model and processor
+print("Loading model...")
 model = AlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
 processor = helper.get_processor(model.tokenizer)
 model._set_processor(processor)
-# messages = helper.create_message(data["image_frames"].flatten(0, 1))
-# inputs = processor.apply_chat_template(
-#     messages,
-#     tokenize=True,
-#     add_generation_prompt=False,
-#     continue_final_message=True,
-#     return_dict=True,
-#     return_tensors="pt",
-# )
-# print(inputs.input_ids.shape)
-# model_inputs = {
-#     "tokenized_data": inputs,
-#     "ego_history_xyz": data["ego_history_xyz"],
-#     "ego_history_rot": data["ego_history_rot"],
-# }
-
-# model_inputs = helper.to_device(model_inputs, "cuda")
-# input_ids = model_inputs["tokenized_data"]["input_ids"].clone()
-
-# torch.cuda.manual_seed_all(42)
-# tokens_per_image = 720
-# feature_dim = 1536
-# with torch.autocast("cuda", dtype=torch.bfloat16):
-#     # for i in range(5):
-#     #     if i > 0:
-#     #         new_pixel_values = torch.randn(
-#     #             4 * tokens_per_image, 
-#     #             feature_dim, 
-#     #             dtype=model_inputs["tokenized_data"]["pixel_values"].dtype, 
-#     #             device=model_inputs["tokenized_data"]["pixel_values"].device
-#     #         )
-#     #         model_inputs["tokenized_data"]["pixel_values"] = new_pixel_values
-#     #         model_inputs["tokenized_data"]["input_ids"] = input_ids
-
-#     pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
-#         data=model_inputs,
-#         top_p=0.98,
-#         temperature=0.6,
-#         num_traj_samples=1,  # Feel free to raise this for more output trajectories and CoC traces.
-#         max_generation_length=256,
-#         return_extra=True,
-#     )
-
-#     print("pred_xyz: ", pred_xyz.shape)
-#     print("pred_rot: ", pred_rot.shape)
-
-# # the size is [batch_size, num_traj_sets, num_traj_samples]
-# print("Chain-of-Causation (per trajectory):\n", extra["cot"][0])
-
-# gt_xy = data["ego_future_xyz"].cpu()[0, 0, :, :2].T.numpy()
-# pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
-# diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
-# min_ade = diff.min()
-# print("minADE:", min_ade, "meters")
-# print(
-#     "Note: VLA-reasoning models produce nondeterministic outputs due to trajectory sampling, "
-#     "hardware differences, etc. With num_traj_samples=1 (set for GPU memory compatibility), "
-#     "variance in minADE is expected. For visual sanity checks, see notebooks/inference.ipynb"
-# )
+print("Model loaded.")
 
 
-def create_sliding_window_input(num_windows, data):
+def create_sliding_window_inputs(
+    num_windows: int,
+    clip_id: str,
+    t0_us: int = 5_100_000,
+    time_step_us: int = 100_000,  # 0.1s = 100_000 us
+):
+    """
+    Create sliding window inputs for streaming inference.
+
+    For streaming:
+    - Window 0 (prefill): 4 cameras × 4 frames = 16 frames
+    - Window 1+: 4 cameras × 1 new frame = 4 frames (to be appended)
+
+    Args:
+        num_windows: Total number of windows (1 prefill + (num_windows-1) streaming steps)
+        clip_id: Clip ID to load data from
+        t0_us: Initial timestamp in microseconds
+        time_step_us: Time step between frames (100_000 us = 0.1s)
+
+    Returns:
+        List of (model_inputs, is_prefill) tuples
+    """
     streaming_inputs = []
-    for i in range(num_windows):
-        messages = helper.create_message(data["image_frames"].flatten(0, 1))
+
+    for window_idx in range(num_windows):
+        # Calculate t0 for this window
+        # Window 0: t0_us (frames at t0-0.3s, t0-0.2s, t0-0.1s, t0)
+        # Window 1: t0_us + 100_000 (need frame at t0+0.1s)
+        # Window 2: t0_us + 200_000 (need frame at t0+0.2s)
+        current_t0 = t0_us + window_idx * time_step_us
+
+        if window_idx == 0:
+            # Prefill: load full 4 frames per camera
+            data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=4)
+            frames = data["image_frames"].flatten(0, 1)  # (4, 4, C, H, W) -> (16, C, H, W)
+            is_prefill = True
+        else:
+            # Streaming: load only the newest frame per camera
+            # num_frames=1 means only load the frame at current_t0
+            data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=1)
+            frames = data["image_frames"].flatten(0, 1)  # (4, 1, C, H, W) -> (4, C, H, W)
+            is_prefill = False
+
+        messages = helper.create_message(frames)
         inputs = processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -107,52 +94,75 @@ def create_sliding_window_input(num_windows, data):
             return_dict=True,
             return_tensors="pt",
         )
+
         model_inputs = {
             "tokenized_data": inputs,
             "ego_history_xyz": data["ego_history_xyz"],
             "ego_history_rot": data["ego_history_rot"],
+            "is_prefill": is_prefill,
         }
         model_inputs = helper.to_device(model_inputs, "cuda")
         streaming_inputs.append(model_inputs)
+
     return streaming_inputs
 
-
+@torch.inference_mode()
 def run_streaming_inference(streaming_inputs):
-    ego_history_xyz, ego_history_rot = None, None
+    """
+    Run streaming inference with sliding window inputs.
+
+    The model internally checks `past_key_values is None` to determine
+    if this is the first prefill or a streaming step.
+
+    Args:
+        streaming_inputs: List of model_inputs dicts, each containing:
+            - tokenized_data: processor output (input_ids, pixel_values, etc.)
+            - ego_history_xyz: history trajectory positions
+            - ego_history_rot: history trajectory rotations
+    """
     pred_xyzs, pred_rots = [], []
-    for model_inputs in streaming_inputs:
-        if ego_history_xyz is not None:
-            model_inputs["ego_history_xyz"] = ego_history_xyz
-            model_inputs["ego_history_rot"] = ego_history_rot
-        
-        # pred_xyz: [1, 1, 1, 64, 3]
+
+    for step_idx, model_inputs in enumerate(streaming_inputs):
+        # Remove is_prefill flag if present (not needed by model)
+        is_prefill = model_inputs.pop("is_prefill", step_idx == 0)
+
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
                 data=model_inputs,
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=1,  # Feel free to raise this for more output trajectories and CoC traces.
+                num_traj_samples=1,
                 max_generation_length=256,
                 return_extra=True,
             )
-        ego_history_xyz = pred_xyz[0][:, :, :16, :]
-        ego_history_rot = pred_rot[0][:, :, :16, :, :]
+
         pred_xyzs.append(pred_xyz[0])
         pred_rots.append(pred_rot[0])
-        
-        gt_xy = data["ego_future_xyz"].cpu()[0, 0, :, :2].T.numpy()
-        pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
-        diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
-        min_ade = diff.min()
-        print("minADE:", min_ade, "meters")
+
+        print(f"\n=== Step {step_idx} ({'prefill' if is_prefill else 'streaming'}) ===")
+        print("Chain-of-Causation:\n", extra["cot"][0])
+
     return pred_xyzs, pred_rots
 
 
 def test_streaming_inference():
-    streaming_inputs = create_sliding_window_input(2, data)
+    """Test streaming inference with sliding window."""
+    print(f"Creating sliding window inputs for clip_id: {clip_id}")
+
+    # Create 3 windows: 1 prefill + 2 streaming steps
+    streaming_inputs = create_sliding_window_inputs(
+        num_windows=3,
+        clip_id=clip_id,
+        t0_us=5_100_000,
+    )
+
+    print(f"Created {len(streaming_inputs)} windows:")
+    for i, inp in enumerate(streaming_inputs):
+        pixel_values = inp["tokenized_data"]["pixel_values"]
+        print(f"  Window {i}: pixel_values shape = {pixel_values.shape}, is_prefill = {inp.get('is_prefill', False)}")
+
     pred_xyzs, pred_rots = run_streaming_inference(streaming_inputs)
-    # print("pred_xyzs: ", pred_xyzs.shape)
-    # print("pred_rots: ", pred_rots.shape)
+    print(f"\nCompleted {len(pred_xyzs)} predictions")
 
 
 if __name__ == "__main__":
