@@ -18,7 +18,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Union
 
@@ -44,6 +44,8 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 from alpamayo_r1.models.qwen3_vl.flex_attention import flex_attention_forward
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen3VLVisionMLP(nn.Module):
@@ -450,7 +452,7 @@ class Qwen3VLTextAttention(nn.Module):
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
         
         query_states = apply_mrope_emb_single(query_states, cos_q, sin_q)
-        key_states = apply_rotary_pos_emb(key_states, cos, sin)
+        key_states = apply_mrope_emb_single(key_states, cos, sin)
 
         # attention_interface: Callable = eager_attention_forward
         # if self.config._attn_implementation != "eager":
@@ -466,17 +468,27 @@ class Qwen3VLTextAttention(nn.Module):
         #     scaling=self.scaling,
         #     **kwargs,
         # )
-
-        attn_output, attn_weights = flex_attention_forward(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=flex_attn_block_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+        if q_len != 1:
+            attn_output, attn_weights = flex_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=flex_attn_block_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+        else:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                is_causal=True,
+                scale=self.scaling,
+                enable_gqa=(query_states.shape[1] != key_states.shape[1]),
+            )
+            attn_weights = None
         
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -861,8 +873,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             text_position_ids = position_ids[0]
         
         last_totken_id = cache_position[-1]
-        position_ids = torch.arange(0, last_totken_id + inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long)
-        position_ids = position_ids.view(1, 1, -1).expand(3, position_ids.shape[0], -1)
+        position_ids = torch.arange(0, last_totken_id + 1, device=inputs_embeds.device, dtype=torch.long)
+        position_ids = position_ids.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
 
         hidden_states = inputs_embeds
 

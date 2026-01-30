@@ -26,6 +26,7 @@ Citation:
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional, Union
 
 import torch
@@ -34,6 +35,11 @@ from packaging import version
 from transformers.utils import is_torch_flex_attn_available, logging
 from transformers.utils.import_utils import _torch_version, is_torch_less_or_equal, is_torchdynamo_compiling
 
+try:
+    from torch._inductor.exc import InductorError
+except Exception:  # pragma: no cover - older torch or missing inductor
+    InductorError = RuntimeError
+
 
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE as flex_default_block_size
@@ -41,6 +47,14 @@ if is_torch_flex_attn_available():
 
 
 logger = logging.get_logger(__name__)
+_DISABLE_FLEX_COMPILE = os.getenv("ALPAMAYO_DISABLE_FLEX_COMPILE", "").lower() in ("1", "true", "yes")
+
+
+def _should_fallback_from_compile(error: Exception) -> bool:
+    if isinstance(error, InductorError):
+        return True
+    message = str(error)
+    return "No valid triton configs" in message or "out of resource" in message
 
 
 class WrappedFlexAttention:
@@ -91,15 +105,44 @@ def compile_friendly_flex_attention(
     training=False,
     **kwargs,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    global _DISABLE_FLEX_COMPILE
     # First call initialise singleton wrapper object, second call invokes the object method to return compiled flex attention
     # Do not use compiled version if already compiling forward (it raises issues)
-    flex_attention_compiled = WrappedFlexAttention(training)() if not is_torchdynamo_compiling() else flex_attention
-    return flex_attention_compiled(
-        query,
-        key,
-        value,
-        **kwargs,
-    )
+    if _DISABLE_FLEX_COMPILE or is_torchdynamo_compiling():
+        flex_attention_fn = flex_attention
+    else:
+        try:
+            flex_attention_fn = WrappedFlexAttention(training)()
+        except Exception as exc:
+            if _should_fallback_from_compile(exc):
+                _DISABLE_FLEX_COMPILE = True
+                logger.warning_once(
+                    "Flex attention compilation failed. Falling back to uncompiled flex attention. "
+                    "Set ALPAMAYO_DISABLE_FLEX_COMPILE=1 to skip compilation on startup."
+                )
+                flex_attention_fn = flex_attention
+            else:
+                raise
+    try:
+        return flex_attention_fn(
+            query,
+            key,
+            value,
+            **kwargs,
+        )
+    except Exception as exc:
+        if flex_attention_fn is not flex_attention and _should_fallback_from_compile(exc):
+            _DISABLE_FLEX_COMPILE = True
+            logger.warning_once(
+                "Flex attention compiled kernel failed at runtime. Falling back to uncompiled flex attention."
+            )
+            return flex_attention(
+                query,
+                key,
+                value,
+                **kwargs,
+            )
+        raise
 
 
 Offset = Union[torch.Tensor, int]

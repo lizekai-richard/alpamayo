@@ -101,7 +101,7 @@ def create_sliding_window_inputs(
             "ego_history_rot": data["ego_history_rot"],
             "is_prefill": is_prefill,
         }
-        model_inputs = helper.to_device(model_inputs, "cuda")
+        # model_inputs = helper.to_device(model_inputs, "cuda")
         streaming_inputs.append(model_inputs)
 
     return streaming_inputs
@@ -128,7 +128,7 @@ def run_streaming_inference(streaming_inputs):
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
-                data=model_inputs,
+                data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
                 num_traj_samples=1,
