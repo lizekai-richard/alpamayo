@@ -31,8 +31,7 @@ from transformers.cache_utils import Cache, DynamicCache
 # from transformers.generation import GenerationMixin
 from alpamayo_r1.models.generation.utils import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
-# from transformers.masking_utils import create_causal_mask
-from alpamayo_r1.models.masking_utils import create_causal_mask
+from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
@@ -43,6 +42,12 @@ from transformers.utils import TransformersKwargs, auto_docstring, is_torchdynam
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
+
+from transformers.integrations.flex_attention import flex_attention_forward
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 class Qwen3VLVisionMLP(nn.Module):
@@ -404,7 +409,6 @@ class Qwen3VLTextAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.mrope_section = config.rope_scaling.get("mrope_section", [24, 20, 20])
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -431,8 +435,7 @@ class Qwen3VLTextAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        image_placeholder_ids_ranges: Optional[list[tuple[int, int]]] = None,
-        num_image_tokens_per_frame: Optional[int] = None,
+        streaming_attnention_mask = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
@@ -444,58 +447,43 @@ class Qwen3VLTextAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-
-        if image_placeholder_ids_ranges is None or q_len == 1:
-            cos_q, sin_q = cos[:, -q_len:, :], sin[:, -q_len:, :]
-        else:
-            cos_q, sin_q = [], []
-            for i in range(len(image_placeholder_ids_ranges)):
-                image_placeholder_start = image_placeholder_ids_ranges[i][0]
-                image_placeholder_end = image_placeholder_ids_ranges[i][1]
-                cos_q.append(cos[:, image_placeholder_start:image_placeholder_end, :])
-                sin_q.append(sin[:, image_placeholder_start:image_placeholder_end, :])
-            last_image_token_id = image_placeholder_ids_ranges[-1][1]
-            cos_q.append(cos[:, last_image_token_id:, :])
-            sin_q.append(sin[:, last_image_token_id:, :])
-
-            cos_q = torch.cat(cos_q, dim=1)
-            sin_q = torch.cat(sin_q, dim=1)
+        cos_q, sin_q = cos[:, cache_position, :], sin[:, cache_position, :]
             
         # store the un-roped keys and values
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            if image_placeholder_ids_ranges is None or q_len == 1:  # either first prefill or the decoding step
-                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            else:  # streaming prefill
-                for i in range(len(image_placeholder_ids_ranges)):
-                    new_kv_cache_start = i * num_image_tokens_per_frame
-                    new_kv_cache_end = new_kv_cache_start + num_image_tokens_per_frame
-                    image_placeholder_start = image_placeholder_ids_ranges[i][0]
-                    image_placeholder_end = image_placeholder_ids_ranges[i][1]
-                    past_key_values[self.layer_idx][0][:, :, image_placeholder_start:image_placeholder_end, :].copy_(key_states[:, :, new_kv_cache_start:new_kv_cache_end, :])
-                    past_key_values[self.layer_idx][1][:, :, image_placeholder_start:image_placeholder_end, :].copy_(value_states[:, :, new_kv_cache_start:new_kv_cache_end, :])
-                
-                total_image_tokens = len(image_placeholder_ids_ranges) * num_image_tokens_per_frame
-                key_states, value_states = past_key_values.update(key_states[:, :, total_image_tokens:, :], value_states[:, :, total_image_tokens:, :], self.layer_idx, cache_kwargs)        
+            cache_kwargs = {'cache_position': cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            valid_length = past_key_values[self.layer_idx].get_seq_length()
+            key_states = key_states[:, :, :valid_length, :]
+            value_states = value_states[:, :, :valid_length, :]
         
+        logger.info(f"key_states: {key_states.shape}")
         query_states = apply_mrope_emb_single(query_states, cos_q, sin_q)
         key_states = apply_mrope_emb_single(key_states, cos, sin)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+        if q_len != 1 and query_states.shape[2] != key_states.shape[2]:  # This is the case for streaming prefill
+            attn_output, attn_weights = sdpa_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=streaming_attnention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+        else:
+            attn_output, attn_weights = sdpa_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -539,9 +527,7 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        image_placeholder_ids_ranges: Optional[list[tuple[int, int]]] = None,
-        traj_and_text_placeholder_ids_range: Optional[tuple[int, int]] = None,
-        num_image_tokens_per_frame: Optional[int] = None,
+        streaming_attnention_mask = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -555,9 +541,7 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            image_placeholder_ids_ranges=image_placeholder_ids_ranges,
-            traj_and_text_placeholder_ids_range=traj_and_text_placeholder_ids_range,
-            num_image_tokens_per_frame=num_image_tokens_per_frame,
+            streaming_attnention_mask=streaming_attnention_mask,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -841,12 +825,9 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        # args for deepstack
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
-        image_placeholder_ids_ranges: Optional[list[tuple[int, int]]] = None,
-        traj_and_text_placeholder_ids_range: Optional[tuple[int, int]] = None,
-        num_image_tokens_per_frame: Optional[int] = None,
+        streaming_attnention_mask = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
         r"""
@@ -875,7 +856,14 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         # the hard coded `3` is for temporal, height and width.
         if position_ids is None:
-            position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+            if len(cache_position) == 1:  # decode
+                position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+            else:
+                last_token_id = cache_position[-1]
+                position_ids = torch.arange(0, last_token_id + 1, dtype=torch.long).to(cache_position.device)
+                position_ids = position_ids.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+                logger.info(f"position_ids: {position_ids.shape}")
+
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
         
@@ -885,12 +873,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             position_ids = position_ids[1:]
         else:
             text_position_ids = position_ids[0]
-        
-        # hard code the position ids
-        last_token_id = cache_position[-1]
-        position_ids = torch.arange(0, last_token_id + 1, dtype=torch.long).to(cache_position.device)
-        position_ids = position_ids.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
-
+    
         attention_mask = create_causal_mask(
             config=self.config,
             input_embeds=inputs_embeds,
@@ -914,9 +897,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                image_placeholder_ids_ranges=image_placeholder_ids_ranges,
-                traj_and_text_placeholder_ids_range=traj_and_text_placeholder_ids_range,
-                num_image_tokens_per_frame=num_image_tokens_per_frame,
+                streaming_attnention_mask=streaming_attnention_mask,
                 **kwargs,
             )
             hidden_states = layer_outputs
@@ -1182,9 +1163,6 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         image_mask = None
         video_mask = None
 
-        image_embeds = None
-        video_embeds = None
-
         if pixel_values is not None:
             image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
@@ -1225,7 +1203,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             visual_pos_masks = video_mask
             deepstack_visual_embeds = deepstack_video_embeds
         
-        return inputs_embeds, image_embeds, video_embeds, deepstack_visual_embeds, visual_pos_masks
+        return inputs_embeds, deepstack_visual_embeds, visual_pos_masks
     
     @auto_docstring
     @check_model_inputs
@@ -1243,9 +1221,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
         visual_pos_masks: Optional[torch.Tensor] = None,
-        image_placeholder_ids_ranges: Optional[list[tuple[int, int]]] = None,
-        traj_and_text_placeholder_ids_range: Optional[tuple[int, int]] = None,
-        num_image_tokens_per_frame: Optional[int] = None,
+        streaming_attnention_mask = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLModelOutputWithPast]:
         r"""
@@ -1359,9 +1335,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             cache_position=cache_position,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
-            image_placeholder_ids_ranges=image_placeholder_ids_ranges,
-            traj_and_text_placeholder_ids_range=traj_and_text_placeholder_ids_range,
-            num_image_tokens_per_frame=num_image_tokens_per_frame,
+            streaming_attnention_mask=streaming_attnention_mask,
             **kwargs,
         )
 
@@ -1464,9 +1438,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
-        image_placeholder_ids_ranges = None,
-        traj_and_text_placeholder_ids_range = None,
-        num_image_tokens_per_frame = None,
+        streaming_attnention_mask = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
         r"""
@@ -1498,9 +1470,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             cache_position=cache_position,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
-            image_placeholder_ids_ranges=image_placeholder_ids_ranges,
-            traj_and_text_placeholder_ids_range=traj_and_text_placeholder_ids_range,
-            num_image_tokens_per_frame=num_image_tokens_per_frame,
+            streaming_attnention_mask=streaming_attnention_mask,
             **kwargs,
         )
 
@@ -1707,4 +1677,10 @@ __all__ = [
     "Qwen3VLModel",
     "Qwen3VLPreTrainedModel",
     "Qwen3VLTextModel",
+    # Streaming attention mask utilities (SDPA)
+    "create_streaming_attention_mask_sdpa",
+    "create_streaming_attention_mask_sdpa_optimized",
+    # Streaming attention mask utilities (Flex Attention)
+    "create_streaming_attention_mask_flex",
+    "create_streaming_mask_mod_factory",
 ]

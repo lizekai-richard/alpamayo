@@ -20,7 +20,7 @@
 import logging
 import torch
 
-from alpamayo_r1.models.alpamayo_r1_streaming_v2 import AlpamayoR1
+from alpamayo_r1.models.alpamayo_r1_streaming import AlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
@@ -124,6 +124,7 @@ def run_streaming_inference(streaming_inputs):
 
     for step_idx, model_inputs in enumerate(streaming_inputs):
         # Remove is_prefill flag if present (not needed by model)
+        print(model_inputs["ego_history_xyz"].shape)
         is_prefill = model_inputs.pop("is_prefill", step_idx == 0)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -151,7 +152,7 @@ def test_streaming_inference():
 
     # Create 3 windows: 1 prefill + 2 streaming steps
     streaming_inputs = create_sliding_window_inputs(
-        num_windows=3,
+        num_windows=2,
         clip_id=clip_id,
         t0_us=5_100_000,
     )

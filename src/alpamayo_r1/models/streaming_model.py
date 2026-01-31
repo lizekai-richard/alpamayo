@@ -27,7 +27,7 @@ from transformers import (
     PreTrainedModel,
 )
 from alpamayo_r1.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLConfig
-from alpamayo_r1.models.qwen3_vl.modeling_qwen3_vl_streaming_v2 import Qwen3VLForConditionalGeneration
+from alpamayo_r1.models.qwen3_vl.modeling_qwen3_vl_streaming import Qwen3VLForConditionalGeneration
 
 logger = logging.getLogger(__name__)
 
