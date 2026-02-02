@@ -435,7 +435,6 @@ class Qwen3VLTextAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        streaming_attnention_mask = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
@@ -454,36 +453,20 @@ class Qwen3VLTextAttention(nn.Module):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {'cache_position': cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            valid_length = past_key_values[self.layer_idx].get_seq_length()
-            key_states = key_states[:, :, :valid_length, :]
-            value_states = value_states[:, :, :valid_length, :]
         
-        logger.info(f"key_states: {key_states.shape}")
         query_states = apply_mrope_emb_single(query_states, cos_q, sin_q)
         key_states = apply_mrope_emb_single(key_states, cos, sin)
 
-        if q_len != 1 and query_states.shape[2] != key_states.shape[2]:  # This is the case for streaming prefill
-            attn_output, attn_weights = sdpa_attention_forward(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=streaming_attnention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                **kwargs,
-            )
-        else:
-            attn_output, attn_weights = sdpa_attention_forward(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                **kwargs,
-            )
+        attn_output, attn_weights = sdpa_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -527,7 +510,7 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        streaming_attnention_mask = None,
+        streaming_attention_mask = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -541,7 +524,7 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            streaming_attnention_mask=streaming_attnention_mask,
+            streaming_attention_mask=streaming_attention_mask,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -814,6 +797,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        self._cached_position_ids = None
+
     @check_model_inputs
     @auto_docstring
     def forward(
@@ -827,7 +812,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
-        streaming_attnention_mask = None,
+        streaming_attention_mask = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
         r"""
@@ -853,27 +838,14 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
-
-        # the hard coded `3` is for temporal, height and width.
-        if position_ids is None:
-            if len(cache_position) == 1:  # decode
-                position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
-            else:
-                last_token_id = cache_position[-1]
-                position_ids = torch.arange(0, last_token_id + 1, dtype=torch.long).to(cache_position.device)
-                position_ids = position_ids.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
-                logger.info(f"position_ids: {position_ids.shape}")
-
-        elif position_ids.ndim == 2:
-            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
-        
-
-        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-            text_position_ids = position_ids[0]
-            position_ids = position_ids[1:]
-        else:
-            text_position_ids = position_ids[0]
     
+        if self._cached_position_ids is None:
+            self._cached_position_ids = position_ids
+
+        text_position_ids = self._cached_position_ids[0]
+
+        is_prefill = len(cache_position) > 1
+
         attention_mask = create_causal_mask(
             config=self.config,
             input_embeds=inputs_embeds,
@@ -886,7 +858,10 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, self._cached_position_ids)
+
+        if is_prefill and streaming_attention_mask is not None:
+            attention_mask = streaming_attention_mask
 
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
@@ -897,7 +872,6 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                streaming_attnention_mask=streaming_attnention_mask,
                 **kwargs,
             )
             hidden_states = layer_outputs
@@ -1221,7 +1195,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
         visual_pos_masks: Optional[torch.Tensor] = None,
-        streaming_attnention_mask = None,
+        streaming_attention_mask = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLModelOutputWithPast]:
         r"""
@@ -1236,48 +1210,48 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
-            image_mask = None
-            video_mask = None
+        image_mask = None
+        video_mask = None
 
-            if pixel_values is not None:
-                image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-                image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-                image_mask, _ = self.get_placeholder_mask(
-                    input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
-                )
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        if pixel_values is not None:
+            image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-            if pixel_values_videos is not None:
-                video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
-                video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-                _, video_mask = self.get_placeholder_mask(
-                    input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-                )
-                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+        if pixel_values_videos is not None:
+            video_embeds, deepstack_video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
+            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-            visual_pos_masks = None
-            deepstack_visual_embeds = None
-            if image_mask is not None and video_mask is not None:
-                # aggregate visual_pos_masks and deepstack_visual_embeds
-                image_mask = image_mask[..., 0]
-                video_mask = video_mask[..., 0]
-                visual_pos_masks = image_mask | video_mask
-                deepstack_visual_embeds = []
-                image_mask_joint = image_mask[visual_pos_masks]
-                video_mask_joint = video_mask[visual_pos_masks]
-                for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
-                    embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
-                    embed_joint[image_mask_joint, :] = img_embed
-                    embed_joint[video_mask_joint, :] = vid_embed
-                    deepstack_visual_embeds.append(embed_joint)
-            elif image_mask is not None:
-                image_mask = image_mask[..., 0]
-                visual_pos_masks = image_mask
-                deepstack_visual_embeds = deepstack_image_embeds
-            elif video_mask is not None:
-                video_mask = video_mask[..., 0]
-                visual_pos_masks = video_mask
-                deepstack_visual_embeds = deepstack_video_embeds
+        visual_pos_masks = None
+        deepstack_visual_embeds = None
+        if image_mask is not None and video_mask is not None:
+            # aggregate visual_pos_masks and deepstack_visual_embeds
+            image_mask = image_mask[..., 0]
+            video_mask = video_mask[..., 0]
+            visual_pos_masks = image_mask | video_mask
+            deepstack_visual_embeds = []
+            image_mask_joint = image_mask[visual_pos_masks]
+            video_mask_joint = video_mask[visual_pos_masks]
+            for img_embed, vid_embed in zip(deepstack_image_embeds, deepstack_video_embeds):
+                embed_joint = img_embed.new_zeros(visual_pos_masks.sum(), img_embed.shape[-1]).to(img_embed.device)
+                embed_joint[image_mask_joint, :] = img_embed
+                embed_joint[video_mask_joint, :] = vid_embed
+                deepstack_visual_embeds.append(embed_joint)
+        elif image_mask is not None:
+            image_mask = image_mask[..., 0]
+            visual_pos_masks = image_mask
+            deepstack_visual_embeds = deepstack_image_embeds
+        elif video_mask is not None:
+            video_mask = video_mask[..., 0]
+            visual_pos_masks = video_mask
+            deepstack_visual_embeds = deepstack_video_embeds
 
 
         if position_ids is None:
@@ -1335,7 +1309,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             cache_position=cache_position,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
-            streaming_attnention_mask=streaming_attnention_mask,
+            streaming_attention_mask=streaming_attention_mask,
             **kwargs,
         )
 
@@ -1436,9 +1410,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         video_grid_thw: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        visual_pos_masks: Optional[torch.Tensor] = None,
-        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
-        streaming_attnention_mask = None,
+        streaming_attention_mask = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
         r"""
@@ -1454,8 +1426,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         Example:
             TODO: Add example
         """
-        if inputs_embeds is not None:
-            assert visual_pos_masks is not None and deepstack_visual_embeds is not None, "visual_pos_masks and deepstack_visual_embeds must be provided when inputs_embeds is provided"
         
         outputs = self.model(
             input_ids=input_ids,
@@ -1468,9 +1438,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
-            visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
-            streaming_attnention_mask=streaming_attnention_mask,
+            streaming_attention_mask=streaming_attention_mask,
             **kwargs,
         )
 
@@ -1504,6 +1472,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         pixel_values_videos=None,
         image_grid_thw=None,
         video_grid_thw=None,
+        streaming_attention_mask=None,
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
@@ -1524,9 +1493,13 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         )
 
         # Qwen3VL position_ids are prepareed with rope_deltas in forward
-        model_inputs["position_ids"] = None
+        if position_ids is not None:
+            model_inputs["position_ids"] = position_ids
+        
+        model_inputs["streaming_attention_mask"] = streaming_attention_mask
 
-        if cache_position[0] != 0:
+        is_decode = len(cache_position) == 1
+        if is_decode and cache_position[0] != 0:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
 

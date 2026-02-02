@@ -151,6 +151,7 @@ def benchmark_mask_creation(
             kv_length=kv_length,
             vision_start_end_ids_ranges=vision_start_end_ids_ranges,
             traj_and_text_ids_range=traj_and_text_ids_range,
+            valid_length=kv_length,
             device=device,
             dtype=torch.float32,
         )
@@ -164,6 +165,7 @@ def benchmark_mask_creation(
             kv_length=kv_length,
             vision_start_end_ids_ranges=vision_start_end_ids_ranges,
             traj_and_text_ids_range=traj_and_text_ids_range,
+            valid_length=kv_length,
             device=device,
             dtype=torch.float32,
         )
@@ -881,6 +883,7 @@ def benchmark_both_cached(
         kv_length=kv_length,
         vision_start_end_ids_ranges=vision_start_end_ids_ranges,
         traj_and_text_ids_range=traj_and_text_ids_range,
+        valid_length=kv_length,
         device=device,
         dtype=torch.bfloat16,
     )

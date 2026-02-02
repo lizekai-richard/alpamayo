@@ -582,18 +582,6 @@ class GenerationMixin(ContinuousMixin):
             if inputs_embeds is not None and len(cache_position) == inputs_embeds.shape[1]:
                 model_inputs[input_ids_key] = None
                 model_inputs["inputs_embeds"] = inputs_embeds
-            elif inputs_embeds is not None and len(cache_position) > 1:  # streaming prefill
-                image_placeholder_ids_ranges = kwargs["image_placeholder_ids_ranges"]
-                traj_and_text_ids_range = kwargs["traj_and_text_ids_range"]
-                effective_inputs_embeds = []
-                for i in range(len(image_placeholder_ids_ranges)):
-                    inputs_embeds_start = image_placeholder_ids_ranges[i][0]
-                    inputs_embeds_end = image_placeholder_ids_ranges[i][1]
-                    effective_inputs_embeds.append(inputs_embeds[:, inputs_embeds_start:inputs_embeds_end, :])
-                effective_inputs_embeds.append(inputs_embeds[:, traj_and_text_ids_range[0]:traj_and_text_ids_range[1], :])
-                model_inputs[input_ids_key] = None
-                model_inputs["inputs_embeds"] = torch.cat(effective_inputs_embeds, dim=1)
-
             else:
                 # `clone` calls in this function ensure a consistent stride. See #32227
                 model_inputs[input_ids_key] = input_ids.clone(memory_format=torch.contiguous_format)

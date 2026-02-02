@@ -19,8 +19,8 @@
 
 import logging
 import torch
-
-from alpamayo_r1.models.alpamayo_r1_streaming import AlpamayoR1
+import numpy as np
+from alpamayo_r1.models.alpamayo_r1_streaming import StreamingAlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
@@ -36,7 +36,7 @@ clip_id = "030c760c-ae38-49aa-9ad8-f5650a545d26"
 
 # Load model and processor
 print("Loading model...")
-model = AlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
+model = StreamingAlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
 processor = helper.get_processor(model.tokenizer)
 model._set_processor(processor)
 print("Model loaded.")
@@ -99,12 +99,22 @@ def create_sliding_window_inputs(
             "tokenized_data": inputs,
             "ego_history_xyz": data["ego_history_xyz"],
             "ego_history_rot": data["ego_history_rot"],
+            "ego_future_xyz": data["ego_future_xyz"],
+            "ego_future_rot": data["ego_future_rot"],
             "is_prefill": is_prefill,
         }
         # model_inputs = helper.to_device(model_inputs, "cuda")
         streaming_inputs.append(model_inputs)
 
     return streaming_inputs
+
+
+def calc_minADE(gt_future_xy, pred_xyz):
+    gt_xy = gt_future_xy.cpu()[0, 0, :, :2].T.numpy()
+    pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
+    diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
+    min_ade = diff.min()
+    return min_ade
 
 @torch.inference_mode()
 def run_streaming_inference(streaming_inputs):
@@ -120,11 +130,8 @@ def run_streaming_inference(streaming_inputs):
             - ego_history_xyz: history trajectory positions
             - ego_history_rot: history trajectory rotations
     """
-    pred_xyzs, pred_rots = [], []
-
     for step_idx, model_inputs in enumerate(streaming_inputs):
         # Remove is_prefill flag if present (not needed by model)
-        print(model_inputs["ego_history_xyz"].shape)
         is_prefill = model_inputs.pop("is_prefill", step_idx == 0)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -137,13 +144,10 @@ def run_streaming_inference(streaming_inputs):
                 return_extra=True,
             )
 
-        pred_xyzs.append(pred_xyz[0])
-        pred_rots.append(pred_rot[0])
-
+        min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
         print(f"\n=== Step {step_idx} ({'prefill' if is_prefill else 'streaming'}) ===")
         print("Chain-of-Causation:\n", extra["cot"][0])
-
-    return pred_xyzs, pred_rots
+        print(f"MinADE: {min_ade}")
 
 
 def test_streaming_inference():
@@ -152,7 +156,7 @@ def test_streaming_inference():
 
     # Create 3 windows: 1 prefill + 2 streaming steps
     streaming_inputs = create_sliding_window_inputs(
-        num_windows=2,
+        num_windows=10,
         clip_id=clip_id,
         t0_us=5_100_000,
     )
@@ -162,8 +166,8 @@ def test_streaming_inference():
         pixel_values = inp["tokenized_data"]["pixel_values"]
         print(f"  Window {i}: pixel_values shape = {pixel_values.shape}, is_prefill = {inp.get('is_prefill', False)}")
 
-    pred_xyzs, pred_rots = run_streaming_inference(streaming_inputs)
-    print(f"\nCompleted {len(pred_xyzs)} predictions")
+    run_streaming_inference(streaming_inputs)
+    print(f"\nCompleted streaming inference")
 
 
 if __name__ == "__main__":

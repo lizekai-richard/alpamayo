@@ -137,12 +137,26 @@ def create_streaming_attention_mask_sdpa_optimized(
     kv_length: int,
     vision_start_end_ids_ranges: list[list[tuple[int, int]]],
     traj_and_text_ids_range: tuple[int, int],
+    valid_length: int,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
     Optimized version using vectorized operations instead of loops.
     Same functionality as create_streaming_attention_mask_sdpa but faster for large sequences.
+
+    Args:
+        batch_size: Batch size
+        cache_position: Query positions in the full sequence [query_length]
+        kv_length: Total KV cache length
+        vision_start_end_ids_ranges: Ranges for each view's frames
+        traj_and_text_ids_range: (start, end) range for trajectory and text tokens
+        valid_length: Positions >= valid_length in KV dimension will be masked as padding.
+        device: Device to create mask on
+        dtype: Data type for the mask
+
+    Returns:
+        attention_mask: [batch_size, 1, query_length, kv_length] with padding masked
     """
     num_views = len(vision_start_end_ids_ranges)
     query_length = cache_position.shape[0]
@@ -228,6 +242,10 @@ def create_streaming_attention_mask_sdpa_optimized(
                 torch.tensor(0.0, dtype=dtype, device=device),
                 torch.tensor(min_val, dtype=dtype, device=device),
             )
+
+    # Mask padding positions: all KV positions >= valid_length should be masked
+    if valid_length < kv_length:
+        attention_mask[:, :, :, valid_length:] = min_val
 
     return attention_mask
 

@@ -66,6 +66,7 @@ class BaseDiffusion(ABC, nn.Module):
         batch_size: int,
         step_fn: StepFn,
         device: torch.device = torch.device("cpu"),
+        dtype: torch.dtype = torch.bfloat16,
         return_all_steps: bool = False,
         *args,
         **kwargs,
