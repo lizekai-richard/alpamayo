@@ -476,7 +476,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             pad_token_id=self.tokenizer.pad_token_id,
         )
 
-        prefill_seq_len = self.past_key_values.get_seq_length()  # past_key_values: [1, 8, seq_len, 128]
+        prefill_output_len = self.past_key_values.get_seq_length()  # past_key_values: [1, 8, seq_len, 128]
 
         # find <traj_future_start> token position for each sequence, use last token if not found
         b_star = vlm_outputs.sequences.shape[0]
@@ -496,9 +496,15 @@ class StreamingAlpamayoR1(ReasoningVLA):
         valid_token_pos_id = torch.where(
             has_traj_future_start, traj_future_start_positions, last_token_positions
         )
-        # note that vlm_outputs.sequences already include the input_ids,
-        # so no need to add the input_ids length
-        offset = valid_token_pos_id + 1
+        # Calculate offset: the position after <traj_future_start> in KV cache
+        if not self.is_first_prefill:
+            # Streaming step: vlm_outputs.sequences only contains streaming input_ids + generated
+            # Need to map position in sequences to actual KV cache position
+            streaming_input_len = prefill_inputs['input_ids'].shape[1]
+            offset = self.prefill_seq_length + (valid_token_pos_id - streaming_input_len) + 1
+        else:
+            # First prefill: vlm_outputs.sequences contains full input_ids
+            offset = valid_token_pos_id + 1
 
         # modify the position ids to remove padding tokens
         n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
@@ -519,8 +525,8 @@ class StreamingAlpamayoR1(ReasoningVLA):
         # Mask [offset[i], prefill_seq_len) - padding after valid content
         # Mask [prefill_seq_len + n_diffusion_tokens, max_cache_len) - remaining padding
         for i in range(b_star):
-            attention_mask[i, :, :, offset[i] : prefill_seq_len] = min_val
-            attention_mask[i, :, :, prefill_seq_len + n_diffusion_tokens :] = min_val
+            attention_mask[i, :, :, offset[i] : prefill_output_len] = min_val
+            attention_mask[i, :, :, prefill_output_len + n_diffusion_tokens :] = min_val
 
         forward_kwargs = {}
         if self.config.expert_non_causal_attention:
@@ -551,7 +557,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
                 **forward_kwargs,
             )
             # crop the prompt cache to remove the newly added tokens
-            self.crop_static_cache(prefill_seq_len)
+            self.crop_static_cache(prefill_output_len)
             last_hidden = expert_out_base.last_hidden_state  # (b*, Tf, hidden_size)
             last_hidden = last_hidden[:, -n_diffusion_tokens:]
             pred = self.action_out_proj(last_hidden).view(

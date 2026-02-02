@@ -400,7 +400,6 @@ class AlpamayoR1(ReasoningVLA):
             "ego_history_rot": ego_history_rot,
         }
         input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
-        print(f"input_ids: {input_ids.shape}")
         device = input_ids.device
 
         # 1) run autoregressive generation for the VLM
@@ -459,10 +458,7 @@ class AlpamayoR1(ReasoningVLA):
             pad_token_id=self.tokenizer.pad_token_id,
         )
         self.past_key_values = vlm_outputs.past_key_values
-
-        print(f"past_key_values: {self.past_key_values[0][0].shape}")
         prefill_seq_len = self.past_key_values.get_seq_length()
-        print(f"prefill_seq_len: {prefill_seq_len}")
 
         # find <traj_future_start> token position for each sequence, use last token if not found
         b_star = vlm_outputs.sequences.shape[0]
