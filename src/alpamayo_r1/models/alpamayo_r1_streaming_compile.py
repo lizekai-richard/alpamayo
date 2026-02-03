@@ -268,15 +268,15 @@ class StreamingAlpamayoR1(ReasoningVLA):
         self._encode_image_grid_thw.copy_(image_grid_thw)
 
         if not hasattr(self, "_compiled_encode_fn"):
-            if self._use_compile:
-                self._encode_fn()
+            if self._torch_compile:
+                self._encode_fn()  # Warmup
                 self._compiled_encode_fn = torch.compile(
                     self._encode_fn, mode=self._torch_compile, fullgraph=True
                 )
             else:
                 self._compiled_encode_fn = self._encode_fn
 
-        if self._use_compile:
+        if self._torch_compile:
             torch.compiler.cudagraph_mark_step_begin()
         return self._compiled_encode_fn()
 
@@ -322,7 +322,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             buf.copy_(emb)
         
         if not hasattr(self, "_compiled_prefill_fn"):
-            if self._use_compile:
+            if self._torch_compile:
                 self._prefill_fn()
                 self._compiled_prefill_fn = torch.compile(
                     self._prefill_fn, mode=self._torch_compile, fullgraph=True
@@ -330,28 +330,28 @@ class StreamingAlpamayoR1(ReasoningVLA):
             else:
                 self._compiled_prefill_fn = self._prefill_fn
 
-        if self._use_compile:
+        if self._torch_compile:
             torch.compiler.cudagraph_mark_step_begin()
         return self._compiled_prefill_fn()
 
     def _decode(
         self,
         input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
+        # attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         cache_position: torch.Tensor,
     ) -> torch.Tensor:
         """Run decode forward pass for a single token."""
         if not hasattr(self, "_decode_fn"):
             self._decode_input_ids = torch.empty_like(input_ids)
-            self._decode_attention_mask = torch.empty_like(attention_mask)
+            # self._decode_attention_mask = torch.empty_like(attention_mask)
             self._decode_position_ids = torch.empty_like(position_ids)
             self._decode_cache_position = torch.empty_like(cache_position)
 
             def decode_fn():
                 hidden = self.vlm.model.language_model(
                     input_ids=self._decode_input_ids,
-                    attention_mask=self._decode_attention_mask,
+                    # attention_mask=self._decode_attention_mask,
                     position_ids=self._decode_position_ids,
                     past_key_values=self._past_key_values,
                     cache_position=self._decode_cache_position,
@@ -362,12 +362,12 @@ class StreamingAlpamayoR1(ReasoningVLA):
             self._decode_fn = decode_fn
 
         self._decode_input_ids.copy_(input_ids)
-        self._decode_attention_mask.copy_(attention_mask)
+        # self._decode_attention_mask.copy_(attention_mask)
         self._decode_position_ids.copy_(position_ids)
         self._decode_cache_position.copy_(cache_position)
 
         if not hasattr(self, "_compiled_decode_fn"):
-            if self._use_compile:
+            if self._torch_compile:
                 self._decode_fn()
                 self._compiled_decode_fn = torch.compile(
                     self._decode_fn, mode=self._torch_compile, fullgraph=True
@@ -375,7 +375,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             else:
                 self._compiled_decode_fn = self._decode_fn
 
-        if self._use_compile:
+        if self._torch_compile:
             torch.compiler.cudagraph_mark_step_begin()
         return self._compiled_decode_fn()
 
@@ -438,7 +438,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # Warmup and compile on first call (if enabled)
         if not hasattr(self, "_compiled_action_fn"):
-            if self._use_compile:
+            if self._torch_compile:
                 self._action_fn()  # Warmup for compile
                 self._compiled_action_fn = torch.compile(
                     self._action_fn, mode=self._torch_compile, fullgraph=True
@@ -446,7 +446,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             else:
                 self._compiled_action_fn = self._action_fn
 
-        if self._use_compile:
+        if self._torch_compile:
             torch.compiler.cudagraph_mark_step_begin()
         return self._compiled_action_fn()
 
@@ -541,6 +541,16 @@ class StreamingAlpamayoR1(ReasoningVLA):
             use_cache=True,
         ).last_hidden_state[:, -1]
 
+        # Delete the cached_pos_embeds in QwenVLVisionModel
+        if hasattr(self.vlm.model.visual, "_cached_pos_embeds"):
+            delattr(self.vlm.model.visual, "_cached_pos_embeds")
+            logger.info("Deleted _cached_pos_embeds in Qwen3VLVisionModel")
+        
+        if hasattr(self.vlm.model.language_model, "_cached_deepstack_indices"):
+            delattr(self.vlm.model.language_model, "_cached_deepstack_indices")
+            logger.info("Deleted _cached_deepstack_indices in Qwen3VLTextModel")
+
+    @torch.inference_mode()
     def sample_trajectories_from_data_with_streaming_vlm_rollout(
         self,
         data: dict[str, Any],
@@ -680,6 +690,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             )
             cur_pos += 1
 
+        logger.info(f"cur_pos: {cur_pos}")
         output_ids = replace_padding_after_eos(
             token_ids=output_ids,
             eos_token_id=self.traj_start_token_id,
@@ -688,27 +699,27 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # Find <traj_future_start> position
         traj_start_pos = self._find_traj_start_positions(output_ids)
-        prefill_output_len = self._past_key_values.get_seq_length()
-
-        # MODIFIED: Calculate offset for action tokens. In streaming setting, the offset is wrong without the modification due to truncated input length.
-        # But the length of kv cache is always the same.
-        if not self.is_first_prefill:
-            streaming_input_len = seq_len
-            offset = self.prefill_seq_length + (traj_start_pos - streaming_input_len) + 1
-        else:
-            offset = traj_start_pos + 1
+        logger.info(f"traj_start_pos: {traj_start_pos}")        
 
         # ===== Action (Diffusion) =====
         # Note: Action only attends to prompt tokens, NOT reasoning tokens (they are masked out).
         # This is by design - the expert model conditions only on the original prompt.
         num_samples = num_traj_samples * num_traj_sets
-        action_start_pos = traj_start_pos + 1
+        # action_start_pos = traj_start_pos + 1
+
+        # MODIFIED: Calculate offset for action tokens. In streaming setting, the offset is wrong without the modification due to truncated input length.
+        # But the length of kv cache is always the same.
+        if not self.is_first_prefill:
+            streaming_input_len = seq_len
+            action_start_pos = self.prefill_seq_length + (traj_start_pos - streaming_input_len) + 1
+        else:
+            action_start_pos = traj_start_pos + 1
         logger.info(f"action_start_pos: {action_start_pos}")
 
         # Build position_ids for action tokens
         position_ids = torch.arange(self.num_action_tokens, device=device)
         position_ids = einops.repeat(position_ids, "t -> 3 b t", b=batch_size).clone()
-        position_ids += (self._cached_rope_deltas + offset[:, None]).to(device)
+        position_ids += (self._cached_rope_deltas + action_start_pos[:, None]).to(device)
         logger.info(f"position_ids: {position_ids}")
 
         # Build attention mask: attend to prompt only, mask out reasoning tokens
@@ -730,8 +741,8 @@ class StreamingAlpamayoR1(ReasoningVLA):
             total_samples=batch_size * num_samples,
             device=device,
             position_ids=position_ids,
+            cache_position=cache_position,
             attention_mask=attention_mask,
-            prefill_output_len=prefill_output_len,
             diffusion_kwargs=diffusion_kwargs,
         )
 

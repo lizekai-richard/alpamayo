@@ -205,10 +205,10 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
 
 _PATCHED_CLASSES = {
     "Qwen3VLVisionModel": Qwen3VLVisionModel,
+    "Qwen3VLTextModel": Qwen3VLTextModel,
     "Qwen3VLVisionPatchEmbed": Qwen3VLVisionPatchEmbed,
     "Qwen3VLVisionAttention": Qwen3VLVisionAttention,
     "Qwen3VLTextAttention": Qwen3VLTextAttention,
-    "Qwen3VLTextModel": Qwen3VLTextModel,
 }
 
 

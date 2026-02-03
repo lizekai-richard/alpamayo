@@ -172,7 +172,7 @@ def test_streaming_inference():
     run_streaming_inference(streaming_inputs)
     print(f"\nCompleted streaming inference")
 
-
+@torch.inference_mode()
 def test_streaming_inference_compiled():
     """Test streaming inference with compiled model."""
     print("Loading model...")
