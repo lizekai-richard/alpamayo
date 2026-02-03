@@ -700,13 +700,15 @@ class AlpamayoR1(ReasoningVLA):
         # Setup generation
         max_new_tokens = kwargs.get("max_generation_length", self.config.tokens_per_future_traj)
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
-        self.max_cache_len = self.prefill_seq_length + max_new_tokens
+
+        cache_len = self.prefill_seq_length + max_new_tokens + self.num_action_tokens
+        self.max_cache_len = cache_len
 
         # Initialize KV cache on first call
         if self._past_key_values is None:
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
-                max_cache_len=self.max_cache_len,
+                max_cache_len=cache_len,
                 offloading=False,
             )
 
@@ -715,7 +717,9 @@ class AlpamayoR1(ReasoningVLA):
             self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, device)
             self._update_past_key_values()
             self.is_first_prefill = False
-            return None
+            if kwargs.get("return_extra", False):
+                return None, None, None
+            return None, None
 
         # Prepare input_ids for streaming (slice off system prompt)
         vision_start_token_id = self.tokenizer.encode("<|vision_start|>")[0]
@@ -814,7 +818,7 @@ class AlpamayoR1(ReasoningVLA):
             num_action_tokens=self.num_action_tokens,
             total_samples=batch_size * num_samples,
             device=device,
-            position_ids=position_ids,
+            position_ids=self._cached_position_ids,
             cache_position=cache_position,
             attention_mask=attention_mask,
             mode="streaming",
@@ -1074,5 +1078,5 @@ class AlpamayoR1(ReasoningVLA):
             self._past_key_values.reset()
 
 
-AutoConfig.register("alpamayo_r1_unified", AlpamayoR1Config)
+AutoConfig.register("alpamayo_r1", AlpamayoR1Config)
 AutoModel.register(AlpamayoR1Config, AlpamayoR1)

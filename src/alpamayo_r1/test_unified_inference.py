@@ -116,7 +116,7 @@ def calc_minADE(gt_future_xy, pred_xyz):
 
 
 @torch.inference_mode()
-def run_streaming_inference(model, streaming_inputs):
+def run_streaming_inference(model, model_inputs, _logging: bool = True):
     """
     Run streaming inference with sliding window inputs.
 
@@ -129,42 +129,39 @@ def run_streaming_inference(model, streaming_inputs):
             - ego_history_xyz: history trajectory positions
             - ego_history_rot: history trajectory rotations
     """
-    for step_idx, model_inputs in enumerate(streaming_inputs):
-
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
-                data=helper.to_device(model_inputs, "cuda"),
-                top_p=0.98,
-                temperature=0.6,
-                num_traj_samples=1,
-                max_generation_length=256,
-                return_extra=True,
-            )
-
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+            data=helper.to_device(model_inputs, "cuda"),
+            top_p=0.98,
+            temperature=0.6,
+            num_traj_samples=1,
+            max_generation_length=256,
+            return_extra=True,
+        )
+    
+    if _logging:
         min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
-        logger.info(f"\n=== Step {step_idx} ===")
         logger.info("Chain-of-Causation:\n", extra["cot"][0])
         logger.info(f"MinADE: {min_ade}")
 
 
 @torch.inference_mode()
-def run_non_streaming_inference(model, streaming_inputs):
+def run_non_streaming_inference(model, model_inputs, _logging: bool = True):
     """
     Run non-streaming inference with sliding window inputs.
     """
-    for step_idx, model_inputs in enumerate(streaming_inputs):
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
-                data=helper.to_device(model_inputs, "cuda"),
-                top_p=0.98,
-                temperature=0.6,
-                num_traj_samples=1,
-                max_generation_length=256,
-                return_extra=True,
-            )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+            data=helper.to_device(model_inputs, "cuda"),
+            top_p=0.98,
+            temperature=0.6,
+            num_traj_samples=1,
+            max_generation_length=256,
+            return_extra=True,
+        )
 
+    if _logging:
         min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
-        logger.info(f"\n=== Step {step_idx} ===")
         logger.info("Chain-of-Causation:\n", extra["cot"][0])
         logger.info(f"MinADE: {min_ade}")
 
@@ -183,7 +180,7 @@ def test_non_streaming_inference(model, processor):
     logger.info("Warming up model...")
     for i in range(3):
         model_inputs = streaming_inputs[i]
-        run_non_streaming_inference(model, model_inputs)
+        run_non_streaming_inference(model, model_inputs, _logging=False)
     logger.info("Warmup completed")
 
     logger.info(f"Running non-streaming inference for {len(streaming_inputs)} windows:")
@@ -191,7 +188,7 @@ def test_non_streaming_inference(model, processor):
     for i in range(3, len(streaming_inputs)):
         model_inputs = streaming_inputs[i]
         start_time = time.perf_counter()
-        run_non_streaming_inference(model, model_inputs)
+        run_non_streaming_inference(model, model_inputs, _logging=True)
         end_time = time.perf_counter()
         total_time += end_time - start_time
         logger.info(f"Time taken for step {i}: {end_time - start_time} seconds")
@@ -215,7 +212,7 @@ def test_streaming_inference(model, processor):
     # warmup the model
     for i in range(3):
         streaming_input = streaming_inputs[i]
-        run_streaming_inference(model, streaming_input)
+        run_streaming_inference(model, streaming_input, _logging=False)
     logger.info("Warmup completed")
 
     logger.info(f"Running streaming inference for {len(streaming_inputs)} windows:")
@@ -223,7 +220,7 @@ def test_streaming_inference(model, processor):
     for i in range(3, len(streaming_inputs)):
         model_inputs = streaming_inputs[i]
         start_time = time.perf_counter()
-        run_streaming_inference(model, model_inputs)
+        run_streaming_inference(model, model_inputs, _logging=True)
         end_time = time.perf_counter()
         total_time += end_time - start_time
         logger.info(f"Time taken for step {i}: {end_time - start_time} seconds")
