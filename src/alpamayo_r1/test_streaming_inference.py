@@ -204,6 +204,7 @@ def test_streaming_inference_compiled():
             )
 
     print("Running streaming inference...")
+    total_time = 0
     for i in range(3, 10):
         streaming_input = streaming_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -222,6 +223,9 @@ def test_streaming_inference_compiled():
             min_ade = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
             print(f"MinADE: {min_ade}")
             print("Chain-of-Causation:\n", extra["cot"][0])
+            total_time += end_time - start_time
+    print(f"Total time taken: {total_time} seconds")
+    print(f"Average time per step: {total_time / 7} seconds")
 
 
 if __name__ == "__main__":

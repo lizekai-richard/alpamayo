@@ -514,7 +514,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
         padding_length = self.max_cache_len - self.prefill_seq_length
         if padding_length > 0:
             last_pos = position_ids[:, :, -1:]
-            logger.info(f"last_pos: {last_pos}")
             padding_pos = last_pos + torch.arange(1, padding_length + 1, device=device)
             position_ids = torch.cat([position_ids, padding_pos], dim=-1)
 
@@ -625,11 +624,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
             self._update_past_key_values()
             self.is_first_prefill = False
             return
-        
-        logger.info(f"_cached_position_ids: {self._cached_position_ids.shape}")
-        logger.info(f"_cached_attention_mask: {self._cached_attention_mask.shape}")
-        logger.info(f"kv_cache valid length: {self._past_key_values.get_seq_length()}")
-        logger.info(f"kv_cache max length: {self._past_key_values.max_cache_len}")
 
         # Prepare input_ids for streaming (slice off system prompt for non-first prefill)
         vision_start_token_id = self.processor.tokenizer.encode("<|vision_start|>")[0]
@@ -692,7 +686,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
             )
             cur_pos += 1
 
-        logger.info(f"cur_pos: {cur_pos}")
         output_ids = replace_padding_after_eos(
             token_ids=output_ids,
             eos_token_id=self.traj_start_token_id,
@@ -701,7 +694,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # Find <traj_future_start> position
         traj_start_pos = self._find_traj_start_positions(output_ids)
-        logger.info(f"traj_start_pos: {traj_start_pos}")        
 
         # ===== Action (Diffusion) =====
         # Note: Action only attends to prompt tokens, NOT reasoning tokens (they are masked out).
@@ -716,14 +708,11 @@ class StreamingAlpamayoR1(ReasoningVLA):
             action_start_pos = self.prefill_seq_length + (traj_start_pos - streaming_input_len) + 1
         else:
             action_start_pos = traj_start_pos + 1
-        logger.info(f"action_start_pos: {action_start_pos}")
 
         # Build position_ids for action tokens
         position_ids = torch.arange(self.num_action_tokens, device=device)
         position_ids = einops.repeat(position_ids, "t -> 3 b t", b=batch_size).clone()
         position_ids += (self._cached_rope_deltas + action_start_pos[:, None]).to(device)
-        logger.info(f"self._cached_rope_deltas: {self._cached_rope_deltas}")
-        logger.info(f"position_ids: {position_ids}")
 
         # Build attention mask: attend to prompt only, mask out reasoning tokens
         indices = torch.arange(self._past_key_values.max_cache_len, device=device)
@@ -737,7 +726,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
         cache_position = torch.arange(
             cur_pos, cur_pos + self.num_action_tokens, device=device
         )
-        logger.info(f"cache_position: {cache_position}")
 
         sampled_action = self._action(
             num_action_tokens=self.num_action_tokens,
