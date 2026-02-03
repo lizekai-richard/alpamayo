@@ -633,7 +633,7 @@ class AlpamayoR1(ReasoningVLA):
         """Streaming mode: reuses KV cache, first call is prefill only."""
         self._torch_compile = torch_compile
         if not hasattr(self, "_patched_for_compile"):
-            patch_for_torch_compile(self)
+            patch_for_torch_compile(self, mode="streaming")
             self._patched_for_compile = True
 
         # Extract inputs
@@ -668,7 +668,7 @@ class AlpamayoR1(ReasoningVLA):
             )
 
         if self.is_first_prefill:
-            logger.info("Streaming: First prefill - caching KV and returning.")
+            logger.info("Streaming: First prefill - caching KV, position_ids, and attention_mask.")
             self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, device)
             self._update_past_key_values()
             self.is_first_prefill = False
@@ -745,6 +745,8 @@ class AlpamayoR1(ReasoningVLA):
         # ===== Action (Diffusion) =====
         num_samples = num_traj_samples * num_traj_sets
         streaming_input_len = seq_len
+
+        # Note: we must add back the truncated input length in the streaming step.
         action_start_pos = self.prefill_seq_length + (traj_start_pos - streaming_input_len) + 1
 
         # Build position_ids for action tokens
@@ -812,7 +814,7 @@ class AlpamayoR1(ReasoningVLA):
         """Non-streaming mode: resets KV cache each call, processes all frames."""
         self._torch_compile = torch_compile
         if not hasattr(self, "_patched_for_compile"):
-            patch_for_torch_compile(self)
+            patch_for_torch_compile(self, mode="non-streaming")
             self._patched_for_compile = True
 
         # Extract inputs
@@ -839,6 +841,7 @@ class AlpamayoR1(ReasoningVLA):
 
         # Initialize or reset KV cache
         cache_len = seq_len + max_new_tokens + self.num_action_tokens
+        self.max_cache_len = cache_len
         if self._past_key_values is None:
             self._past_key_values = StaticCache(
                 config=self.vlm.config,

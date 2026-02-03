@@ -210,12 +210,19 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
         )
 
 
-_PATCHED_CLASSES = {
+_PATCHED_CLASSES_STREAMING = {
     "Qwen3VLVisionModel": Qwen3VLVisionModel,
     "Qwen3VLTextModel": Qwen3VLTextModel,
     "Qwen3VLVisionPatchEmbed": Qwen3VLVisionPatchEmbed,
     "Qwen3VLVisionAttention": Qwen3VLVisionAttention,
-    "Qwen3VLTextAttention": Qwen3VLTextAttention,
+    "Qwen3VLTextAttention": Qwen3VLTextAttention,  # Order matters. Replace the parent(Qwen3VLTextModel) first
+}
+
+_PATCHED_CLASSES_NON_STREAMING = {
+    "Qwen3VLVisionModel": Qwen3VLVisionModel,
+    "Qwen3VLVisionPatchEmbed": Qwen3VLVisionPatchEmbed,
+    "Qwen3VLVisionAttention": Qwen3VLVisionAttention,
+    "Qwen3VLTextModel": Qwen3VLTextModel,
 }
 
 
@@ -249,8 +256,12 @@ def _replace_module(
     setattr(parent, name, new_module)
 
 
-def patch_for_torch_compile(model: nn.Module) -> None:
+def patch_for_torch_compile(model: nn.Module, mode: ["streaming", "non-streaming"] = "streaming") -> None:
     """Patch Qwen3-VL modules for torch.compile compatibility."""
+    if mode == "streaming":
+        _PATCHED_CLASSES = _PATCHED_CLASSES_STREAMING
+    else:
+        _PATCHED_CLASSES = _PATCHED_CLASSES_NON_STREAMING
     for class_name, patched_class in _PATCHED_CLASSES.items():
         for module_path, module in model.named_modules():
             if type(module).__name__ == class_name:
