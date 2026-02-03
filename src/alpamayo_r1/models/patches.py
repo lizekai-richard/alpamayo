@@ -11,6 +11,9 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_
 from transformers.models.qwen3_vl.modeling_qwen3_vl import rotate_half
 from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen3VLVisionPatchEmbed(qwen3vl.Qwen3VLVisionPatchEmbed):
@@ -161,23 +164,27 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
         cache_position: Optional[torch.LongTensor] = None,
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+        streaming_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[tuple, BaseModelOutputWithPast]:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-
+        
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
         position_ids = position_ids[0]
 
-        if inputs_embeds.shape[1] > 1:
-            attention_mask = create_causal_mask(
-                config=self.config,
-                input_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-            )
+        if inputs_embeds.shape[1] > 1:  # prefill, attention handles decode by default
+            if streaming_attention_mask is not None:
+                attention_mask = streaming_attention_mask
+            else:
+                attention_mask = create_causal_mask(
+                    config=self.config,
+                    input_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    cache_position=cache_position,
+                    past_key_values=past_key_values,
+                    position_ids=position_ids,
+                )
 
         if deepstack_visual_embeds is not None and not hasattr(self, "_cached_deepstack_indices"):
             self._cached_deepstack_indices = visual_pos_masks.flatten().nonzero(as_tuple=True)[0]

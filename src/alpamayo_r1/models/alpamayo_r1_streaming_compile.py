@@ -384,14 +384,14 @@ class StreamingAlpamayoR1(ReasoningVLA):
         num_action_tokens: int,
         total_samples: int,
         device: torch.device,
-        position_ids: torch.Tensor,
+        # position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         cache_position: torch.Tensor,
         diffusion_kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         if not hasattr(self, "_action_fn"):
             # Initialize static buffers
-            self._action_position_ids = torch.empty_like(position_ids)
+            # self._action_position_ids = torch.empty_like(position_ids)
             self._action_attention_mask = torch.empty_like(attention_mask)
             self._action_cache_position = torch.empty_like(cache_position)
             self._action_noise = torch.empty(
@@ -407,7 +407,8 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
                 hidden = self.expert(
                     inputs_embeds=action_embeds,
-                    position_ids=self._action_position_ids,
+                    # position_ids=self._action_position_ids,
+                    position_ids=self._cached_position_ids,
                     past_key_values=self._past_key_values,
                     attention_mask=self._action_attention_mask,
                     cache_position=self._action_cache_position,
@@ -429,7 +430,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             self._action_fn = action_fn
 
         # Copy inputs to static buffers
-        self._action_position_ids.copy_(position_ids)
+        # self._action_position_ids.copy_(position_ids)
         self._action_attention_mask.copy_(attention_mask)
         self._action_cache_position.copy_(cache_position)
 
@@ -513,6 +514,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         padding_length = self.max_cache_len - self.prefill_seq_length
         if padding_length > 0:
             last_pos = position_ids[:, :, -1:]
+            logger.info(f"last_pos: {last_pos}")
             padding_pos = last_pos + torch.arange(1, padding_length + 1, device=device)
             position_ids = torch.cat([position_ids, padding_pos], dim=-1)
 
@@ -720,6 +722,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         position_ids = torch.arange(self.num_action_tokens, device=device)
         position_ids = einops.repeat(position_ids, "t -> 3 b t", b=batch_size).clone()
         position_ids += (self._cached_rope_deltas + action_start_pos[:, None]).to(device)
+        logger.info(f"self._cached_rope_deltas: {self._cached_rope_deltas}")
         logger.info(f"position_ids: {position_ids}")
 
         # Build attention mask: attend to prompt only, mask out reasoning tokens
@@ -740,7 +743,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             num_action_tokens=self.num_action_tokens,
             total_samples=batch_size * num_samples,
             device=device,
-            position_ids=position_ids,
+            # position_ids=self._cached_position_ids,
             cache_position=cache_position,
             attention_mask=attention_mask,
             diffusion_kwargs=diffusion_kwargs,
@@ -760,7 +763,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
         # Update streaming state
         # self._crop_static_cache(self.prefill_seq_length)
         self._update_past_key_values()
-        self.is_first_prefill = False
 
         if kwargs.get("return_extra", False):
             extra = extract_text_tokens(self.tokenizer, output_ids)
