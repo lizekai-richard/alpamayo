@@ -268,6 +268,9 @@ class AlpamayoR1(ReasoningVLA):
             self._action_position_ids = torch.empty_like(position_ids)
             self._action_attention_mask = torch.empty_like(attention_mask)
             self._action_cache_position = torch.empty_like(cache_position)
+            self._action_noise = torch.empty(
+                total_samples, *self.action_space.get_action_space_dims(), device=device, dtype=torch.bfloat16
+            )
             expert_kwargs = {"is_causal": False} if self.config.expert_non_causal_attention else {}
             action_dims = self.action_space.get_action_space_dims()
 
@@ -289,6 +292,7 @@ class AlpamayoR1(ReasoningVLA):
 
             def action_fn():
                 return self.diffusion.sample(
+                    noise=self._action_noise,
                     batch_size=total_samples,
                     step_fn=step_fn,
                     device=device,
@@ -303,11 +307,8 @@ class AlpamayoR1(ReasoningVLA):
         self._action_attention_mask.copy_(attention_mask)
         self._action_cache_position.copy_(cache_position)
 
-        # Prepare noise outside compiled graph for deterministic RNG
-        if self._use_compile and hasattr(self.diffusion, "prepare_noise"):
-            self.diffusion.prepare_noise(batch_size=total_samples, device=device)
-        elif hasattr(self.diffusion, "clear_cached_noise"):
-            self.diffusion.clear_cached_noise()
+        # Generate noise outside compiled graph for deterministic RNG
+        self._action_noise.normal_()
 
         # Warmup and compile on first call (if enabled)
         if not hasattr(self, "_compiled_action_fn"):
@@ -370,22 +371,10 @@ class AlpamayoR1(ReasoningVLA):
             logprob: The log probability.
         """
         # Patch model for inference on first call
-        if not hasattr(self, "_inference_initialized"):
-            patch_qwen3vl_for_inference(self.vlm)
-            patch_qwen3vl_for_inference(self.expert)
-            self._inference_initialized = True
-
-        # Clear compiled functions if compile mode changed
-        if getattr(self, "_use_compile", None) != use_compile:
-            for attr in (
-                "_compiled_encode_fn",
-                "_compiled_prefill_fn",
-                "_compiled_decode_fn",
-                "_compiled_action_fn",
-            ):
-                if hasattr(self, attr):
-                    delattr(self, attr)
         self._use_compile = use_compile
+        if self._use_compile and not hasattr(self, "_inference_initialized"):
+            patch_qwen3vl_for_inference(self)
+            self._inference_initialized = True
 
         # Extract inputs
         tokenized = data["tokenized_data"]
