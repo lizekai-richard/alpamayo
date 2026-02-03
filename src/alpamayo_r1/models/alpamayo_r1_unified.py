@@ -367,37 +367,57 @@ class AlpamayoR1(ReasoningVLA):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         cache_position: torch.Tensor,
+        mode: str = "streaming",
     ) -> torch.Tensor:
-        """Run decode forward pass for a single token."""
-        if not hasattr(self, "_decode_fn"):
-            self._decode_input_ids = torch.empty_like(input_ids)
-            self._decode_position_ids = torch.empty_like(position_ids)
-            self._decode_cache_position = torch.empty_like(cache_position)
+        """Run decode forward pass for a single token.
+
+        Args:
+            mode: "streaming" or "non_streaming" - determines which set of compiled
+                  functions and static buffers to use.
+        """
+        # Use mode-specific attribute names
+        fn_attr = f"_decode_fn_{mode}"
+        compiled_attr = f"_compiled_decode_fn_{mode}"
+        input_ids_attr = f"_decode_input_ids_{mode}"
+        pos_ids_attr = f"_decode_position_ids_{mode}"
+        cache_pos_attr = f"_decode_cache_position_{mode}"
+
+        if not hasattr(self, fn_attr):
+            # Create mode-specific static buffers
+            setattr(self, input_ids_attr, torch.empty_like(input_ids))
+            setattr(self, pos_ids_attr, torch.empty_like(position_ids))
+            setattr(self, cache_pos_attr, torch.empty_like(cache_position))
+
+            # Capture buffer references for closure
+            decode_input_ids = getattr(self, input_ids_attr)
+            decode_position_ids = getattr(self, pos_ids_attr)
+            decode_cache_position = getattr(self, cache_pos_attr)
 
             def decode_fn():
                 hidden = self.vlm.model.language_model(
-                    input_ids=self._decode_input_ids,
-                    position_ids=self._decode_position_ids,
+                    input_ids=decode_input_ids,
+                    position_ids=decode_position_ids,
                     past_key_values=self._past_key_values,
-                    cache_position=self._decode_cache_position,
+                    cache_position=decode_cache_position,
                     use_cache=True,
                 ).last_hidden_state[:, -1]
                 return self.vlm.lm_head(hidden)
 
-            self._decode_fn = decode_fn
+            setattr(self, fn_attr, decode_fn)
 
-        self._decode_input_ids.copy_(input_ids)
-        self._decode_position_ids.copy_(position_ids)
-        self._decode_cache_position.copy_(cache_position)
+        # Copy input tensors to static buffers
+        getattr(self, input_ids_attr).copy_(input_ids)
+        getattr(self, pos_ids_attr).copy_(position_ids)
+        getattr(self, cache_pos_attr).copy_(cache_position)
 
-        if not hasattr(self, "_compiled_decode_fn"):
-            self._decode_fn()  # Warmup
-            self._compiled_decode_fn = torch.compile(
-                self._decode_fn, mode=self._torch_compile, fullgraph=True
-            )
+        if not hasattr(self, compiled_attr):
+            getattr(self, fn_attr)()  # Warmup
+            setattr(self, compiled_attr, torch.compile(
+                getattr(self, fn_attr), mode=self._torch_compile, fullgraph=True
+            ))
 
         torch.compiler.cudagraph_mark_step_begin()
-        return self._compiled_decode_fn()
+        return getattr(self, compiled_attr)()
 
     def _action(
         self,
@@ -407,18 +427,40 @@ class AlpamayoR1(ReasoningVLA):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         cache_position: torch.Tensor,
+        mode: str = "streaming",
         diffusion_kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor:
-        """Run diffusion sampling for action prediction."""
-        if not hasattr(self, "_action_fn"):
-            self._action_position_ids = torch.empty_like(position_ids)
-            self._action_attention_mask = torch.empty_like(attention_mask)
-            self._action_cache_position = torch.empty_like(cache_position)
-            self._action_noise = torch.empty(
+        """Run diffusion sampling for action prediction.
+
+        Args:
+            mode: "streaming" or "non_streaming" - determines which set of compiled
+                  functions and static buffers to use.
+        """
+        # Use mode-specific attribute names to separate streaming vs non-streaming buffers
+        fn_attr = f"_action_fn_{mode}"
+        compiled_attr = f"_compiled_action_fn_{mode}"
+        pos_ids_attr = f"_action_position_ids_{mode}"
+        attn_mask_attr = f"_action_attention_mask_{mode}"
+        cache_pos_attr = f"_action_cache_position_{mode}"
+        noise_attr = f"_action_noise_{mode}"
+
+        if not hasattr(self, fn_attr):
+            # Create mode-specific static buffers
+            setattr(self, pos_ids_attr, torch.empty_like(position_ids))
+            setattr(self, attn_mask_attr, torch.empty_like(attention_mask))
+            setattr(self, cache_pos_attr, torch.empty_like(cache_position))
+            setattr(self, noise_attr, torch.empty(
                 total_samples, *self.action_space.get_action_space_dims(), device=device, dtype=torch.bfloat16
-            )
+            ))
+
             expert_kwargs = {"is_causal": False} if self.config.expert_non_causal_attention else {}
             action_dims = self.action_space.get_action_space_dims()
+
+            # Capture buffer references for closure
+            action_position_ids = getattr(self, pos_ids_attr)
+            action_attention_mask = getattr(self, attn_mask_attr)
+            action_cache_position = getattr(self, cache_pos_attr)
+            action_noise = getattr(self, noise_attr)
 
             def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
                 action_embeds = self.action_in_proj(x, t)
@@ -427,10 +469,10 @@ class AlpamayoR1(ReasoningVLA):
 
                 hidden = self.expert(
                     inputs_embeds=action_embeds,
-                    position_ids=self._action_position_ids,
+                    position_ids=action_position_ids,
                     past_key_values=self._past_key_values,
-                    attention_mask=self._action_attention_mask,
-                    cache_position=self._action_cache_position,
+                    attention_mask=action_attention_mask,
+                    cache_position=action_cache_position,
                     use_cache=True,
                     **expert_kwargs,
                 ).last_hidden_state[:, -num_action_tokens:]
@@ -438,7 +480,7 @@ class AlpamayoR1(ReasoningVLA):
 
             def action_fn():
                 return self.diffusion.sample(
-                    noise=self._action_noise,
+                    noise=action_noise,
                     batch_size=total_samples,
                     step_fn=step_fn,
                     device=device,
@@ -446,23 +488,24 @@ class AlpamayoR1(ReasoningVLA):
                     **(diffusion_kwargs or {}),
                 )
 
-            self._action_fn = action_fn
+            setattr(self, fn_attr, action_fn)
 
-        self._action_position_ids.copy_(position_ids)
-        self._action_attention_mask.copy_(attention_mask)
-        self._action_cache_position.copy_(cache_position)
+        # Copy input tensors to static buffers
+        getattr(self, pos_ids_attr).copy_(position_ids)
+        getattr(self, attn_mask_attr).copy_(attention_mask)
+        getattr(self, cache_pos_attr).copy_(cache_position)
 
         # Generate noise outside compiled graph for deterministic RNG
-        self._action_noise.normal_()
+        getattr(self, noise_attr).normal_()
 
-        if not hasattr(self, "_compiled_action_fn"):
-            self._action_fn()  # Warmup
-            self._compiled_action_fn = torch.compile(
-                self._action_fn, mode=self._torch_compile, fullgraph=True
-            )
+        if not hasattr(self, compiled_attr):
+            getattr(self, fn_attr)()  # Warmup
+            setattr(self, compiled_attr, torch.compile(
+                getattr(self, fn_attr), mode=self._torch_compile, fullgraph=True
+            ))
 
         torch.compiler.cudagraph_mark_step_begin()
-        return self._compiled_action_fn()
+        return getattr(self, compiled_attr)()
 
     # ==================== Logits Processor ====================
 
@@ -730,6 +773,7 @@ class AlpamayoR1(ReasoningVLA):
                 input_ids=next_token.unsqueeze(-1),
                 position_ids=self._cached_position_ids,
                 cache_position=torch.tensor([cur_pos], device=device),
+                mode="streaming",
             )
             cur_pos += 1
 
@@ -773,6 +817,7 @@ class AlpamayoR1(ReasoningVLA):
             position_ids=position_ids,
             cache_position=cache_position,
             attention_mask=attention_mask,
+            mode="streaming",
             diffusion_kwargs=diffusion_kwargs,
         )
 
@@ -893,6 +938,7 @@ class AlpamayoR1(ReasoningVLA):
                 input_ids=next_token.unsqueeze(-1),
                 position_ids=(cur_pos + rope_deltas).unsqueeze(0).expand(3, -1, -1),
                 cache_position=torch.tensor([cur_pos], device=device),
+                mode="non_streaming",
             )
             cur_pos += 1
 
@@ -933,6 +979,7 @@ class AlpamayoR1(ReasoningVLA):
             position_ids=position_ids,
             cache_position=cache_position,
             attention_mask=attention_mask,
+            mode="non_streaming",
             diffusion_kwargs=diffusion_kwargs,
         )
 

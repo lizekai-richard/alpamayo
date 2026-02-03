@@ -21,22 +21,21 @@ import logging
 import torch
 import time
 import numpy as np
-from alpamayo_r1.models.alpamayo_r1_streaming import StreamingAlpamayoR1
+from alpamayo_r1.models.alpamayo_r1_unified import AlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
-# Configure logging to show INFO level messages
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-# )
-
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Example clip ID
 clip_id = "030c760c-ae38-49aa-9ad8-f5650a545d26"
 
 def load_model():
-    model = StreamingAlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
+    model = AlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
     processor = helper.get_processor(model.tokenizer)
     return model, processor
 
@@ -115,6 +114,7 @@ def calc_minADE(gt_future_xy, pred_xyz):
     min_ade = diff.min()
     return min_ade
 
+
 @torch.inference_mode()
 def run_streaming_inference(model, streaming_inputs):
     """
@@ -130,8 +130,6 @@ def run_streaming_inference(model, streaming_inputs):
             - ego_history_rot: history trajectory rotations
     """
     for step_idx, model_inputs in enumerate(streaming_inputs):
-        # Remove is_prefill flag if present (not needed by model)
-        is_prefill = model_inputs.pop("is_prefill", step_idx == 0)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
@@ -144,83 +142,97 @@ def run_streaming_inference(model, streaming_inputs):
             )
 
         min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
-        print(f"\n=== Step {step_idx} ({'prefill' if is_prefill else 'streaming'}) ===")
-        print("Chain-of-Causation:\n", extra["cot"][0])
-        print(f"MinADE: {min_ade}")
-
-
-def test_streaming_inference(model, processor):
-    """Test streaming inference with sliding window."""
-    print(f"Creating sliding window inputs for clip_id: {clip_id}")
-
-    # Create 3 windows: 1 prefill + 2 streaming steps
-    streaming_inputs = create_sliding_window_inputs(
-        processor=processor,
-        num_windows=10,
-        clip_id=clip_id,
-        t0_us=5_100_000,
-    )
-
-    print(f"Created {len(streaming_inputs)} windows:")
-    for i, inp in enumerate(streaming_inputs):
-        pixel_values = inp["tokenized_data"]["pixel_values"]
-        print(f"  Window {i}: pixel_values shape = {pixel_values.shape}, is_prefill = {inp.get('is_prefill', False)}")
-
-    run_streaming_inference(model, streaming_inputs)
-    print(f"\nCompleted streaming inference")
+        logger.info(f"\n=== Step {step_idx} ===")
+        logger.info("Chain-of-Causation:\n", extra["cot"][0])
+        logger.info(f"MinADE: {min_ade}")
 
 
 @torch.inference_mode()
-def test_streaming_inference_compiled(model, processor):
-    """Test streaming inference with compiled model."""
-    print("Loading model...")
-    print("Warming up model...")
+def run_non_streaming_inference(model, streaming_inputs):
+    """
+    Run non-streaming inference with sliding window inputs.
+    """
+    for step_idx, model_inputs in enumerate(streaming_inputs):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+                data=helper.to_device(model_inputs, "cuda"),
+                top_p=0.98,
+                temperature=0.6,
+                num_traj_samples=1,
+                max_generation_length=256,
+                return_extra=True,
+            )
+
+        min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
+        logger.info(f"\n=== Step {step_idx} ===")
+        logger.info("Chain-of-Causation:\n", extra["cot"][0])
+        logger.info(f"MinADE: {min_ade}")
+
+
+@torch.inference_mode()
+def test_non_streaming_inference(model, processor):
+    """Test non-streaming inference."""
+    
     streaming_inputs = create_sliding_window_inputs(
         processor=processor,
         num_windows=10,
         clip_id=clip_id,
         t0_us=5_100_000,
     )
+
+    logger.info("Warming up model...")
+    for i in range(3):
+        model_inputs = streaming_inputs[i]
+        run_non_streaming_inference(model, model_inputs)
+    logger.info("Warmup completed")
+
+    logger.info(f"Running non-streaming inference for {len(streaming_inputs)} windows:")
+    total_time = 0
+    for i in range(3, len(streaming_inputs)):
+        model_inputs = streaming_inputs[i]
+        start_time = time.perf_counter()
+        run_non_streaming_inference(model, model_inputs)
+        end_time = time.perf_counter()
+        total_time += end_time - start_time
+        logger.info(f"Time taken for step {i}: {end_time - start_time} seconds")
+    logger.info(f"Total time taken: {total_time} seconds")
+    logger.info(f"Average time per step: {total_time / len(streaming_inputs)} seconds")
+    logger.info(f"\nCompleted non-streaming inference")
+
+
+@torch.inference_mode()
+def test_streaming_inference(model, processor):
+    """Test streaming inference."""
     
+    streaming_inputs = create_sliding_window_inputs(
+        processor=processor,
+        num_windows=10,
+        clip_id=clip_id,
+        t0_us=5_100_000,
+    )
+        
+    logger.info("Warming up model...")
     # warmup the model
     for i in range(3):
         streaming_input = streaming_inputs[i]
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            model.sample_trajectories_from_data_with_streaming_vlm_rollout(
-                data=helper.to_device(streaming_input, "cuda"),
-                top_p=0.98,
-                temperature=0.6,
-                num_traj_samples=1,
-                max_generation_length=256,
-                torch_compile="max-autotune",
-            )
+        run_streaming_inference(model, streaming_input)
+    logger.info("Warmup completed")
 
-    print("Running streaming inference...")
+    logger.info(f"Running streaming inference for {len(streaming_inputs)} windows:")
     total_time = 0
-    for i in range(3, 10):
-        streaming_input = streaming_inputs[i]
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            start_time = time.perf_counter()
-            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
-                data=helper.to_device(streaming_input, "cuda"),
-                top_p=0.98,
-                temperature=0.6,
-                num_traj_samples=1,
-                max_generation_length=256,
-                torch_compile="max-autotune",
-                return_extra=True,
-            )
-            end_time = time.perf_counter()
-            print(f"Time taken: {end_time - start_time} seconds")
-            min_ade = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
-            print(f"MinADE: {min_ade}")
-            print("Chain-of-Causation:\n", extra["cot"][0])
-            total_time += end_time - start_time
-    print(f"Total time taken: {total_time} seconds")
-    print(f"Average time per step: {total_time / 7} seconds")
+    for i in range(3, len(streaming_inputs)):
+        model_inputs = streaming_inputs[i]
+        start_time = time.perf_counter()
+        run_streaming_inference(model, model_inputs)
+        end_time = time.perf_counter()
+        total_time += end_time - start_time
+        logger.info(f"Time taken for step {i}: {end_time - start_time} seconds")
+    logger.info(f"Total time taken: {total_time} seconds")
+    logger.info(f"Average time per step: {total_time / len(streaming_inputs)} seconds")
+    logger.info(f"\nCompleted streaming inference")
 
 
 if __name__ == "__main__":
     model, processor = load_model()
     # test_streaming_inference(model, processor)
-    test_streaming_inference_compiled(model, processor)
+    test_streaming_inference(model, processor)

@@ -384,14 +384,12 @@ class StreamingAlpamayoR1(ReasoningVLA):
         num_action_tokens: int,
         total_samples: int,
         device: torch.device,
-        # position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         cache_position: torch.Tensor,
         diffusion_kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         if not hasattr(self, "_action_fn"):
             # Initialize static buffers
-            # self._action_position_ids = torch.empty_like(position_ids)
             self._action_attention_mask = torch.empty_like(attention_mask)
             self._action_cache_position = torch.empty_like(cache_position)
             self._action_noise = torch.empty(
@@ -407,7 +405,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
                 hidden = self.expert(
                     inputs_embeds=action_embeds,
-                    # position_ids=self._action_position_ids,
                     position_ids=self._cached_position_ids,
                     past_key_values=self._past_key_values,
                     attention_mask=self._action_attention_mask,
@@ -679,10 +676,8 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
             logits = self._decode(
                 input_ids=next_token.unsqueeze(-1),
-                # position_ids=(cur_pos + self._cached_rope_deltas).unsqueeze(0).expand(3, -1, -1),
                 position_ids=self._cached_position_ids,
                 cache_position=torch.tensor([cur_pos], device=device),
-                # attention_mask=self._cached_attention_mask,
             )
             cur_pos += 1
 
@@ -731,7 +726,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
             num_action_tokens=self.num_action_tokens,
             total_samples=batch_size * num_samples,
             device=device,
-            # position_ids=self._cached_position_ids,
             cache_position=cache_position,
             attention_mask=attention_mask,
             diffusion_kwargs=diffusion_kwargs,
