@@ -8,11 +8,14 @@ from transformers.cache_utils import Cache
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
+from transformers.models.qwen3_vl.modeling_qwen3_vl import rotate_half
+from transformers.integrations.flex_attention import flex_attention_forward
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
 
 class Qwen3VLVisionPatchEmbed(qwen3vl.Qwen3VLVisionPatchEmbed):
     def __init__(self, config) -> None:
-        nn.Module.__init__(self)  # Skip parent's Conv3d initialization
+        nn.Module.__init__(self)
         self.in_features = (
             config.in_channels * config.temporal_patch_size * config.patch_size**2
         )
@@ -93,6 +96,59 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
         return self.merger(hidden_states), deepstack_features
 
 
+def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to a single tensor."""
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    tensor_embed = (tensor * cos) + (rotate_half(tensor) * sin)
+    return tensor_embed
+
+
+class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
+    def forward(
+        self,
+        hidden_states=None,
+        position_embeddings=None,
+        attention_mask=None,
+        past_key_values=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        cos_q, sin_q = cos[:, cache_position, :], sin[:, cache_position, :]
+            
+        # store the un-roped keys and values
+        if past_key_values is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {'cache_position': cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        
+        query_states = apply_mrope_emb_single(query_states, cos_q, sin_q)
+        key_states = apply_mrope_emb_single(key_states, cos, sin)
+
+        attn_output, attn_weights = sdpa_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
 class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
     def forward(
         self,
@@ -105,39 +161,28 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
         cache_position: Optional[torch.LongTensor] = None,
         visual_pos_masks: Optional[torch.Tensor] = None,
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
-        streaming_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[tuple, BaseModelOutputWithPast]:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
         position_ids = position_ids[0]
 
-        # Create causal mask only for prefill when no 4D mask is provided
-        # - Decode (seq_len=1): skip, attention handles it
-        # - Action: already has custom 4D mask, skip
-        is_prefill = inputs_embeds.shape[1] > 1
-        has_4d_mask = attention_mask is not None and attention_mask.ndim == 4
-        if is_prefill and not has_4d_mask:
-            if streaming_attention_mask is not None:
-                attention_mask = streaming_attention_mask
-            else:
-                attention_mask = create_causal_mask(
-                    config=self.config,
-                    input_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    cache_position=cache_position,
-                    past_key_values=past_key_values,
-                    position_ids=position_ids,
-                )
+        if inputs_embeds.shape[1] > 1:
+            attention_mask = create_causal_mask(
+                config=self.config,
+                input_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
 
-
-        # Cache deepstack indices on first call (torch.compile compatibility)
         if deepstack_visual_embeds is not None and not hasattr(self, "_cached_deepstack_indices"):
             self._cached_deepstack_indices = visual_pos_masks.flatten().nonzero(as_tuple=True)[0]
 
+        hidden_states = inputs_embeds
         for layer_idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
                 hidden_states,
@@ -147,7 +192,7 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
             )
-            if deepstack_visual_embeds is not None and layer_idx < 3:
+            if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
                 flat_hidden = hidden_states.view(-1, hidden_states.shape[-1])
                 flat_hidden.index_add_(
                     0, self._cached_deepstack_indices, deepstack_visual_embeds[layer_idx]
@@ -162,6 +207,7 @@ _PATCHED_CLASSES = {
     "Qwen3VLVisionModel": Qwen3VLVisionModel,
     "Qwen3VLVisionPatchEmbed": Qwen3VLVisionPatchEmbed,
     "Qwen3VLVisionAttention": Qwen3VLVisionAttention,
+    "Qwen3VLTextAttention": Qwen3VLTextAttention,
     "Qwen3VLTextModel": Qwen3VLTextModel,
 }
 
@@ -184,7 +230,11 @@ def _replace_module(
     config = getattr(old_module, "config", None) or getattr(parent, "config", None)
     device, dtype = _get_device_dtype(old_module)
 
-    new_module = new_class(config)
+    if new_class is Qwen3VLTextAttention:
+        layer_idx = getattr(old_module, "layer_idx", None)
+        new_module = new_class(config, layer_idx)
+    else:
+        new_module = new_class(config)
     new_module.load_state_dict(old_module.state_dict(), assign=True)
     if device.type != "meta":
         new_module = new_module.to(device=device, dtype=dtype)
@@ -192,7 +242,8 @@ def _replace_module(
     setattr(parent, name, new_module)
 
 
-def patch_qwen3vl_for_inference(model: nn.Module) -> None:
+def patch_for_torch_compile(model: nn.Module) -> None:
+    """Patch Qwen3-VL modules for torch.compile compatibility."""
     for class_name, patched_class in _PATCHED_CLASSES.items():
         for module_path, module in model.named_modules():
             if type(module).__name__ == class_name:

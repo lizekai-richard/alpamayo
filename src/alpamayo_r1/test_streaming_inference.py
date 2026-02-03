@@ -19,30 +19,32 @@
 
 import logging
 import torch
+import time
 import numpy as np
 from alpamayo_r1.models.alpamayo_r1_streaming import StreamingAlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
 # Configure logging to show INFO level messages
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# )
 
 
 # Example clip ID
 clip_id = "030c760c-ae38-49aa-9ad8-f5650a545d26"
 
-# Load model and processor
-print("Loading model...")
-model = StreamingAlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
-processor = helper.get_processor(model.tokenizer)
-model._set_processor(processor)
-print("Model loaded.")
+# # Load model and processor
+# print("Loading model...")
+# model = StreamingAlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
+# processor = helper.get_processor(model.tokenizer)
+# model._set_processor(processor)
+# print("Model loaded.")
 
 
 def create_sliding_window_inputs(
+    processor,
     num_windows: int,
     clip_id: str,
     t0_us: int = 5_100_000,
@@ -156,6 +158,7 @@ def test_streaming_inference():
 
     # Create 3 windows: 1 prefill + 2 streaming steps
     streaming_inputs = create_sliding_window_inputs(
+        processor=processor,
         num_windows=10,
         clip_id=clip_id,
         t0_us=5_100_000,
@@ -170,5 +173,57 @@ def test_streaming_inference():
     print(f"\nCompleted streaming inference")
 
 
+def test_streaming_inference_compiled():
+    """Test streaming inference with compiled model."""
+    print("Loading model...")
+    from alpamayo_r1.models.alpamayo_r1_streaming_compile import StreamingAlpamayoR1
+    model = StreamingAlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
+    processor = helper.get_processor(model.tokenizer)
+    model._set_processor(processor)
+    print("Model loaded.")
+
+    print("Warming up model...")
+    streaming_inputs = create_sliding_window_inputs(
+        processor=processor,
+        num_windows=10,
+        clip_id=clip_id,
+        t0_us=5_100_000,
+    )
+    
+    # warmup the model
+    for i in range(3):
+        streaming_input = streaming_inputs[i]
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+                data=helper.to_device(streaming_input, "cuda"),
+                top_p=0.98,
+                temperature=0.6,
+                num_traj_samples=1,
+                max_generation_length=256,
+                torch_compile="max-autotune",
+            )
+
+    print("Running streaming inference...")
+    for i in range(3, 10):
+        streaming_input = streaming_inputs[i]
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            start_time = time.perf_counter()
+            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+                data=helper.to_device(streaming_input, "cuda"),
+                top_p=0.98,
+                temperature=0.6,
+                num_traj_samples=1,
+                max_generation_length=256,
+                torch_compile="max-autotune",
+                return_extra=True,
+            )
+            end_time = time.perf_counter()
+            print(f"Time taken: {end_time - start_time} seconds")
+            min_ade = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
+            print(f"MinADE: {min_ade}")
+            print("Chain-of-Causation:\n", extra["cot"][0])
+
+
 if __name__ == "__main__":
-    test_streaming_inference()
+    # test_streaming_inference()
+    test_streaming_inference_compiled()
