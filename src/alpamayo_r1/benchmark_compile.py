@@ -401,14 +401,19 @@ class InstrumentedStreamingModel:
 # Data Preparation
 # =============================================================================
 
-def create_sliding_window_inputs(
+def create_streaming_inputs(
     processor,
     num_windows: int,
     clip_id: str,
     t0_us: int = 5_100_000,
     time_step_us: int = 100_000,
 ) -> list[dict]:
-    """Create sliding window inputs for streaming inference."""
+    """Create sliding window inputs for streaming inference.
+
+    For streaming:
+    - Window 0 (prefill): 4 cameras × 4 frames = 16 frames
+    - Window 1+: 4 cameras × 1 new frame = 4 frames
+    """
     streaming_inputs = []
 
     for window_idx in range(num_windows):
@@ -444,6 +449,48 @@ def create_sliding_window_inputs(
         streaming_inputs.append(model_inputs)
 
     return streaming_inputs
+
+
+def create_non_streaming_inputs(
+    processor,
+    num_windows: int,
+    clip_id: str,
+    t0_us: int = 5_100_000,
+    time_step_us: int = 100_000,
+) -> list[dict]:
+    """Create sliding window inputs for non-streaming inference.
+
+    For non-streaming:
+    - Every window: 4 cameras × 4 frames = 16 frames
+    """
+    non_streaming_inputs = []
+
+    for window_idx in range(num_windows):
+        current_t0 = t0_us + window_idx * time_step_us
+
+        data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=4)
+        frames = data["image_frames"].flatten(0, 1)  # (4, 4, C, H, W) -> (16, C, H, W)
+
+        messages = helper.create_message(frames)
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            continue_final_message=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+
+        model_inputs = {
+            "tokenized_data": inputs,
+            "ego_history_xyz": data["ego_history_xyz"],
+            "ego_history_rot": data["ego_history_rot"],
+            "ego_future_xyz": data["ego_future_xyz"],
+            "ego_future_rot": data["ego_future_rot"],
+        }
+        non_streaming_inputs.append(model_inputs)
+
+    return non_streaming_inputs
 
 
 # =============================================================================
@@ -485,11 +532,18 @@ def run_compiled_benchmark(
 
     # Create inputs
     total_steps = warmup_steps + num_steps + (1 if streaming else 0)  # +1 for first prefill in streaming
-    streaming_inputs = create_sliding_window_inputs(
-        processor=model_wrapper.processor,
-        num_windows=total_steps,
-        clip_id=clip_id,
-    )
+    if streaming:
+        benchmark_inputs = create_streaming_inputs(
+            processor=model_wrapper.processor,
+            num_windows=total_steps,
+            clip_id=clip_id,
+        )
+    else:
+        benchmark_inputs = create_non_streaming_inputs(
+            processor=model_wrapper.processor,
+            num_windows=total_steps,
+            clip_id=clip_id,
+        )
 
     all_timings: list[StepTiming] = []
     warmup_timings: list[StepTiming] = []
@@ -510,7 +564,7 @@ def run_compiled_benchmark(
     # Reset model state
     model_wrapper.reset()
 
-    for step_idx, inputs in enumerate(streaming_inputs):
+    for step_idx, inputs in enumerate(benchmark_inputs):
         inputs_copy = copy.deepcopy(inputs)
         inputs_copy.pop("is_prefill", None)
 

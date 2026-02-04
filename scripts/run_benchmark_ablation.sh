@@ -27,24 +27,50 @@ echo ""
 # Common args
 COMMON_ARGS="--model_path $MODEL_PATH --output_dir $OUTPUT_DIR --num_steps $NUM_STEPS --warmup_steps $WARMUP_STEPS --clip_id $CLIP_ID"
 
+# Function to check if benchmark result already exists
+check_exists() {
+    local pattern="$1"
+    if ls "$OUTPUT_DIR"/$pattern 1> /dev/null 2>&1; then
+        return 0  # exists
+    else
+        return 1  # not exists
+    fi
+}
+
 # =============================================================================
 # Streaming mode ablations (supports fuse options)
 # =============================================================================
 
 echo ">>> [1/6] Streaming mode - baseline (no fusion)"
-python -m alpamayo_r1.benchmark_compile $COMMON_ARGS
+if check_exists "benchmark_streaming_max-autotune_2*.json"; then
+    echo "    [SKIP] Result already exists"
+else
+    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS
+fi
 
 echo ""
 echo ">>> [2/6] Streaming mode - fuse_qkv only"
-python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --fuse_qkv
+if check_exists "benchmark_streaming_max-autotune_fuse_qkv_2*.json"; then
+    echo "    [SKIP] Result already exists"
+else
+    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --fuse_qkv
+fi
 
 echo ""
 echo ">>> [3/6] Streaming mode - fuse_gate_up only"
-python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --fuse_gate_up
+if check_exists "benchmark_streaming_max-autotune_fuse_gate_up_2*.json"; then
+    echo "    [SKIP] Result already exists"
+else
+    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --fuse_gate_up
+fi
 
 echo ""
 echo ">>> [4/6] Streaming mode - fuse_qkv + fuse_gate_up"
-python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --fuse_qkv --fuse_gate_up
+if check_exists "benchmark_streaming_max-autotune_fuse_qkv_fuse_gate_up_2*.json"; then
+    echo "    [SKIP] Result already exists"
+else
+    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --fuse_qkv --fuse_gate_up
+fi
 
 # =============================================================================
 # Non-streaming mode (fuse options not supported)
@@ -52,7 +78,11 @@ python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --fuse_qkv --fuse_gate_up
 
 echo ""
 echo ">>> [5/6] Non-streaming mode - baseline"
-python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --non_streaming
+if check_exists "benchmark_non_streaming_max-autotune_2*.json"; then
+    echo "    [SKIP] Result already exists"
+else
+    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --non_streaming
+fi
 
 # =============================================================================
 # Comparison: compiled vs non-compiled (streaming + full fusion)
@@ -60,7 +90,11 @@ python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --non_streaming
 
 echo ""
 echo ">>> [6/6] Comparison: compiled vs non-compiled (streaming + full fusion)"
-python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --compare --fuse_qkv --fuse_gate_up
+if check_exists "comparison_2*.png"; then
+    echo "    [SKIP] Result already exists"
+else
+    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --compare --fuse_qkv --fuse_gate_up
+fi
 
 echo ""
 echo "=============================================="
