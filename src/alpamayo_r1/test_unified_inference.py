@@ -16,7 +16,9 @@
 # End-to-end example script for the inference pipeline:
 # This script loads a dataset, runs inference, and computes the minADE.
 # It can be used to test the inference pipeline.
-
+import os
+import json
+import argparse
 import logging
 import torch
 import time
@@ -31,11 +33,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Example clip ID
-clip_id = "030c760c-ae38-49aa-9ad8-f5650a545d26"
+# Enable TF32 matmul for better perf on Ampere+ GPUs.
+torch.set_float32_matmul_precision("high")
 
-def load_model():
-    model = AlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
+def load_model(args):
+    model = AlpamayoR1.from_pretrained(args.model_path, dtype=torch.bfloat16).to("cuda")
     processor = helper.get_processor(model.tokenizer)
     return model, processor
 
@@ -141,8 +143,10 @@ def run_streaming_inference(model, model_inputs, _logging: bool = True):
     
     if _logging:
         min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
-        logger.info("Chain-of-Causation:\n", extra["cot"][0])
+        logger.info("Chain-of-Causation:\n%s", extra["cot"][0])
         logger.info(f"MinADE: {min_ade}")
+    
+    return min_ade, extra["cot"][0]
 
 
 @torch.inference_mode()
@@ -162,74 +166,118 @@ def run_non_streaming_inference(model, model_inputs, _logging: bool = True):
 
     if _logging:
         min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
-        logger.info("Chain-of-Causation:\n", extra["cot"][0])
+        logger.info("Chain-of-Causation:\n%s", extra["cot"][0])
         logger.info(f"MinADE: {min_ade}")
-
+    
+    return min_ade, extra["cot"][0]
 
 @torch.inference_mode()
-def test_non_streaming_inference(model, processor):
+def test_non_streaming_inference(args, model, processor):
     """Test non-streaming inference."""
-    
-    streaming_inputs = create_sliding_window_inputs(
+    warmup_steps = args.warmup_steps
+    non_streaming_inputs = create_sliding_window_inputs(
         processor=processor,
-        num_windows=10,
+        num_windows=args.num_steps,
         clip_id=clip_id,
-        t0_us=5_100_000,
+        t0_us=args.t0_us,
+        time_step_us=args.time_step_us,
     )
 
     logger.info("Warming up model...")
-    for i in range(3):
-        model_inputs = streaming_inputs[i]
+    for i in range(warmup_steps):
+        model_inputs = non_streaming_inputs[i]
         run_non_streaming_inference(model, model_inputs, _logging=False)
     logger.info("Warmup completed")
 
-    logger.info(f"Running non-streaming inference for {len(streaming_inputs)} windows:")
-    total_time = 0
-    for i in range(3, len(streaming_inputs)):
-        model_inputs = streaming_inputs[i]
+    logger.info(f"Running non-streaming inference for {len(non_streaming_inputs)} windows:")
+    time_list = []
+    min_ade_list = []
+    cot_list = []
+    for i in range(warmup_steps, len(non_streaming_inputs)):
+        model_inputs = non_streaming_inputs[i]
         start_time = time.perf_counter()
-        run_non_streaming_inference(model, model_inputs, _logging=True)
+        min_ade, cot = run_non_streaming_inference(model, model_inputs, _logging=True)
+        min_ade_list.append(min_ade)
+        cot_list.append(cot)
         end_time = time.perf_counter()
-        total_time += end_time - start_time
+        time_list.append(end_time - start_time)
         logger.info(f"Time taken for step {i}: {end_time - start_time} seconds")
-    logger.info(f"Total time taken: {total_time} seconds")
-    logger.info(f"Average time per step: {total_time / len(streaming_inputs)} seconds")
+    logger.info(f"Total time taken: {sum(time_list)} seconds")
+    logger.info(f"Average time per step: {sum(time_list) / len(time_list)} seconds")
     logger.info(f"\nCompleted non-streaming inference")
+
+    results = {}
+    for i in range(len(time_list)):
+        results[i] = {
+            "latency": time_list[i],
+            "min_ade": min_ade_list[i],
+            "cot": cot_list[i],
+        }
+    with open(os.path.join(args.output_dir, f"non_streaming_results.json"), "w") as f:
+        json.dump(results, f)
 
 
 @torch.inference_mode()
-def test_streaming_inference(model, processor):
+def test_streaming_inference(args, model, processor):
     """Test streaming inference."""
-    
+    warmup_steps = args.warmup_steps
     streaming_inputs = create_sliding_window_inputs(
         processor=processor,
-        num_windows=10,
+        num_windows=args.num_steps,
         clip_id=clip_id,
-        t0_us=5_100_000,
+        t0_us=args.t0_us,
+        time_step_us=args.time_step_us,
     )
         
     logger.info("Warming up model...")
     # warmup the model
-    for i in range(3):
-        streaming_input = streaming_inputs[i]
-        run_streaming_inference(model, streaming_input, _logging=False)
+    for i in range(warmup_steps):
+        model_inputs = streaming_inputs[i]
+        run_streaming_inference(model, model_inputs, _logging=False)
     logger.info("Warmup completed")
 
     logger.info(f"Running streaming inference for {len(streaming_inputs)} windows:")
-    total_time = 0
-    for i in range(3, len(streaming_inputs)):
+    time_list = []
+    min_ade_list = []
+    cot_list = []
+    for i in range(warmup_steps, len(streaming_inputs)):
         model_inputs = streaming_inputs[i]
         start_time = time.perf_counter()
-        run_streaming_inference(model, model_inputs, _logging=True)
+        min_ade, cot = run_streaming_inference(model, model_inputs, _logging=True)
+        min_ade_list.append(min_ade)
+        cot_list.append(cot)
         end_time = time.perf_counter()
-        total_time += end_time - start_time
+        time_list.append(end_time - start_time)
         logger.info(f"Time taken for step {i}: {end_time - start_time} seconds")
-    logger.info(f"Total time taken: {total_time} seconds")
-    logger.info(f"Average time per step: {total_time / len(streaming_inputs)} seconds")
+    logger.info(f"Total time taken: {sum(time_list)} seconds")
+    logger.info(f"Average time per step: {sum(time_list) / len(time_list)} seconds")
     logger.info(f"\nCompleted streaming inference")
+
+    results = {}
+    for i in range(len(time_list)):
+        results[i] = {
+            "latency": time_list[i],
+            "min_ade": min_ade_list[i],
+            "cot": cot_list[i],
+        }
+    with open(os.path.join(args.output_dir, f"streaming_results.json"), "w") as f:
+        json.dump(results, f)
 
 
 if __name__ == "__main__":
-    model, processor = load_model()
-    # test_streaming_inference(model, processor)
-    test_streaming_inference(model, processor)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
+    parser.add_argument("--mode", type=str, default="streaming", choices=["streaming", "non_streaming"])
+    parser.add_argument("--warmup_steps", type=int, default=3)
+    parser.add_argument("--num_steps", type=int, default=15)
+    parser.add_argument("--clip_id", type=str, default="030c760c-ae38-49aa-9ad8-f5650a545d26")
+    parser.add_argument("--t0_us", type=int, default=5_100_000)
+    parser.add_argument("--time_step_us", type=int, default=100_000)
+    parser.add_argument("--output_dir", type=str, default="./test_results")
+
+    args = parser.parse_args()
+    model, processor = load_model(args)
+    if args.mode == "streaming":
+        test_streaming_inference(args, model, processor)
+    elif args.mode == "non_streaming":
+        test_non_streaming_inference(args, model, processor)
