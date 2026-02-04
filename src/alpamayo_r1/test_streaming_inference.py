@@ -17,19 +17,14 @@
 # This script loads a dataset, runs inference, and computes the minADE.
 # It can be used to test the inference pipeline.
 
-import logging
+import json
 import torch
 import time
 import numpy as np
+from pathlib import Path
 from alpamayo_r1.models.alpamayo_r1_streaming_compile import StreamingAlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
-
-# Configure logging to show INFO level messages
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-# )
 
 torch.set_float32_matmul_precision("high")
 
@@ -115,6 +110,78 @@ def calc_minADE(gt_future_xy, pred_xyz):
     diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
     min_ade = diff.min()
     return min_ade
+
+
+def reset_streaming_state(model):
+    """Reset the model's streaming state for a new clip.
+
+    This resets:
+    1. Streaming state (is_first_prefill, cached masks, position IDs, etc.)
+    2. KV cache
+    3. Compiled functions and static buffers (so each clip recompiles fresh)
+    """
+    # Reset streaming state
+    model.is_first_prefill = True
+    model._past_key_values = None
+    model._cached_position_ids = None
+    model._cached_attention_mask = None
+    model._cached_streaming_attention_mask = None
+    model._cached_rope_deltas = None
+    model.vision_start_end_ids_ranges = None
+    model.image_token_ids_ranges = None
+    model.traj_and_text_ids_range = None
+
+    # Reset compiled functions and static buffers for _encode
+    if hasattr(model, "_encode_fn"):
+        delattr(model, "_encode_fn")
+    if hasattr(model, "_compiled_encode_fn"):
+        delattr(model, "_compiled_encode_fn")
+    if hasattr(model, "_encode_pixel_values"):
+        delattr(model, "_encode_pixel_values")
+    if hasattr(model, "_encode_image_grid_thw"):
+        delattr(model, "_encode_image_grid_thw")
+
+    # Reset compiled functions and static buffers for _prefill
+    if hasattr(model, "_prefill_fn"):
+        delattr(model, "_prefill_fn")
+    if hasattr(model, "_compiled_prefill_fn"):
+        delattr(model, "_compiled_prefill_fn")
+    if hasattr(model, "_prefill_inputs_embeds"):
+        delattr(model, "_prefill_inputs_embeds")
+    if hasattr(model, "_prefill_position_ids"):
+        delattr(model, "_prefill_position_ids")
+    if hasattr(model, "_prefill_cache_position"):
+        delattr(model, "_prefill_cache_position")
+    if hasattr(model, "_prefill_visual_pos_masks"):
+        delattr(model, "_prefill_visual_pos_masks")
+    if hasattr(model, "_prefill_deepstack_embeds"):
+        delattr(model, "_prefill_deepstack_embeds")
+    if hasattr(model, "_prefill_streaming_attention_mask"):
+        delattr(model, "_prefill_streaming_attention_mask")
+
+    # Reset compiled functions and static buffers for _decode
+    if hasattr(model, "_decode_fn"):
+        delattr(model, "_decode_fn")
+    if hasattr(model, "_compiled_decode_fn"):
+        delattr(model, "_compiled_decode_fn")
+    if hasattr(model, "_decode_input_ids"):
+        delattr(model, "_decode_input_ids")
+    if hasattr(model, "_decode_position_ids"):
+        delattr(model, "_decode_position_ids")
+    if hasattr(model, "_decode_cache_position"):
+        delattr(model, "_decode_cache_position")
+
+    # Reset compiled functions and static buffers for _action
+    if hasattr(model, "_action_fn"):
+        delattr(model, "_action_fn")
+    if hasattr(model, "_compiled_action_fn"):
+        delattr(model, "_compiled_action_fn")
+    if hasattr(model, "_action_attention_mask"):
+        delattr(model, "_action_attention_mask")
+    if hasattr(model, "_action_cache_position"):
+        delattr(model, "_action_cache_position")
+    if hasattr(model, "_action_noise"):
+        delattr(model, "_action_noise")
 
 @torch.inference_mode()
 def run_streaming_inference(model, streaming_inputs):
@@ -225,7 +292,139 @@ def test_streaming_inference_compiled(model, processor):
     print(f"Average time per step: {total_time / 7} seconds")
 
 
+@torch.inference_mode()
+def eval_all_clips(model, processor, clip_ids_path: str = "./clip_ids.json", output_path: str = "./eval_results.json", num_warmup_steps: int = 3):
+    """Evaluate on all clips and compute average minADE.
+
+    For each clip:
+    - Step 0 to num_warmup_steps-1: warmup (cache + compile), not measured
+    - Step num_warmup_steps to 9: compiled streaming, measure minADE
+    """
+    # Load clip IDs
+    with open(clip_ids_path, "r") as f:
+        clip_ids = json.load(f)
+
+    print(f"Loaded {len(clip_ids)} clip IDs")
+
+    # Evaluate all clips
+    all_results = []
+
+    for idx, cid in enumerate(clip_ids):
+        print(f"\n[{idx + 1}/{len(clip_ids)}] Evaluating clip: {cid}")
+
+        try:
+            streaming_inputs = create_sliding_window_inputs(
+                processor=processor,
+                num_windows=10,
+                clip_id=cid,
+                t0_us=5_100_000,
+            )
+        except Exception as e:
+            print(f"  Failed to load clip: {e}")
+            all_results.append({"clip_id": cid, "error": str(e)})
+            reset_streaming_state(model)
+            continue
+
+        clip_minADEs = []
+        clip_time = 0
+        step_results = []
+
+        for step_idx, streaming_input in enumerate(streaming_inputs):
+            is_prefill = streaming_input.pop("is_prefill", step_idx == 0)
+            is_warmup = step_idx < num_warmup_steps
+
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                start_time = time.perf_counter()
+                if is_warmup:
+                    # Warmup steps: cache + compile, no return_extra needed
+                    model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+                        data=helper.to_device(streaming_input, "cuda"),
+                        top_p=0.98,
+                        temperature=0.6,
+                        num_traj_samples=1,
+                        max_generation_length=256,
+                        torch_compile="max-autotune",
+                        fuse_qkv=True,
+                        fuse_gate_up=True,
+                    )
+                else:
+                    # Compiled streaming steps: measure minADE
+                    pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+                        data=helper.to_device(streaming_input, "cuda"),
+                        top_p=0.98,
+                        temperature=0.6,
+                        num_traj_samples=1,
+                        max_generation_length=256,
+                        torch_compile="max-autotune",
+                        return_extra=True,
+                        fuse_qkv=True,
+                        fuse_gate_up=True,
+                    )
+                end_time = time.perf_counter()
+
+            step_time = end_time - start_time
+
+            if not is_warmup:
+                clip_time += step_time
+                min_ade = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
+                clip_minADEs.append(float(min_ade))
+
+                step_results.append({
+                    "step": step_idx,
+                    "minADE": float(min_ade),
+                    "time_seconds": step_time,
+                    "cot": extra["cot"][0],
+                })
+
+        avg_minADE = np.mean(clip_minADEs)
+        print(f"  avg_minADE: {avg_minADE:.4f}, time: {clip_time:.2f}s")
+
+        all_results.append({
+            "clip_id": cid,
+            "avg_minADE": float(avg_minADE),
+            "step_results": step_results,
+            "total_time_seconds": clip_time,
+        })
+
+        # Reset streaming state for next clip
+        reset_streaming_state(model)
+
+    # Calculate overall statistics
+    successful_results = [r for r in all_results if "avg_minADE" in r]
+    if successful_results:
+        overall_avg_minADE = np.mean([r["avg_minADE"] for r in successful_results])
+        overall_std_minADE = np.std([r["avg_minADE"] for r in successful_results])
+    else:
+        overall_avg_minADE = 0.0
+        overall_std_minADE = 0.0
+
+    # Save results
+    final_results = {
+        "summary": {
+            "total_clips": len(clip_ids),
+            "successful_clips": len(successful_results),
+            "failed_clips": len(clip_ids) - len(successful_results),
+            "overall_avg_minADE": float(overall_avg_minADE),
+            "overall_std_minADE": float(overall_std_minADE),
+        },
+        "per_clip_results": all_results,
+    }
+
+    with open(output_path, "w") as f:
+        json.dump(final_results, f, indent=2)
+
+    print(f"\n{'='*60}")
+    print("Evaluation Summary")
+    print(f"{'='*60}")
+    print(f"Total clips: {len(clip_ids)}")
+    print(f"Successful: {len(successful_results)}")
+    print(f"Failed: {len(clip_ids) - len(successful_results)}")
+    print(f"Overall avg minADE: {overall_avg_minADE:.4f} +/- {overall_std_minADE:.4f}")
+    print(f"Results saved to: {output_path}")
+
+
 if __name__ == "__main__":
     model, processor = load_model()
     # test_streaming_inference(model, processor)
-    test_streaming_inference_compiled(model, processor)
+    # test_streaming_inference_compiled(model, processor)
+    eval_all_clips(model, processor)
