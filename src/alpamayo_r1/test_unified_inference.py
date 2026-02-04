@@ -195,7 +195,7 @@ def run_streaming_inference(model, model_inputs, _logging: bool = True):
             data=helper.to_device(model_inputs, "cuda"),
             top_p=0.98,
             temperature=0.6,
-            num_traj_samples=1,
+            num_traj_samples=args.num_traj_samples,
             max_generation_length=256,
             return_extra=True,
             torch_compile="max-autotune",
@@ -223,11 +223,12 @@ def run_non_streaming_inference(model, model_inputs, _logging: bool = True):
             data=helper.to_device(model_inputs, "cuda"),
             top_p=0.98,
             temperature=0.6,
-            num_traj_samples=1,
+            num_traj_samples=args.num_traj_samples,
             max_generation_length=256,
             return_extra=True,
             torch_compile="max-autotune",
         )
+        print(pred_xyz.shape)
         min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
 
     if _logging:
@@ -278,7 +279,7 @@ def test_non_streaming_inference(args, model, processor):
             "min_ade": min_ade_list[i],
             "cot": cot_list[i],
         }
-    with open(os.path.join(args.output_dir, f"non_streaming_results.json"), "w") as f:
+    with open(os.path.join(args.output_dir, f"original_{args.clip_id}.json"), "w") as f:
         json.dump(results, f)
 
 
@@ -325,7 +326,7 @@ def test_streaming_inference(args, model, processor):
             "min_ade": min_ade_list[i],
             "cot": cot_list[i],
         }
-    with open(os.path.join(args.output_dir, f"streaming_results.json"), "w") as f:
+    with open(os.path.join(args.output_dir, f"streaming_{args.clip_id}.json"), "w") as f:
         json.dump(results, f)
 
 
@@ -335,8 +336,10 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="streaming", choices=["streaming", "non_streaming"])
     parser.add_argument("--warmup_steps", type=int, default=3)
     parser.add_argument("--num_steps", type=int, default=15)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_traj_samples", type=int, default=6)
     parser.add_argument("--clip_id", type=str, default="030c760c-ae38-49aa-9ad8-f5650a545d26")
-    parser.add_argument("--t0_us", type=int, default=5_100_000)
+    parser.add_argument("--t0_us", type=int, default=2_000_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
     parser.add_argument("--output_dir", type=str, default="./test_results")
 

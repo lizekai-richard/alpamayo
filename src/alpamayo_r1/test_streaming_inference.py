@@ -183,6 +183,27 @@ def reset_streaming_state(model):
     if hasattr(model, "_action_noise"):
         delattr(model, "_action_noise")
 
+    # Reset patched layer caches (from patches.py)
+    # Qwen3VLVisionModel caches
+    visual = model.vlm.model.visual
+    if hasattr(visual, "_cached_pos_embeds"):
+        delattr(visual, "_cached_pos_embeds")
+    if hasattr(visual, "_cached_position_embeddings"):
+        delattr(visual, "_cached_position_embeddings")
+    if hasattr(visual, "_cached_cu_seqlens"):
+        delattr(visual, "_cached_cu_seqlens")
+
+    # Qwen3VLVisionAttention caches
+    for block in visual.blocks:
+        if hasattr(block.attn, "_num_chunks"):
+            delattr(block.attn, "_num_chunks")
+
+    # Qwen3VLTextModel caches
+    language_model = model.vlm.model.language_model
+    if hasattr(language_model, "_cached_deepstack_indices"):
+        delattr(language_model, "_cached_deepstack_indices")
+
+
 @torch.inference_mode()
 def run_streaming_inference(model, streaming_inputs):
     """
@@ -315,9 +336,9 @@ def eval_all_clips(model, processor, clip_ids_path: str = "./clip_ids.json", out
         try:
             streaming_inputs = create_sliding_window_inputs(
                 processor=processor,
-                num_windows=10,
+                num_windows=15,
                 clip_id=cid,
-                t0_us=5_100_000,
+                t0_us=2_000_000,
             )
         except Exception as e:
             print(f"  Failed to load clip: {e}")
@@ -344,8 +365,8 @@ def eval_all_clips(model, processor, clip_ids_path: str = "./clip_ids.json", out
                         num_traj_samples=1,
                         max_generation_length=256,
                         torch_compile="max-autotune",
-                        fuse_qkv=True,
-                        fuse_gate_up=True,
+                        fuse_qkv=False,
+                        fuse_gate_up=False,
                     )
                 else:
                     # Compiled streaming steps: measure minADE
@@ -357,8 +378,8 @@ def eval_all_clips(model, processor, clip_ids_path: str = "./clip_ids.json", out
                         max_generation_length=256,
                         torch_compile="max-autotune",
                         return_extra=True,
-                        fuse_qkv=True,
-                        fuse_gate_up=True,
+                        fuse_qkv=False,
+                        fuse_gate_up=False,
                     )
                 end_time = time.perf_counter()
 
@@ -369,6 +390,10 @@ def eval_all_clips(model, processor, clip_ids_path: str = "./clip_ids.json", out
                 min_ade = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
                 clip_minADEs.append(float(min_ade))
 
+                # Log each step's results
+                print(f"  Step {step_idx}: minADE={min_ade:.4f}, time={step_time:.2f}s")
+                print(f"    CoT: {extra['cot'][0]}")
+
                 step_results.append({
                     "step": step_idx,
                     "minADE": float(min_ade),
@@ -377,7 +402,7 @@ def eval_all_clips(model, processor, clip_ids_path: str = "./clip_ids.json", out
                 })
 
         avg_minADE = np.mean(clip_minADEs)
-        print(f"  avg_minADE: {avg_minADE:.4f}, time: {clip_time:.2f}s")
+        print(f"  [Clip Summary] avg_minADE: {avg_minADE:.4f}, total_time: {clip_time:.2f}s")
 
         all_results.append({
             "clip_id": cid,
