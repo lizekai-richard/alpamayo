@@ -303,26 +303,19 @@ def test_streaming_inference(args, model, processor):
     logger.info("Warmup completed")
 
     logger.info(f"Running streaming inference for {len(streaming_inputs)} windows:")
-    time_list = []
     min_ade_list = []
     cot_list = []
     for i in range(warmup_steps, len(streaming_inputs)):
         model_inputs = streaming_inputs[i]
-        start_time = time.perf_counter()
         min_ade, cot = run_streaming_inference(model, model_inputs, _logging=True)
         min_ade_list.append(min_ade)
         cot_list.append(cot)
-        end_time = time.perf_counter()
-        time_list.append(end_time - start_time)
-        logger.info(f"Time taken for step {i}: {end_time - start_time} seconds")
-    logger.info(f"Total time taken: {sum(time_list)} seconds")
-    logger.info(f"Average time per step: {sum(time_list) / len(time_list)} seconds")
+
     logger.info(f"\nCompleted streaming inference")
 
     results = {}
-    for i in range(len(time_list)):
+    for i in range(len(min_ade_list)):
         results[i] = {
-            "latency": time_list[i],
             "min_ade": min_ade_list[i],
             "cot": cot_list[i],
         }

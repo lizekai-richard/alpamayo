@@ -8,7 +8,7 @@ from transformers.cache_utils import Cache
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
-from transformers.models.qwen3_vl.modeling_qwen3_vl import rotate_half
+from transformers.models.qwen3_vl.modeling_qwen3_vl import rotate_half, apply_rotary_pos_emb
 from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 import logging
@@ -233,10 +233,11 @@ def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):
 class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
     """Patched Qwen3VL Text Attention with optional fused QKV projection."""
 
-    def __init__(self, config, layer_idx: int, fuse_qkv: bool = False):
+    def __init__(self, config, layer_idx: int, mode: str = "streaming", fuse_qkv: bool = False):
         super().__init__(config, layer_idx)
 
         self.fuse_qkv = fuse_qkv
+        self.mode = mode
 
         if fuse_qkv:
             # Replace separate q/k/v projections with fused QKVLinear
@@ -319,7 +320,12 @@ class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
             value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        cos_q, sin_q = cos[:, cache_position, :], sin[:, cache_position, :]
+
+        if self.mode == "streaming":
+            cos_q, sin_q = cos[:, cache_position, :], sin[:, cache_position, :]
+        
+        if self.mode == "non_streaming":
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # Store the un-roped keys and values in cache
         if past_key_values is not None:
@@ -328,8 +334,9 @@ class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        query_states = apply_mrope_emb_single(query_states, cos_q, sin_q)
-        key_states = apply_mrope_emb_single(key_states, cos, sin)
+        if self.mode == "streaming":
+            query_states = apply_mrope_emb_single(query_states, cos_q, sin_q)
+            key_states = apply_mrope_emb_single(key_states, cos, sin)
 
         attn_output, attn_weights = sdpa_attention_forward(
             self,
@@ -450,20 +457,13 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
             last_hidden_state=self.norm(hidden_states), past_key_values=past_key_values
         )
 
-
-_PATCHED_CLASSES_STREAMING = {
-    "Qwen3VLVisionModel": Qwen3VLVisionModel,
-    "Qwen3VLTextModel": Qwen3VLTextModel,
-    "Qwen3VLVisionPatchEmbed": Qwen3VLVisionPatchEmbed,
-    "Qwen3VLVisionAttention": Qwen3VLVisionAttention,
-    "Qwen3VLTextAttention": Qwen3VLTextAttention,  # Order matters. Replace the parent(Qwen3VLTextModel) first
-}
-
-_PATCHED_CLASSES_NON_STREAMING = {
+_PATCHED_CLASSES = {
     "Qwen3VLVisionModel": Qwen3VLVisionModel,
     "Qwen3VLVisionPatchEmbed": Qwen3VLVisionPatchEmbed,
     "Qwen3VLVisionAttention": Qwen3VLVisionAttention,
     "Qwen3VLTextModel": Qwen3VLTextModel,
+    "Qwen3VLTextAttention": Qwen3VLTextAttention,
+    "Qwen3VLTextMLP": Qwen3VLTextMLP,
 }
 
 
@@ -479,6 +479,7 @@ def _replace_module(
     module_path: str,
     old_module: nn.Module,
     new_class: type,
+    mode: str = "streaming",
     fuse_qkv: bool = False,
     fuse_gate_up: bool = False,
 ) -> None:
@@ -492,7 +493,7 @@ def _replace_module(
 
     if new_class is Qwen3VLTextAttention:
         layer_idx = getattr(old_module, "layer_idx", None)
-        new_module = new_class(config, layer_idx, fuse_qkv=fuse_qkv)
+        new_module = new_class(config, layer_idx, mode=mode, fuse_qkv=fuse_qkv)
 
         # offload for fusion
         old_module = old_module.to("cpu")
@@ -527,24 +528,20 @@ def patch_for_torch_compile(
         fuse_qkv: If True, fuse q/k/v projections into a single QKVLinear.
         fuse_gate_up: If True, fuse gate/up projections into a single MergedColumnLinear.
     """
-    if mode == "streaming":
-        patched_classes = _PATCHED_CLASSES_STREAMING.copy()  # Copy to avoid modifying global
-        if fuse_gate_up:
-            patched_classes["Qwen3VLTextMLP"] = Qwen3VLTextMLP
-    else:
-        patched_classes = _PATCHED_CLASSES_NON_STREAMING.copy()
-        if fuse_gate_up:
-            patched_classes["Qwen3VLTextMLP"] = Qwen3VLTextMLP
 
     # Collect modules to replace first (avoid modifying during iteration)
     modules_to_replace = []
     for module_path, module in model.named_modules():
         class_name = type(module).__name__
-        if class_name in patched_classes:
+        if class_name in _PATCHED_CLASSES:
             # Skip if already patched
-            if type(module) is patched_classes[class_name]:
+            if type(module) is _PATCHED_CLASSES[class_name]:
                 continue
-            modules_to_replace.append((module_path, module, patched_classes[class_name]))
+            if not fuse_qkv and class_name == "Qwen3VLTextAttention":
+                continue
+            if not fuse_gate_up and class_name == "Qwen3VLTextMLP":
+                continue
+            modules_to_replace.append((module_path, module, _PATCHED_CLASSES[class_name]))
 
     for module_path, module, patched_class in modules_to_replace:
-        _replace_module(model, module_path, module, patched_class, fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+        _replace_module(model, module_path, module, patched_class, mode=mode, fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)

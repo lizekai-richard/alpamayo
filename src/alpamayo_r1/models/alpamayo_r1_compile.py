@@ -34,7 +34,7 @@ from alpamayo_r1.action_space import ActionSpace
 from alpamayo_r1.models.base_model import ReasoningVLA
 from alpamayo_r1.config import AlpamayoR1Config
 from alpamayo_r1.diffusion.base import BaseDiffusion
-from alpamayo_r1.models.qwen3vl_patches import patch_qwen3vl_for_inference
+from alpamayo_r1.models.patches import patch_for_torch_compile
 from alpamayo_r1.models.token_utils import (
     extract_text_tokens,
     replace_padding_after_eos,
@@ -146,15 +146,15 @@ class AlpamayoR1(ReasoningVLA):
 
         # Warmup and compile on first call (if enabled)
         if not hasattr(self, "_compiled_encode_fn"):
-            if self._use_compile:
-                self._encode_fn()  # Warmup for compile
+            if self._torch_compile:
+                self._encode_fn()  # Warmup
                 self._compiled_encode_fn = torch.compile(
-                    self._encode_fn, mode="max-autotune", fullgraph=True
+                    self._encode_fn, mode=self._torch_compile, fullgraph=True
                 )
             else:
                 self._compiled_encode_fn = self._encode_fn
 
-        if self._use_compile:
+        if self._torch_compile:
             torch.compiler.cudagraph_mark_step_begin()
         return self._compiled_encode_fn()
 
@@ -198,15 +198,15 @@ class AlpamayoR1(ReasoningVLA):
 
         # Warmup and compile on first call (if enabled)
         if not hasattr(self, "_compiled_prefill_fn"):
-            if self._use_compile:
-                self._prefill_fn()  # Warmup for compile
+            if self._torch_compile:
+                self._prefill_fn()  # Warmup
                 self._compiled_prefill_fn = torch.compile(
-                    self._prefill_fn, mode="max-autotune", fullgraph=True
+                    self._prefill_fn, mode=self._torch_compile, fullgraph=True
                 )
             else:
                 self._compiled_prefill_fn = self._prefill_fn
 
-        if self._use_compile:
+        if self._torch_compile:
             torch.compiler.cudagraph_mark_step_begin()
         return self._compiled_prefill_fn()
 
@@ -241,15 +241,15 @@ class AlpamayoR1(ReasoningVLA):
 
         # Warmup and compile on first call (if enabled)
         if not hasattr(self, "_compiled_decode_fn"):
-            if self._use_compile:
-                self._decode_fn()  # Warmup for compile
+            if self._torch_compile:
+                self._decode_fn()  # Warmup
                 self._compiled_decode_fn = torch.compile(
-                    self._decode_fn, mode="max-autotune", fullgraph=True
+                    self._decode_fn, mode=self._torch_compile, fullgraph=True
                 )
             else:
                 self._compiled_decode_fn = self._decode_fn
 
-        if self._use_compile:
+        if self._torch_compile:
             torch.compiler.cudagraph_mark_step_begin()
         return self._compiled_decode_fn()
 
@@ -312,15 +312,15 @@ class AlpamayoR1(ReasoningVLA):
 
         # Warmup and compile on first call (if enabled)
         if not hasattr(self, "_compiled_action_fn"):
-            if self._use_compile:
-                self._action_fn()  # Warmup for compile
+            if self._torch_compile:
+                self._action_fn()  # Warmup
                 self._compiled_action_fn = torch.compile(
-                    self._action_fn, mode="max-autotune", fullgraph=True
+                    self._action_fn, mode=self._torch_compile, fullgraph=True
                 )
             else:
                 self._compiled_action_fn = self._action_fn
 
-        if self._use_compile:
+        if self._torch_compile:
             torch.compiler.cudagraph_mark_step_begin()
         return self._compiled_action_fn()
 
@@ -347,7 +347,9 @@ class AlpamayoR1(ReasoningVLA):
         num_traj_samples: int = 6,
         num_traj_sets: int = 1,
         diffusion_kwargs: dict[str, Any] | None = None,
-        use_compile: bool = True,
+        torch_compile: str | None = None,
+        fuse_qkv: bool = False,
+        fuse_gate_up: bool = False,
         *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -361,7 +363,8 @@ class AlpamayoR1(ReasoningVLA):
             num_traj_samples: The number of trajectory samples.
             num_traj_sets: The number of trajectory sets.
             diffusion_kwargs: Additional kwargs for diffusion sampling.
-            use_compile: Whether to use torch.compile for inference optimization.
+            torch_compile: torch.compile mode (e.g. "max-autotune", "reduce-overhead").
+                None disables compilation.
             *args: Variable length argument list.
             **kwargs: Arbitrary keyword arguments.
 
@@ -370,11 +373,11 @@ class AlpamayoR1(ReasoningVLA):
             pred_rot: The predicted rotation.
             logprob: The log probability.
         """
-        # Patch model for inference on first call
-        self._use_compile = use_compile
-        if self._use_compile and not hasattr(self, "_inference_initialized"):
-            patch_qwen3vl_for_inference(self)
-            self._inference_initialized = True
+        # Patch model for torch.compile on first call
+        self._torch_compile = torch_compile
+        if self._torch_compile and not hasattr(self, "_patched_for_compile"):
+            patch_for_torch_compile(self, mode="non_streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+            self._patched_for_compile = True
 
         # Extract inputs
         tokenized = data["tokenized_data"]

@@ -41,7 +41,7 @@ check_exists() {
 # Streaming mode ablations (supports fuse options)
 # =============================================================================
 
-echo ">>> [1/6] Streaming mode - baseline (no fusion)"
+echo ">>> [1/7] Streaming mode - baseline (no fusion)"
 if check_exists "benchmark_streaming_max-autotune_2*.json"; then
     echo "    [SKIP] Result already exists"
 else
@@ -49,7 +49,7 @@ else
 fi
 
 echo ""
-echo ">>> [2/6] Streaming mode - fuse_qkv only"
+echo ">>> [2/7] Streaming mode - fuse_qkv only"
 if check_exists "benchmark_streaming_max-autotune_fuse_qkv_2*.json"; then
     echo "    [SKIP] Result already exists"
 else
@@ -57,7 +57,7 @@ else
 fi
 
 echo ""
-echo ">>> [3/6] Streaming mode - fuse_gate_up only"
+echo ">>> [3/7] Streaming mode - fuse_gate_up only"
 if check_exists "benchmark_streaming_max-autotune_fuse_gate_up_2*.json"; then
     echo "    [SKIP] Result already exists"
 else
@@ -65,7 +65,7 @@ else
 fi
 
 echo ""
-echo ">>> [4/6] Streaming mode - fuse_qkv + fuse_gate_up"
+echo ">>> [4/7] Streaming mode - fuse_qkv + fuse_gate_up"
 if check_exists "benchmark_streaming_max-autotune_fuse_qkv_fuse_gate_up_2*.json"; then
     echo "    [SKIP] Result already exists"
 else
@@ -77,7 +77,7 @@ fi
 # =============================================================================
 
 echo ""
-echo ">>> [5/6] Non-streaming mode - baseline"
+echo ">>> [5/7] Non-streaming mode - baseline"
 if check_exists "benchmark_non_streaming_max-autotune_2*.json"; then
     echo "    [SKIP] Result already exists"
 else
@@ -85,11 +85,23 @@ else
 fi
 
 # =============================================================================
+# Original model (no streaming, no compile)
+# =============================================================================
+
+echo ""
+echo ">>> [6/7] Original model (no streaming, no compile)"
+if check_exists "benchmark_original_2*.json"; then
+    echo "    [SKIP] Result already exists"
+else
+    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --original
+fi
+
+# =============================================================================
 # Comparison: compiled vs non-compiled (streaming + full fusion)
 # =============================================================================
 
 echo ""
-echo ">>> [6/6] Comparison: compiled vs non-compiled (streaming + full fusion)"
+echo ">>> [7/7] Comparison: compiled vs non-compiled (streaming + full fusion)"
 if check_exists "comparison_2*.png"; then
     echo "    [SKIP] Result already exists"
 else

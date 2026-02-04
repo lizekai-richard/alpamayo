@@ -24,6 +24,9 @@ MODES="${MODES:-streaming}"
 # Skip clips that already have result files.
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
+# Limit to first N clips (0 = all).
+MAX_CLIPS="${MAX_CLIPS:-0}"
+
 if [[ ! -f "$CLIP_IDS_FILE" ]]; then
   echo "Clip IDs file not found: $CLIP_IDS_FILE" >&2
   exit 1
@@ -48,6 +51,7 @@ echo "t0_us:          $T0_US"
 echo "time_step_us:   $TIME_STEP_US"
 echo "Modes:          $MODES"
 echo "Skip existing:  $SKIP_EXISTING"
+echo "Max clips:      $MAX_CLIPS"
 echo "=============================================="
 echo ""
 
@@ -67,7 +71,7 @@ fi
 
 for mode in $MODES; do
   case "$mode" in
-    streaming|non_streaming) ;;
+    non_streaming|streaming) ;;
     *)
       echo "Unsupported mode: $mode (use streaming or non_streaming)" >&2
       exit 1
@@ -75,7 +79,13 @@ for mode in $MODES; do
   esac
 
   echo ">>> Mode: $mode"
+  clip_count=0
   for clip_id in "${CLIP_IDS[@]}"; do
+    if [[ "$MAX_CLIPS" -gt 0 && "$clip_count" -ge "$MAX_CLIPS" ]]; then
+      echo "  [DONE] Reached max clips ($MAX_CLIPS)"
+      break
+    fi
+    clip_count=$((clip_count + 1))
     if [[ "$mode" == "streaming" ]]; then
       result_file="$OUTPUT_DIR/streaming_${clip_id}.json"
     else

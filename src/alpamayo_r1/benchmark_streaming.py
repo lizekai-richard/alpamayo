@@ -367,9 +367,8 @@ class StreamingModelBenchmark(ModelBenchmarkBase):
 
         with total_timer:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                pred_xyz, pred_rot, extra = self.model.sample_trajectories(
+                pred_xyz, pred_rot, extra = self.model.sample_trajectories_from_data_with_streaming_vlm_rollout(
                     data=data,
-                    streaming=True,
                     top_p=0.98,
                     temperature=0.6,
                     num_traj_samples=1,
@@ -445,9 +444,8 @@ class OriginalModelBenchmark(ModelBenchmarkBase):
         torch_compile = "max-autotune" if self.use_compile else None
         with total_timer:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                pred_xyz, pred_rot, extra = self.model.sample_trajectories(
+                pred_xyz, pred_rot, extra = self.model.sample_trajectories_from_data_with_vlm_rollout(
                     data=data,
-                    streaming=False,
                     top_p=0.98,
                     temperature=0.6,
                     num_traj_samples=1,

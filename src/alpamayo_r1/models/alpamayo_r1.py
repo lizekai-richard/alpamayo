@@ -288,7 +288,12 @@ class AlpamayoR1(ReasoningVLA):
         if diffusion_kwargs is None:
             diffusion_kwargs = {}
 
+        action_noise = torch.randn(
+            total_batch, *self.action_space.get_action_space_dims(), device=device, dtype=torch.bfloat16
+        )
+
         sampled_action = self.diffusion.sample(
+            noise=action_noise,
             batch_size=total_batch,
             step_fn=step_fn,
             device=device,

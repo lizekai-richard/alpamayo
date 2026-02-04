@@ -183,6 +183,7 @@ class BenchmarkStats:
     decode_min_ms: float = 0.0
     decode_max_ms: float = 0.0
     decode_per_token_mean_ms: float = 0.0
+    decode_per_token_std_ms: float = 0.0
 
     action_mean_ms: float = 0.0
     action_std_ms: float = 0.0
@@ -231,6 +232,7 @@ def compute_stats(name: str, timings: list[StepTiming]) -> BenchmarkStats:
         decode_min_ms=np.min(decode),
         decode_max_ms=np.max(decode),
         decode_per_token_mean_ms=np.mean(decode_per_token),
+        decode_per_token_std_ms=np.std(decode_per_token),
         action_mean_ms=np.mean(action),
         action_std_ms=np.std(action),
         action_min_ms=np.min(action),
@@ -249,6 +251,111 @@ def compute_stats(name: str, timings: list[StepTiming]) -> BenchmarkStats:
 # =============================================================================
 # Instrumented Model Wrapper
 # =============================================================================
+
+class InstrumentedOriginalModel:
+    """
+    Wrapper that instruments the original (non-streaming, non-compiled) model.
+
+    This class wraps the original AlpamayoR1 model and provides timing for:
+      - VLM generation (combined encode + prefill + decode)
+      - Action (diffusion sampling)
+    """
+
+    def __init__(self, model_path: str, dtype=torch.bfloat16):
+        from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+
+        logger.info("Loading original model...")
+        self.model = AlpamayoR1.from_pretrained(model_path, dtype=dtype).to("cuda")
+        self.processor = helper.get_processor(self.model.tokenizer)
+        logger.info("Original model loaded.")
+
+        # Timing storage for current step
+        self._current_timing = None
+
+        # Instrument the model's internal methods
+        self._instrument_model()
+
+    def _instrument_model(self):
+        """Wrap model methods with timing instrumentation."""
+        model = self.model
+
+        # Store original diffusion sample method
+        self._original_diffusion_sample = model.diffusion.sample
+
+        # Create instrumented diffusion sample
+        def instrumented_diffusion_sample(*args, **kwargs):
+            with CUDATimer() as timer:
+                result = self._original_diffusion_sample(*args, **kwargs)
+            if self._current_timing is not None:
+                self._current_timing.action_ms += timer.elapsed_ms
+            return result
+
+        # Replace method
+        model.diffusion.sample = instrumented_diffusion_sample
+
+    @torch.inference_mode()
+    def run_step(
+        self,
+        model_inputs: dict,
+        step_idx: int,
+    ) -> tuple[StepTiming, Optional[tuple]]:
+        """
+        Run one inference step with timing.
+
+        For the original model, we can only measure:
+          - VLM generation time (encode + prefill + decode combined)
+          - Action (diffusion) time
+
+        Args:
+            model_inputs: Input data dict
+            step_idx: Current step index
+
+        Returns:
+            timing: StepTiming with per-phase latencies
+            outputs: (pred_xyz, pred_rot, extra)
+        """
+        # Initialize timing for this step
+        self._current_timing = StepTiming(
+            step_idx=step_idx,
+            is_first_prefill=False,
+        )
+
+        # Prepare data
+        data = helper.to_device(model_inputs, "cuda")
+
+        # Run inference with total timing
+        with CUDATimer() as total_timer:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                # Time VLM generation (encode + prefill + decode)
+                with CUDATimer() as vlm_timer:
+                    result = self.model.sample_trajectories_from_data_with_vlm_rollout(
+                        data=data,
+                        top_p=0.98,
+                        temperature=0.6,
+                        num_traj_samples=1,
+                        max_generation_length=256,
+                        return_extra=True,
+                    )
+
+        # VLM time = total time - action time (action is already measured)
+        self._current_timing.total_ms = total_timer.elapsed_ms
+        # The VLM generation includes everything except diffusion
+        # We measure VLM as: prefill (combined encode+prefill) + decode
+        vlm_ms = vlm_timer.elapsed_ms - self._current_timing.action_ms
+        # Split VLM time: assume prefill is ~30% and decode is ~70% (rough estimate)
+        # For proper comparison, we report VLM time as combined encode+prefill+decode
+        self._current_timing.encode_ms = 0.0  # Combined into prefill
+        self._current_timing.prefill_ms = vlm_ms  # VLM generation time
+        self._current_timing.decode_ms = 0.0  # Combined into prefill
+        self._current_timing.decode_token_count = 0  # Unknown for original model
+
+        self._current_timing.compute_overhead()
+
+        timing = self._current_timing
+        self._current_timing = None
+
+        return timing, result
+
 
 class InstrumentedStreamingModel:
     """
@@ -376,18 +483,30 @@ class InstrumentedStreamingModel:
         # Run inference with total timing
         with CUDATimer() as total_timer:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                result = self.model.sample_trajectories(
-                    data=data,
-                    streaming=streaming,
-                    top_p=0.98,
-                    temperature=0.6,
-                    num_traj_samples=1,
-                    max_generation_length=256,
-                    torch_compile=torch_compile,
-                    fuse_qkv=fuse_qkv,
-                    fuse_gate_up=fuse_gate_up,
-                    return_extra=True,
-                )
+                if streaming:
+                    result = self.model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+                        data=data,
+                        top_p=0.98,
+                        temperature=0.6,
+                        num_traj_samples=1,
+                        max_generation_length=256,
+                        torch_compile=torch_compile,
+                        fuse_qkv=fuse_qkv,
+                        fuse_gate_up=fuse_gate_up,
+                        return_extra=True,
+                    )
+                else:
+                    result = self.model.sample_trajectories_from_data_with_vlm_rollout(
+                        data=data,
+                        top_p=0.98,
+                        temperature=0.6,
+                        num_traj_samples=1,
+                        max_generation_length=256,
+                        torch_compile=torch_compile,
+                        fuse_qkv=fuse_qkv,
+                        fuse_gate_up=fuse_gate_up,
+                        return_extra=True,
+                    )
 
         self._current_timing.total_ms = total_timer.elapsed_ms
         self._current_timing.compute_overhead()
@@ -655,6 +774,154 @@ def run_compiled_benchmark(
     return results
 
 
+def run_original_benchmark(
+    model_path: str,
+    clip_id: str,
+    num_steps: int = 20,
+    warmup_steps: int = 3,
+    output_dir: str = "./benchmark_results",
+) -> dict:
+    """
+    Run benchmark on the original (non-streaming, non-compiled) model.
+
+    Args:
+        model_path: Path to model checkpoint
+        clip_id: Clip ID for dataset
+        num_steps: Number of steps to benchmark (excluding warmup)
+        warmup_steps: Number of warmup steps
+        output_dir: Output directory for results
+
+    Returns:
+        Dictionary with benchmark results
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load model
+    model_wrapper = InstrumentedOriginalModel(model_path)
+
+    # Create inputs (always use 16 frames for original model)
+    total_steps = warmup_steps + num_steps
+    benchmark_inputs = create_non_streaming_inputs(
+        processor=model_wrapper.processor,
+        num_windows=total_steps,
+        clip_id=clip_id,
+    )
+
+    all_timings: list[StepTiming] = []
+    warmup_timings: list[StepTiming] = []
+
+    logger.info(f"\n{'='*70}")
+    logger.info(f"ORIGINAL MODEL BENCHMARK (no streaming, no compile)")
+    logger.info(f"{'='*70}")
+    logger.info(f"Warmup steps: {warmup_steps}")
+    logger.info(f"Benchmark steps: {num_steps}")
+    logger.info(f"{'='*70}\n")
+
+    for step_idx, inputs in enumerate(benchmark_inputs):
+        inputs_copy = copy.deepcopy(inputs)
+
+        timing, result = model_wrapper.run_step(
+            model_inputs=inputs_copy,
+            step_idx=step_idx,
+        )
+
+        # Categorize timing
+        if step_idx < warmup_steps:
+            warmup_timings.append(timing)
+            phase = f"WARMUP {step_idx}"
+        else:
+            all_timings.append(timing)
+            phase = f"STEP {step_idx - warmup_steps}"
+
+        # Log progress
+        logger.info(
+            f"[{phase}] "
+            f"Total: {timing.total_ms:7.2f}ms | "
+            f"VLM: {timing.prefill_ms:6.2f}ms | "
+            f"Action: {timing.action_ms:6.2f}ms"
+        )
+
+    # Compute statistics
+    step_stats = compute_stats("Original Model Steps", all_timings)
+    warmup_stats = compute_stats("Warmup Steps", warmup_timings)
+
+    # Print summary (adapted for original model)
+    print_original_summary(step_stats, warmup_stats)
+
+    # Save results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    results = {
+        "timestamp": timestamp,
+        "model_path": model_path,
+        "clip_id": clip_id,
+        "model_type": "original",
+        "torch_compile": None,
+        "streaming": False,
+        "warmup_steps": warmup_steps,
+        "num_steps": num_steps,
+        "warmup_timings": [asdict(t) for t in warmup_timings],
+        "step_timings": [asdict(t) for t in all_timings],
+        "step_stats": asdict(step_stats),
+        "warmup_stats": asdict(warmup_stats),
+    }
+
+    results_file = os.path.join(output_dir, f"benchmark_original_{timestamp}.json")
+    with open(results_file, "w") as f:
+        json.dump(results, f, indent=2)
+    logger.info(f"\nResults saved to {results_file}")
+
+    # Generate plots
+    plot_latency_breakdown(all_timings, step_stats, output_dir, timestamp, "original")
+    plot_timing_trace(all_timings, output_dir, timestamp, "original")
+
+    # Clean up model to free GPU memory
+    del model_wrapper
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return results
+
+
+def print_original_summary(
+    step_stats: BenchmarkStats,
+    warmup_stats: BenchmarkStats,
+):
+    """Print benchmark summary for original model."""
+    print(f"\n{'='*80}")
+    print(f"ORIGINAL MODEL BENCHMARK SUMMARY")
+    print(f"{'='*80}")
+
+    print(f"\n--- WARMUP STATISTICS ({warmup_stats.num_samples} steps) ---")
+    print(f"  Total:  {warmup_stats.total_mean_ms:7.2f} ± {warmup_stats.total_std_ms:6.2f}ms")
+    print(f"  VLM:    {warmup_stats.prefill_mean_ms:7.2f} ± {warmup_stats.prefill_std_ms:6.2f}ms")
+    print(f"  Action: {warmup_stats.action_mean_ms:7.2f} ± {warmup_stats.action_std_ms:6.2f}ms")
+
+    print(f"\n--- STEP STATISTICS ({step_stats.num_samples} steps) ---")
+    print(f"  Total:  {step_stats.total_mean_ms:7.2f} ± {step_stats.total_std_ms:6.2f}ms  "
+          f"[min: {step_stats.total_min_ms:.2f}, max: {step_stats.total_max_ms:.2f}]")
+    print(f"  VLM:    {step_stats.prefill_mean_ms:7.2f} ± {step_stats.prefill_std_ms:6.2f}ms  "
+          f"[min: {step_stats.prefill_min_ms:.2f}, max: {step_stats.prefill_max_ms:.2f}]")
+    print(f"  Action: {step_stats.action_mean_ms:7.2f} ± {step_stats.action_std_ms:6.2f}ms  "
+          f"[min: {step_stats.action_min_ms:.2f}, max: {step_stats.action_max_ms:.2f}]")
+    print(f"  Overhead: {step_stats.overhead_mean_ms:6.2f}ms")
+
+    print(f"\n--- PERCENTILES ---")
+    print(f"  P50 (median): {step_stats.total_p50_ms:.2f}ms")
+    print(f"  P90:          {step_stats.total_p90_ms:.2f}ms")
+    print(f"  P99:          {step_stats.total_p99_ms:.2f}ms")
+
+    # Latency breakdown percentage
+    total = step_stats.total_mean_ms
+    if total > 0:
+        print(f"\n--- LATENCY BREAKDOWN (% of total) ---")
+        print(f"  VLM:     {step_stats.prefill_mean_ms/total*100:5.1f}%")
+        print(f"  Action:  {step_stats.action_mean_ms/total*100:5.1f}%")
+        print(f"  Overhead:{step_stats.overhead_mean_ms/total*100:5.1f}%")
+
+    print(f"{'='*80}\n")
+
+
 def run_comparison_benchmark(
     model_path: str,
     clip_id: str,
@@ -768,7 +1035,7 @@ def print_summary(
           f"[min: {streaming_stats.prefill_min_ms:.2f}, max: {streaming_stats.prefill_max_ms:.2f}]")
     print(f"  Decode:  {streaming_stats.decode_mean_ms:7.2f} ± {streaming_stats.decode_std_ms:6.2f}ms  "
           f"[min: {streaming_stats.decode_min_ms:.2f}, max: {streaming_stats.decode_max_ms:.2f}]")
-    print(f"    Per-token: {streaming_stats.decode_per_token_mean_ms:.2f}ms")
+    print(f"    Per-token: {streaming_stats.decode_per_token_mean_ms:.2f} ± {streaming_stats.decode_per_token_std_ms:.2f}ms")
     print(f"  Action:  {streaming_stats.action_mean_ms:7.2f} ± {streaming_stats.action_std_ms:6.2f}ms  "
           f"[min: {streaming_stats.action_min_ms:.2f}, max: {streaming_stats.action_max_ms:.2f}]")
     print(f"  Overhead: {streaming_stats.overhead_mean_ms:6.2f}ms")
@@ -1147,11 +1414,24 @@ def main():
         action="store_true",
         help="Fuse gate/up projections into single MergedColumnLinear",
     )
+    parser.add_argument(
+        "--original",
+        action="store_true",
+        help="Benchmark the original model (no streaming, no compile)",
+    )
 
     args = parser.parse_args()
     streaming = not args.non_streaming
 
-    if args.compare:
+    if args.original:
+        results = run_original_benchmark(
+            model_path=args.model_path,
+            clip_id=args.clip_id,
+            num_steps=args.num_steps,
+            warmup_steps=args.warmup_steps,
+            output_dir=args.output_dir,
+        )
+    elif args.compare:
         results = run_comparison_benchmark(
             model_path=args.model_path,
             clip_id=args.clip_id,

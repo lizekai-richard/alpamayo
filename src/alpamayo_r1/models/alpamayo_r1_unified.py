@@ -23,13 +23,13 @@ This module provides a single model class that can operate in two modes:
 Both modes use torch.compile with CUDA graphs for optimized inference.
 
 Usage:
-    model = UnifiedAlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
+    model = AlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
 
-    # Streaming mode (default)
-    result = model.sample_trajectories(data, streaming=True)
+    # Streaming mode
+    result = model.sample_trajectories_from_data_with_streaming_vlm_rollout(data)
 
     # Non-streaming mode
-    result = model.sample_trajectories(data, streaming=False)
+    result = model.sample_trajectories_from_data_with_vlm_rollout(data)
 """
 
 import copy
@@ -603,69 +603,6 @@ class AlpamayoR1(ReasoningVLA):
             delattr(self.vlm.model.language_model, "_cached_deepstack_indices")
 
     @torch.inference_mode()
-    def sample_trajectories(
-        self,
-        data: dict[str, Any],
-        streaming: bool = True,
-        torch_compile: str = "max-autotune",
-        top_p: float = 0.98,
-        top_k: int | None = None,
-        temperature: float = 0.6,
-        num_traj_samples: int = 6,
-        num_traj_sets: int = 1,
-        diffusion_kwargs: dict[str, Any] | None = None,
-        fuse_qkv: bool = False,
-        fuse_gate_up: bool = False,
-        **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict] | tuple[torch.Tensor, torch.Tensor] | None:
-        """
-        Unified inference entry point.
-
-        Args:
-            data: Input data containing tokenized_data, ego_history_xyz, ego_history_rot.
-            streaming: If True, use streaming mode (KV cache reuse).
-                       If False, use non-streaming mode (fresh KV cache each call).
-            torch_compile: Compile mode ("max-autotune", "reduce-overhead", etc.)
-            top_p: Top-p sampling parameter.
-            top_k: Top-k sampling parameter.
-            temperature: Sampling temperature.
-            num_traj_samples: Number of trajectory samples.
-            num_traj_sets: Number of trajectory sets.
-            diffusion_kwargs: Additional kwargs for diffusion sampling.
-            **kwargs: Additional kwargs (e.g., return_extra, max_generation_length).
-
-        Returns:
-            If streaming=True and is_first_prefill: None (only caches state)
-            Otherwise: (pred_xyz, pred_rot) or (pred_xyz, pred_rot, extra) if return_extra=True
-        """
-        if streaming:
-            return self._streaming_rollout(
-                data=data,
-                torch_compile=torch_compile,
-                top_p=top_p,
-                top_k=top_k,
-                temperature=temperature,
-                num_traj_samples=num_traj_samples,
-                num_traj_sets=num_traj_sets,
-                diffusion_kwargs=diffusion_kwargs,
-                fuse_qkv=fuse_qkv,
-                fuse_gate_up=fuse_gate_up,
-                **kwargs,
-            )
-        else:
-            # Non-streaming mode doesn't support fuse options
-            return self._non_streaming_rollout(
-                data=data,
-                torch_compile=torch_compile,
-                top_p=top_p,
-                top_k=top_k,
-                temperature=temperature,
-                num_traj_samples=num_traj_samples,
-                num_traj_sets=num_traj_sets,
-                diffusion_kwargs=diffusion_kwargs,
-                **kwargs,
-            )
-
     def _streaming_rollout(
         self,
         data: dict[str, Any],
@@ -855,6 +792,7 @@ class AlpamayoR1(ReasoningVLA):
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
 
+    @torch.inference_mode()
     def _non_streaming_rollout(
         self,
         data: dict[str, Any],
@@ -865,12 +803,14 @@ class AlpamayoR1(ReasoningVLA):
         num_traj_samples: int,
         num_traj_sets: int,
         diffusion_kwargs: dict[str, Any] | None,
+        fuse_qkv: bool = False,
+        fuse_gate_up: bool = False,
         **kwargs: Any,
     ):
         """Non-streaming mode: resets KV cache each call, processes all frames."""
         self._torch_compile = torch_compile
         if not hasattr(self, "_patched_for_compile"):
-            patch_for_torch_compile(self, mode="non-streaming")
+            patch_for_torch_compile(self, mode="non-streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
             self._patched_for_compile = True
 
         # Extract inputs
@@ -1016,7 +956,7 @@ class AlpamayoR1(ReasoningVLA):
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
 
-    # ==================== Backward Compatible Methods ====================
+    # ==================== Public API Methods ====================
 
     def sample_trajectories_from_data_with_streaming_vlm_rollout(
         self,
@@ -1030,13 +970,15 @@ class AlpamayoR1(ReasoningVLA):
         diffusion_kwargs: dict[str, Any] | None = None,
         fuse_qkv: bool = False,
         fuse_gate_up: bool = False,
-        *args: Any,
         **kwargs: Any,
     ):
-        """Backward compatible: streaming mode."""
-        return self.sample_trajectories(
+        """
+        Streaming inference: reuses KV cache across frames.
+
+        First call caches KV state (returns None), subsequent calls reuse cached state.
+        """
+        return self._streaming_rollout(
             data=data,
-            streaming=True,
             torch_compile=torch_compile,
             top_p=top_p,
             top_k=top_k,
@@ -1059,13 +1001,15 @@ class AlpamayoR1(ReasoningVLA):
         num_traj_samples: int = 6,
         num_traj_sets: int = 1,
         diffusion_kwargs: dict[str, Any] | None = None,
-        *args: Any,
+        fuse_qkv: bool = False,
+        fuse_gate_up: bool = False,
         **kwargs: Any,
     ):
-        """Backward compatible: non-streaming mode."""
-        return self.sample_trajectories(
+        """
+        Non-streaming inference: resets KV cache each call, processes all frames.
+        """
+        return self._non_streaming_rollout(
             data=data,
-            streaming=False,
             torch_compile=torch_compile,
             top_p=top_p,
             top_k=top_k,
@@ -1073,6 +1017,8 @@ class AlpamayoR1(ReasoningVLA):
             num_traj_samples=num_traj_samples,
             num_traj_sets=num_traj_sets,
             diffusion_kwargs=diffusion_kwargs,
+            fuse_qkv=fuse_qkv,
+            fuse_gate_up=fuse_gate_up,
             **kwargs,
         )
 
@@ -1087,6 +1033,15 @@ class AlpamayoR1(ReasoningVLA):
         self.traj_and_text_ids_range = None
         if self._past_key_values is not None:
             self._past_key_values.reset()
+
+        # Reset VLM internal caches
+        for block in self.vlm.model.visual.blocks:
+            if hasattr(block.attn, "_num_chunks"):
+                delattr(block.attn, "_num_chunks")
+        if hasattr(self.vlm.model.visual, "_cached_pos_embeds"):
+            delattr(self.vlm.model.visual, "_cached_pos_embeds")
+        if hasattr(self.vlm.model.language_model, "_cached_deepstack_indices"):
+            delattr(self.vlm.model.language_model, "_cached_deepstack_indices")
 
 
 AutoConfig.register("alpamayo_r1", AlpamayoR1Config)

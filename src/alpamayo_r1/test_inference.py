@@ -20,7 +20,7 @@
 import torch
 import numpy as np
 
-from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+from alpamayo_r1.models.alpamayo_r1_compile import AlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
@@ -29,7 +29,7 @@ def create_sliding_window_inputs(
     processor,
     num_windows: int,
     clip_id: str,
-    t0_us: int = 5_100_000,
+    t0_us: int = 2_000_000,
     time_step_us: int = 100_000,  # 0.1s = 100_000 us
 ):
     """
@@ -57,17 +57,10 @@ def create_sliding_window_inputs(
         # Window 2: t0_us + 200_000 (need frame at t0+0.2s)
         current_t0 = t0_us + window_idx * time_step_us
 
-        if window_idx == 0:
-            # Prefill: load full 4 frames per camera
-            data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=4)
-            frames = data["image_frames"].flatten(0, 1)  # (4, 4, C, H, W) -> (16, C, H, W)
-            is_prefill = True
-        else:
-            # Streaming: load only the newest frame per camera
-            # num_frames=1 means only load the frame at current_t0
-            data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=1)
-            frames = data["image_frames"].flatten(0, 1)  # (4, 1, C, H, W) -> (4, C, H, W)
-            is_prefill = False
+        # Prefill: load full 4 frames per camera
+        data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=4)
+        frames = data["image_frames"].flatten(0, 1)  # (4, 4, C, H, W) -> (16, C, H, W)
+        is_prefill = True
 
         messages = helper.create_message(frames)
         inputs = processor.apply_chat_template(
@@ -119,7 +112,7 @@ def run_inference(model, processor, sliding_window_inputs):
 
 def test_inference():
     # Example clip ID
-    clip_id = "030c760c-ae38-49aa-9ad8-f5650a545d26"
+    clip_id = "eb6d28c4-fcca-447f-bcf0-08f94c973d84"
     print(f"Loading dataset for clip_id: {clip_id}...")
 
     model = AlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
