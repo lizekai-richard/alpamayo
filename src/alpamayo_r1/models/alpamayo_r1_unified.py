@@ -113,6 +113,7 @@ class AlpamayoR1(ReasoningVLA):
             for key, value in config.expert_cfg.items():
                 setattr(expert_config, key, value)
         self.expert = AutoModel.from_config(expert_config)
+        self.expert = self.expert.to(dtype=self.vlm.dtype)
 
         # Action space and diffusion setup
         self.action_space: ActionSpace = hyu.instantiate(config.action_space_cfg)
@@ -134,6 +135,7 @@ class AlpamayoR1(ReasoningVLA):
 
         # Convert action-related modules to the same dtype as expert
         expert_dtype = self.expert.dtype
+        logger.info(f"Expert dtype: {expert_dtype}")
         if self.config.keep_same_dtype:
             self.diffusion = self.diffusion.to(dtype=expert_dtype)
             self.action_in_proj = self.action_in_proj.to(dtype=expert_dtype)

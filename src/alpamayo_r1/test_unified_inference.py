@@ -36,12 +36,13 @@ logger = logging.getLogger(__name__)
 # Enable TF32 matmul for better perf on Ampere+ GPUs.
 torch.set_float32_matmul_precision("high")
 
+
 def load_model(args):
     model = AlpamayoR1.from_pretrained(args.model_path, dtype=torch.bfloat16).to("cuda")
     processor = helper.get_processor(model.tokenizer)
     return model, processor
 
-def create_sliding_window_inputs(
+def create_streaming_inputs(
     processor,
     num_windows: int,
     clip_id: str,
@@ -107,6 +108,64 @@ def create_sliding_window_inputs(
         streaming_inputs.append(model_inputs)
 
     return streaming_inputs
+
+
+def create_non_streaming_inputs(
+    processor,
+    num_windows: int,
+    clip_id: str,
+    t0_us: int = 5_100_000,
+    time_step_us: int = 100_000,  # 0.1s = 100_000 us
+):
+    """
+    Create sliding window inputs for streaming inference.
+
+    For streaming:
+    - Window 0 (prefill): 4 cameras × 4 frames = 16 frames
+    - Window 1+: 4 cameras × 1 new frame = 4 frames (to be appended)
+
+    Args:
+        num_windows: Total number of windows (1 prefill + (num_windows-1) streaming steps)
+        clip_id: Clip ID to load data from
+        t0_us: Initial timestamp in microseconds
+        time_step_us: Time step between frames (100_000 us = 0.1s)
+
+    Returns:
+        List of (model_inputs, is_prefill) tuples
+    """
+    non_streaming_inputs = []
+
+    for window_idx in range(num_windows):
+        # Calculate t0 for this window
+        # Window 0: t0_us (frames at t0-0.3s, t0-0.2s, t0-0.1s, t0)
+        # Window 1: t0_us + 100_000 (need frame at t0+0.1s)
+        # Window 2: t0_us + 200_000 (need frame at t0+0.2s)
+        current_t0 = t0_us + window_idx * time_step_us
+
+        data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=4)
+        frames = data["image_frames"].flatten(0, 1)  # (4, 4, C, H, W) -> (16, C, H, W)
+
+        messages = helper.create_message(frames)
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            continue_final_message=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+
+        model_inputs = {
+            "tokenized_data": inputs,
+            "ego_history_xyz": data["ego_history_xyz"],
+            "ego_history_rot": data["ego_history_rot"],
+            "ego_future_xyz": data["ego_future_xyz"],
+            "ego_future_rot": data["ego_future_rot"],
+        }
+        # model_inputs = helper.to_device(model_inputs, "cuda")
+        non_streaming_inputs.append(model_inputs)
+
+    return non_streaming_inputs
 
 
 def calc_minADE(gt_future_xy, pred_xyz):
@@ -175,7 +234,7 @@ def run_non_streaming_inference(model, model_inputs, _logging: bool = True):
 def test_non_streaming_inference(args, model, processor):
     """Test non-streaming inference."""
     warmup_steps = args.warmup_steps
-    non_streaming_inputs = create_sliding_window_inputs(
+    non_streaming_inputs = create_non_streaming_inputs(
         processor=processor,
         num_windows=args.num_steps,
         clip_id=args.clip_id,
@@ -221,7 +280,7 @@ def test_non_streaming_inference(args, model, processor):
 def test_streaming_inference(args, model, processor):
     """Test streaming inference."""
     warmup_steps = args.warmup_steps
-    streaming_inputs = create_sliding_window_inputs(
+    streaming_inputs = create_streaming_inputs(
         processor=processor,
         num_windows=args.num_steps,
         clip_id=args.clip_id,

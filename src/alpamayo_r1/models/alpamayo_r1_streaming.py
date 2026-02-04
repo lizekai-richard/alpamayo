@@ -104,8 +104,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
             for key, value in config.expert_cfg.items():
                 setattr(expert_config, key, value)
         self.expert = AutoModel.from_config(expert_config)
-        # we don't need the embed_tokens of the expert model
-        del self.expert.embed_tokens
 
         self.action_space: ActionSpace = hyu.instantiate(config.action_space_cfg)
         self.diffusion: BaseDiffusion = hyu.instantiate(
@@ -574,7 +572,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
             batch_size=total_batch,
             step_fn=step_fn,
             device=device,
-            dtype=torch.bfloat16,
             return_all_steps=False,
             **diffusion_kwargs,
         )
