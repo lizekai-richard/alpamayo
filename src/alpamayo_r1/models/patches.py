@@ -16,6 +16,80 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class QKVLinear(nn.Module):
+    """Fused Query-Key-Value projection for multi-head attention.
+    
+    Instead of three separate linear layers (q_proj, k_proj, v_proj),
+    this combines them into a single projection:
+    
+        [Q, K, V] = x @ W^T  where W = [W_q; W_k; W_v]
+    """
+    
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int | None = None,
+        bias: bool = False,
+    ):
+        """Initialize fused QKV projection.
+        
+        Args:
+            hidden_size: Input embedding dimension.
+            head_size: Dimension per attention head.
+            total_num_heads: Number of query heads.
+            total_num_kv_heads: Number of key/value heads (for GQA). 
+                               Defaults to total_num_heads.
+            bias: Whether to include bias terms.
+        """
+        super().__init__()
+        total_num_kv_heads = total_num_kv_heads or total_num_heads
+
+        self.hidden_size = hidden_size
+        self.head_size = head_size
+        self.num_heads = total_num_heads
+        self.num_kv_heads = total_num_kv_heads
+
+        # Output size: Q heads + K heads + V heads
+        output_size = (self.num_heads + 2 * self.num_kv_heads) * self.head_size
+        self.weight = nn.Parameter(torch.empty(output_size, hidden_size))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(output_size))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project input to Q, K, V tensors.
+        
+        Args:
+            x: Input tensor [B, L, hidden_size].
+            
+        Returns:
+            q: Query tensor [B, num_heads, L, head_size].
+            k: Key tensor [B, num_kv_heads, L, head_size].
+            v: Value tensor [B, num_kv_heads, L, head_size].
+        """
+        if x.dim() != 3:
+            raise ValueError(f"QKVLinear expects 3D input [B, L, D], got {x.shape}")
+
+        bsz, seqlen, _ = x.shape
+        
+        # Single fused projection
+        out = F.linear(x, self.weight, self.bias)
+
+        # Reshape and split into Q, K, V
+        total_heads = self.num_heads + 2 * self.num_kv_heads
+        out = out.view(bsz, seqlen, total_heads, self.head_size)
+        out = out.permute(0, 2, 1, 3).contiguous()  # [B, H_total, L, D]
+
+        q = out[:, : self.num_heads]
+        k = out[:, self.num_heads : self.num_heads + self.num_kv_heads]
+        v = out[:, self.num_heads + self.num_kv_heads :]
+        
+        return q, k, v
+        
+
 class Qwen3VLVisionPatchEmbed(qwen3vl.Qwen3VLVisionPatchEmbed):
     def __init__(self, config) -> None:
         nn.Module.__init__(self)
@@ -108,6 +182,53 @@ def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):
 
 
 class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
+    """Patched Qwen3VL Text Attention with fused QKV projection."""
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__(config, layer_idx)
+
+        # Replace separate q/k/v projections with fused QKVLinear
+        self.qkv_proj = QKVLinear(
+            hidden_size=config.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=config.num_attention_heads,
+            total_num_kv_heads=config.num_key_value_heads,
+            bias=config.attention_bias,
+        )
+
+        # Remove original separate projections
+        del self.q_proj
+        del self.k_proj
+        del self.v_proj
+
+        # Register hook to fuse q/k/v weights when loading from checkpoint
+        self._register_load_state_dict_pre_hook(self._fuse_qkv_hook)
+
+    def _fuse_qkv_hook(self, state_dict, prefix, *args, **kwargs):
+        """Hook to fuse separate q/k/v weights into qkv_proj when loading state dict."""
+        q_weight_key = f"{prefix}q_proj.weight"
+        k_weight_key = f"{prefix}k_proj.weight"
+        v_weight_key = f"{prefix}v_proj.weight"
+        qkv_weight_key = f"{prefix}qkv_proj.weight"
+
+        # Check if we need to fuse (original separate weights exist)
+        if q_weight_key in state_dict and k_weight_key in state_dict and v_weight_key in state_dict:
+            q_weight = state_dict.pop(q_weight_key)
+            k_weight = state_dict.pop(k_weight_key)
+            v_weight = state_dict.pop(v_weight_key)
+
+            # Fuse weights: [q_dim, hidden] + [kv_dim, hidden] + [kv_dim, hidden]
+            state_dict[qkv_weight_key] = torch.cat([q_weight, k_weight, v_weight], dim=0)
+
+            # Handle bias if exists
+            q_bias_key = f"{prefix}q_proj.bias"
+            if q_bias_key in state_dict:
+                state_dict[f"{prefix}qkv_proj.bias"] = torch.cat([
+                    state_dict.pop(q_bias_key),
+                    state_dict.pop(f"{prefix}k_proj.bias"),
+                    state_dict.pop(f"{prefix}v_proj.bias"),
+                ], dim=0)
+
     def forward(
         self,
         hidden_states=None,
@@ -118,21 +239,24 @@ class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
         **kwargs,
     ):
         input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # QKVLinear returns (q, k, v) each with shape [B, H, L, D]
+        query_states, key_states, value_states = self.qkv_proj(hidden_states)
+
+        # Apply norms: transpose to [B, L, H, D] for norm, then back to [B, H, L, D]
+        query_states = self.q_norm(query_states.transpose(1, 2)).transpose(1, 2)
+        key_states = self.k_norm(key_states.transpose(1, 2)).transpose(1, 2)
 
         cos, sin = position_embeddings
         cos_q, sin_q = cos[:, cache_position, :], sin[:, cache_position, :]
-            
-        # store the un-roped keys and values
+
+        # Store the un-roped keys and values in cache
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {'cache_position': cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
         query_states = apply_mrope_emb_single(query_states, cos_q, sin_q)
         key_states = apply_mrope_emb_single(key_states, cos, sin)
 

@@ -199,13 +199,13 @@ def run_streaming_inference(model, model_inputs, _logging: bool = True):
             max_generation_length=256,
             return_extra=True,
         )
+        min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
     
     if _logging:
-        min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
         logger.info("Chain-of-Causation:\n%s", extra["cot"][0])
         logger.info(f"MinADE: {min_ade}")
     
-    return min_ade, extra["cot"][0]
+    return float(min_ade), extra["cot"][0]
 
 
 @torch.inference_mode()
@@ -222,13 +222,13 @@ def run_non_streaming_inference(model, model_inputs, _logging: bool = True):
             max_generation_length=256,
             return_extra=True,
         )
+        min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
 
     if _logging:
-        min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
         logger.info("Chain-of-Causation:\n%s", extra["cot"][0])
         logger.info(f"MinADE: {min_ade}")
     
-    return min_ade, extra["cot"][0]
+    return float(min_ade), extra["cot"][0]
 
 @torch.inference_mode()
 def test_non_streaming_inference(args, model, processor):
