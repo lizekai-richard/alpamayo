@@ -178,7 +178,7 @@ def test_non_streaming_inference(args, model, processor):
     non_streaming_inputs = create_sliding_window_inputs(
         processor=processor,
         num_windows=args.num_steps,
-        clip_id=clip_id,
+        clip_id=args.clip_id,
         t0_us=args.t0_us,
         time_step_us=args.time_step_us,
     )
@@ -224,7 +224,7 @@ def test_streaming_inference(args, model, processor):
     streaming_inputs = create_sliding_window_inputs(
         processor=processor,
         num_windows=args.num_steps,
-        clip_id=clip_id,
+        clip_id=args.clip_id,
         t0_us=args.t0_us,
         time_step_us=args.time_step_us,
     )
