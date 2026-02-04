@@ -14,9 +14,9 @@
 # limitations under the License.
 
 """
-Comprehensive Benchmark for Compiled Streaming Model with Latency Breakdown.
+Comprehensive Benchmark for Unified Model with Latency Breakdown.
 
-This script benchmarks the torch.compile + CUDA graph enabled streaming model,
+This script benchmarks the unified AlpamayoR1 model with torch.compile support,
 providing detailed latency breakdown for each inference phase:
   - Encode: Visual encoder forward pass
   - Prefill: Language model prefill phase
@@ -24,6 +24,7 @@ providing detailed latency breakdown for each inference phase:
   - Action: Diffusion sampling for trajectory prediction
 
 Features:
+  - Supports both streaming and non-streaming modes
   - Compare compiled vs non-compiled performance
   - Detailed per-phase timing with CUDA synchronization
   - Warmup phase for torch.compile graph capture
@@ -34,21 +35,26 @@ Features:
 HOW TO RUN
 ================================================================================
 
-1. Default configuration:
+1. Default configuration (streaming mode, compiled):
 
     cd /home/user/zekai/alpamayo
     python -m alpamayo_r1.benchmark_compile
 
-2. Compare compiled vs non-compiled:
+2. Non-streaming mode:
+
+    python -m alpamayo_r1.benchmark_compile --non_streaming
+
+3. Compare compiled vs non-compiled:
 
     python -m alpamayo_r1.benchmark_compile --compare
 
-3. Custom parameters:
+4. Custom parameters:
 
     python -m alpamayo_r1.benchmark_compile \\
         --model_path ./Alpamayo-R1-10B \\
         --num_steps 20 \\
         --warmup_steps 3 \\
+        --non_streaming \\
         --output_dir ./benchmark_results
 
 ================================================================================
@@ -68,6 +74,8 @@ from functools import wraps
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+torch.set_float32_matmul_precision("high")
 
 from alpamayo_r1 import helper
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
@@ -250,12 +258,11 @@ class InstrumentedStreamingModel:
     """
 
     def __init__(self, model_path: str, dtype=torch.bfloat16):
-        from alpamayo_r1.models.alpamayo_r1_streaming_compile import StreamingAlpamayoR1
+        from alpamayo_r1.models.alpamayo_r1_unified import AlpamayoR1
 
-        logger.info("Loading compiled streaming model...")
-        self.model = StreamingAlpamayoR1.from_pretrained(model_path, dtype=dtype).to("cuda")
+        logger.info("Loading unified model...")
+        self.model = AlpamayoR1.from_pretrained(model_path, dtype=dtype).to("cuda")
         self.processor = helper.get_processor(self.model.tokenizer)
-        self.model._set_processor(self.processor)
         logger.info("Model loaded.")
 
         # Timing storage for current step
@@ -312,24 +319,20 @@ class InstrumentedStreamingModel:
 
     def reset(self):
         """Reset model state for a new benchmark run."""
-        self.model.is_first_prefill = True
+        self.model.reset_streaming_state()
         self.model._past_key_values = None
-        self.model._cached_position_ids = None
-        self.model._cached_attention_mask = None
-        self.model._cached_streaming_attention_mask = None
-        self.model._cached_rope_deltas = None
-        self.model.vision_start_end_ids_ranges = None
-        self.model.image_token_ids_ranges = None
-        self.model.traj_and_text_ids_range = None
 
         # Reset compiled function caches (force recompilation)
         for attr in ['_compiled_encode_fn', '_compiled_prefill_fn',
-                     '_compiled_decode_fn', '_compiled_action_fn']:
+                     '_compiled_decode_fn_streaming', '_compiled_decode_fn_non_streaming',
+                     '_compiled_action_fn_streaming', '_compiled_action_fn_non_streaming']:
             if hasattr(self.model, attr):
                 delattr(self.model, attr)
 
         # Reset static buffers
-        for attr in ['_encode_fn', '_prefill_fn', '_decode_fn', '_action_fn']:
+        for attr in ['_encode_fn', '_prefill_fn',
+                     '_decode_fn_streaming', '_decode_fn_non_streaming',
+                     '_action_fn_streaming', '_action_fn_non_streaming']:
             if hasattr(self.model, attr):
                 delattr(self.model, attr)
 
@@ -339,15 +342,26 @@ class InstrumentedStreamingModel:
         model_inputs: dict,
         step_idx: int,
         torch_compile: str | None = "max-autotune",
+        streaming: bool = True,
+        fuse_qkv: bool = False,
+        fuse_gate_up: bool = False,
     ) -> tuple[StepTiming, Optional[tuple]]:
         """
         Run one inference step with detailed timing.
+
+        Args:
+            model_inputs: Input data dict
+            step_idx: Current step index
+            torch_compile: Compile mode or None to disable
+            streaming: If True, use streaming mode; if False, use non-streaming mode
+            fuse_qkv: If True, fuse q/k/v projections into single QKVLinear
+            fuse_gate_up: If True, fuse gate/up projections into single MergedColumnLinear
 
         Returns:
             timing: StepTiming with per-phase latencies
             outputs: (pred_xyz, pred_rot, extra) or None for first prefill
         """
-        is_first_prefill = self.model.is_first_prefill
+        is_first_prefill = self.model.is_first_prefill if streaming else False
 
         # Initialize timing for this step
         self._current_timing = StepTiming(
@@ -361,13 +375,16 @@ class InstrumentedStreamingModel:
         # Run inference with total timing
         with CUDATimer() as total_timer:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                result = self.model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+                result = self.model.sample_trajectories(
                     data=data,
+                    streaming=streaming,
                     top_p=0.98,
                     temperature=0.6,
                     num_traj_samples=1,
                     max_generation_length=256,
                     torch_compile=torch_compile,
+                    fuse_qkv=fuse_qkv,
+                    fuse_gate_up=fuse_gate_up,
                     return_extra=True,
                 )
 
@@ -439,17 +456,23 @@ def run_compiled_benchmark(
     num_steps: int = 20,
     warmup_steps: int = 3,
     torch_compile: str | None = "max-autotune",
+    streaming: bool = True,
+    fuse_qkv: bool = False,
+    fuse_gate_up: bool = False,
     output_dir: str = "./benchmark_results",
 ) -> dict:
     """
-    Run benchmark on the compiled streaming model.
+    Run benchmark on the unified model.
 
     Args:
         model_path: Path to model checkpoint
         clip_id: Clip ID for dataset
-        num_steps: Number of streaming steps to benchmark (excluding warmup)
+        num_steps: Number of steps to benchmark (excluding warmup)
         warmup_steps: Number of warmup steps for torch.compile
         torch_compile: Compile mode or None to disable
+        streaming: If True, use streaming mode; if False, use non-streaming mode
+        fuse_qkv: If True, fuse q/k/v projections into single QKVLinear
+        fuse_gate_up: If True, fuse gate/up projections into single MergedColumnLinear
         output_dir: Output directory for results
 
     Returns:
@@ -461,7 +484,7 @@ def run_compiled_benchmark(
     model_wrapper = InstrumentedStreamingModel(model_path)
 
     # Create inputs
-    total_steps = warmup_steps + num_steps + 1  # +1 for first prefill
+    total_steps = warmup_steps + num_steps + (1 if streaming else 0)  # +1 for first prefill in streaming
     streaming_inputs = create_sliding_window_inputs(
         processor=model_wrapper.processor,
         num_windows=total_steps,
@@ -472,10 +495,14 @@ def run_compiled_benchmark(
     warmup_timings: list[StepTiming] = []
     first_prefill_timing: Optional[StepTiming] = None
 
+    mode_str = "STREAMING" if streaming else "NON-STREAMING"
+    fuse_str = f"fuse_qkv={fuse_qkv}, fuse_gate_up={fuse_gate_up}"
     logger.info(f"\n{'='*70}")
-    logger.info(f"COMPILED STREAMING MODEL BENCHMARK")
+    logger.info(f"UNIFIED MODEL BENCHMARK ({mode_str})")
     logger.info(f"{'='*70}")
     logger.info(f"torch.compile mode: {torch_compile}")
+    logger.info(f"Streaming mode: {streaming}")
+    logger.info(f"Fusion options: {fuse_str}")
     logger.info(f"Warmup steps: {warmup_steps}")
     logger.info(f"Benchmark steps: {num_steps}")
     logger.info(f"{'='*70}\n")
@@ -491,6 +518,9 @@ def run_compiled_benchmark(
             model_inputs=inputs_copy,
             step_idx=step_idx,
             torch_compile=torch_compile,
+            streaming=streaming,
+            fuse_qkv=fuse_qkv,
+            fuse_gate_up=fuse_gate_up,
         )
 
         # Categorize timing
@@ -518,38 +548,49 @@ def run_compiled_benchmark(
             )
 
     # Compute statistics
-    streaming_stats = compute_stats("Streaming Steps", all_timings)
+    stats_name = "Streaming Steps" if streaming else "Non-Streaming Steps"
+    step_stats = compute_stats(stats_name, all_timings)
     warmup_stats = compute_stats("Warmup Steps", warmup_timings)
 
     # Print summary
-    print_summary(streaming_stats, warmup_stats, first_prefill_timing)
+    print_summary(step_stats, warmup_stats, first_prefill_timing)
 
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     compile_mode = torch_compile if torch_compile else "no_compile"
+    mode_suffix = "streaming" if streaming else "non_streaming"
+    fuse_suffix = ""
+    if fuse_qkv:
+        fuse_suffix += "_fuse_qkv"
+    if fuse_gate_up:
+        fuse_suffix += "_fuse_gate_up"
 
     results = {
         "timestamp": timestamp,
         "model_path": model_path,
         "clip_id": clip_id,
         "torch_compile": torch_compile,
+        "streaming": streaming,
+        "fuse_qkv": fuse_qkv,
+        "fuse_gate_up": fuse_gate_up,
         "warmup_steps": warmup_steps,
         "num_steps": num_steps,
         "first_prefill": asdict(first_prefill_timing) if first_prefill_timing else None,
         "warmup_timings": [asdict(t) for t in warmup_timings],
         "streaming_timings": [asdict(t) for t in all_timings],
-        "streaming_stats": asdict(streaming_stats),
+        "streaming_stats": asdict(step_stats),
         "warmup_stats": asdict(warmup_stats),
     }
 
-    results_file = os.path.join(output_dir, f"benchmark_compile_{compile_mode}_{timestamp}.json")
+    results_file = os.path.join(output_dir, f"benchmark_{mode_suffix}_{compile_mode}{fuse_suffix}_{timestamp}.json")
     with open(results_file, "w") as f:
         json.dump(results, f, indent=2)
     logger.info(f"\nResults saved to {results_file}")
 
     # Generate plots
-    plot_latency_breakdown(all_timings, streaming_stats, output_dir, timestamp, compile_mode)
-    plot_timing_trace(all_timings, output_dir, timestamp, compile_mode)
+    plot_suffix = f"{mode_suffix}_{compile_mode}{fuse_suffix}"
+    plot_latency_breakdown(all_timings, step_stats, output_dir, timestamp, plot_suffix)
+    plot_timing_trace(all_timings, output_dir, timestamp, plot_suffix)
 
     return results
 
@@ -559,18 +600,34 @@ def run_comparison_benchmark(
     clip_id: str,
     num_steps: int = 15,
     warmup_steps: int = 3,
+    streaming: bool = True,
+    fuse_qkv: bool = False,
+    fuse_gate_up: bool = False,
     output_dir: str = "./benchmark_results",
 ) -> dict:
     """
     Run comparison benchmark: compiled vs non-compiled.
+
+    Args:
+        model_path: Path to model checkpoint
+        clip_id: Clip ID for dataset
+        num_steps: Number of steps to benchmark
+        warmup_steps: Number of warmup steps
+        streaming: If True, use streaming mode; if False, use non-streaming mode
+        fuse_qkv: If True, fuse q/k/v projections into single QKVLinear
+        fuse_gate_up: If True, fuse gate/up projections into single MergedColumnLinear
+        output_dir: Output directory for results
     """
     os.makedirs(output_dir, exist_ok=True)
 
     results = {}
+    mode_str = "STREAMING" if streaming else "NON-STREAMING"
+    fuse_str = f"fuse_qkv={fuse_qkv}, fuse_gate_up={fuse_gate_up}"
 
     # Run compiled benchmark
     logger.info("\n" + "="*70)
-    logger.info("RUNNING COMPILED BENCHMARK (max-autotune)")
+    logger.info(f"RUNNING COMPILED {mode_str} BENCHMARK (max-autotune)")
+    logger.info(f"Fusion options: {fuse_str}")
     logger.info("="*70 + "\n")
 
     results["compiled"] = run_compiled_benchmark(
@@ -579,6 +636,9 @@ def run_comparison_benchmark(
         num_steps=num_steps,
         warmup_steps=warmup_steps,
         torch_compile="max-autotune",
+        streaming=streaming,
+        fuse_qkv=fuse_qkv,
+        fuse_gate_up=fuse_gate_up,
         output_dir=output_dir,
     )
 
@@ -588,7 +648,8 @@ def run_comparison_benchmark(
 
     # Run non-compiled benchmark
     logger.info("\n" + "="*70)
-    logger.info("RUNNING NON-COMPILED BENCHMARK")
+    logger.info(f"RUNNING NON-COMPILED {mode_str} BENCHMARK")
+    logger.info(f"Fusion options: {fuse_str}")
     logger.info("="*70 + "\n")
 
     results["non_compiled"] = run_compiled_benchmark(
@@ -597,6 +658,9 @@ def run_comparison_benchmark(
         num_steps=num_steps,
         warmup_steps=warmup_steps,
         torch_compile=None,
+        streaming=streaming,
+        fuse_qkv=fuse_qkv,
+        fuse_gate_up=fuse_gate_up,
         output_dir=output_dir,
     )
 
@@ -966,7 +1030,7 @@ def plot_comparison(results: dict, output_dir: str, timestamp: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark compiled streaming model with latency breakdown"
+        description="Benchmark unified model with latency breakdown (supports streaming/non-streaming modes)"
     )
     parser.add_argument(
         "--model_path",
@@ -1008,8 +1072,24 @@ def main():
         action="store_true",
         help="Disable torch.compile (for baseline comparison)",
     )
+    parser.add_argument(
+        "--non_streaming",
+        action="store_true",
+        help="Use non-streaming mode (default is streaming mode)",
+    )
+    parser.add_argument(
+        "--fuse_qkv",
+        action="store_true",
+        help="Fuse q/k/v projections into single QKVLinear",
+    )
+    parser.add_argument(
+        "--fuse_gate_up",
+        action="store_true",
+        help="Fuse gate/up projections into single MergedColumnLinear",
+    )
 
     args = parser.parse_args()
+    streaming = not args.non_streaming
 
     if args.compare:
         results = run_comparison_benchmark(
@@ -1017,6 +1097,9 @@ def main():
             clip_id=args.clip_id,
             num_steps=args.num_steps,
             warmup_steps=args.warmup_steps,
+            streaming=streaming,
+            fuse_qkv=args.fuse_qkv,
+            fuse_gate_up=args.fuse_gate_up,
             output_dir=args.output_dir,
         )
     else:
@@ -1027,6 +1110,9 @@ def main():
             num_steps=args.num_steps,
             warmup_steps=args.warmup_steps,
             torch_compile=torch_compile,
+            streaming=streaming,
+            fuse_qkv=args.fuse_qkv,
+            fuse_gate_up=args.fuse_gate_up,
             output_dir=args.output_dir,
         )
 

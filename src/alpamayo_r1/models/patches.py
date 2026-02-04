@@ -493,11 +493,19 @@ def _replace_module(
     if new_class is Qwen3VLTextAttention:
         layer_idx = getattr(old_module, "layer_idx", None)
         new_module = new_class(config, layer_idx, fuse_qkv=fuse_qkv)
+
+        # offload for fusion
+        old_module = old_module.to("cpu")
+        new_module.load_state_dict(old_module.state_dict(), assign=True)
     elif new_class is Qwen3VLTextMLP:
         new_module = new_class(config, fuse_gate_up=fuse_gate_up)
+
+        # offload for fusion
+        old_module = old_module.to("cpu")
+        new_module.load_state_dict(old_module.state_dict(), assign=True)
     else:
         new_module = new_class(config)
-    new_module.load_state_dict(old_module.state_dict(), assign=True)
+        new_module.load_state_dict(old_module.state_dict(), assign=True)
 
     if device.type != "meta":
         new_module = new_module.to(device=device, dtype=dtype)

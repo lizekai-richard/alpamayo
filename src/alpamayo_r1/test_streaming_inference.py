@@ -31,6 +31,7 @@ from alpamayo_r1 import helper
 #     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 # )
 
+torch.set_float32_matmul_precision("high")
 
 # Example clip ID
 clip_id = "030c760c-ae38-49aa-9ad8-f5650a545d26"
@@ -193,7 +194,7 @@ def test_streaming_inference_compiled(model, processor):
                 num_traj_samples=1,
                 max_generation_length=256,
                 torch_compile="max-autotune",
-                # fuse_qkv=True,
+                fuse_qkv=True,
                 fuse_gate_up=True,
             )
 
@@ -211,7 +212,7 @@ def test_streaming_inference_compiled(model, processor):
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 return_extra=True,
-                # fuse_qkv=True,
+                fuse_qkv=True,
                 fuse_gate_up=True,
             )
             end_time = time.perf_counter()

@@ -615,6 +615,7 @@ class AlpamayoR1(ReasoningVLA):
         num_traj_sets: int = 1,
         diffusion_kwargs: dict[str, Any] | None = None,
         fuse_qkv: bool = False,
+        fuse_gate_up: bool = False,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict] | tuple[torch.Tensor, torch.Tensor] | None:
         """
@@ -648,9 +649,11 @@ class AlpamayoR1(ReasoningVLA):
                 num_traj_sets=num_traj_sets,
                 diffusion_kwargs=diffusion_kwargs,
                 fuse_qkv=fuse_qkv,
+                fuse_gate_up=fuse_gate_up,
                 **kwargs,
             )
         else:
+            # Non-streaming mode doesn't support fuse options
             return self._non_streaming_rollout(
                 data=data,
                 torch_compile=torch_compile,
@@ -674,12 +677,13 @@ class AlpamayoR1(ReasoningVLA):
         num_traj_sets: int,
         diffusion_kwargs: dict[str, Any] | None,
         fuse_qkv: bool = False,
+        fuse_gate_up: bool = False,
         **kwargs: Any,
     ):
         """Streaming mode: reuses KV cache, first call is prefill only."""
         self._torch_compile = torch_compile
         if not hasattr(self, "_patched_for_compile"):
-            patch_for_torch_compile(self, mode="streaming", fuse_qkv=fuse_qkv)
+            patch_for_torch_compile(self, mode="streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
             self._patched_for_compile = True
 
         # Extract inputs
@@ -1025,6 +1029,7 @@ class AlpamayoR1(ReasoningVLA):
         num_traj_sets: int = 1,
         diffusion_kwargs: dict[str, Any] | None = None,
         fuse_qkv: bool = False,
+        fuse_gate_up: bool = False,
         *args: Any,
         **kwargs: Any,
     ):
@@ -1040,6 +1045,7 @@ class AlpamayoR1(ReasoningVLA):
             num_traj_sets=num_traj_sets,
             diffusion_kwargs=diffusion_kwargs,
             fuse_qkv=fuse_qkv,
+            fuse_gate_up=fuse_gate_up,
             **kwargs,
         )
 

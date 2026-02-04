@@ -111,6 +111,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+torch.set_float32_matmul_precision("high")
+
 from alpamayo_r1 import helper
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 
@@ -331,13 +333,12 @@ class StreamingModelBenchmark(ModelBenchmarkBase):
 
     def __init__(self, model_path: str, dtype=torch.bfloat16):
         super().__init__()
-        from alpamayo_r1.models.alpamayo_r1_streaming import StreamingAlpamayoR1
+        from alpamayo_r1.models.alpamayo_r1_unified import AlpamayoR1
 
-        logger.info("Loading streaming model...")
-        self.model = StreamingAlpamayoR1.from_pretrained(model_path, dtype=dtype).to("cuda")
+        logger.info("Loading unified model (streaming mode)...")
+        self.model = AlpamayoR1.from_pretrained(model_path, dtype=dtype).to("cuda")
         self.processor = helper.get_processor(self.model.tokenizer)
-        self.model._set_processor(self.processor)
-        logger.info("Streaming model loaded.")
+        logger.info("Model loaded.")
 
         # Register timing hooks
         self._register_hooks(
@@ -347,16 +348,8 @@ class StreamingModelBenchmark(ModelBenchmarkBase):
 
     def reset(self):
         """Reset model state for new benchmark run."""
-        self.model.is_first_prefill = True
-        self.model._cached_position_ids = None
-        self.model._cached_attention_mask = None
-        self.model._cached_streaming_attention_mask = None
-        self.model._cached_rope_deltas = None
-        self.model.vision_start_end_ids_ranges = None
-        self.model.image_token_ids_ranges = None
-        self.model.traj_and_text_ids_range = None
-        # Reset KV cache
-        self.model.past_key_values.reset()
+        self.model.reset_streaming_state()
+        self.model._past_key_values = None
 
     @torch.inference_mode()
     def run_step_with_timing(self, model_inputs: dict) -> BenchmarkResult:
@@ -374,8 +367,9 @@ class StreamingModelBenchmark(ModelBenchmarkBase):
 
         with total_timer:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                pred_xyz, pred_rot, extra = self.model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+                pred_xyz, pred_rot, extra = self.model.sample_trajectories(
                     data=data,
+                    streaming=True,
                     top_p=0.98,
                     temperature=0.6,
                     num_traj_samples=1,
@@ -420,17 +414,17 @@ class StreamingModelBenchmark(ModelBenchmarkBase):
 
 
 class OriginalModelBenchmark(ModelBenchmarkBase):
-    """Benchmark wrapper for original model with detailed timing."""
+    """Benchmark wrapper for original (non-streaming) model with detailed timing."""
 
     def __init__(self, model_path: str, dtype=torch.bfloat16, use_compile: bool = False):
         super().__init__()
-        from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+        from alpamayo_r1.models.alpamayo_r1_unified import AlpamayoR1
 
-        logger.info("Loading original model...")
+        logger.info("Loading unified model (non-streaming mode)...")
         self.model = AlpamayoR1.from_pretrained(model_path, dtype=dtype).to("cuda")
         self.processor = helper.get_processor(self.model.tokenizer)
         self.use_compile = use_compile
-        logger.info("Original model loaded.")
+        logger.info("Model loaded.")
 
         # Register timing hooks
         self._register_hooks(
@@ -448,16 +442,18 @@ class OriginalModelBenchmark(ModelBenchmarkBase):
 
         total_timer = TimingContext()
 
+        torch_compile = "max-autotune" if self.use_compile else None
         with total_timer:
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                pred_xyz, pred_rot, extra = self.model.sample_trajectories_from_data_with_vlm_rollout(
+                pred_xyz, pred_rot, extra = self.model.sample_trajectories(
                     data=data,
+                    streaming=False,
                     top_p=0.98,
                     temperature=0.6,
                     num_traj_samples=1,
                     max_generation_length=256,
+                    torch_compile=torch_compile,
                     return_extra=True,
-                    use_compile=self.use_compile,
                 )
 
         # Extract timing from hooks
