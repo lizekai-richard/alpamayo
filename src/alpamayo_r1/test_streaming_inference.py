@@ -193,7 +193,7 @@ def test_streaming_inference_compiled(model, processor):
                 num_traj_samples=1,
                 max_generation_length=256,
                 torch_compile="max-autotune",
-                fuse_qkv=True,
+                # fuse_qkv=True,
                 fuse_gate_up=True,
             )
 
@@ -211,7 +211,7 @@ def test_streaming_inference_compiled(model, processor):
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 return_extra=True,
-                fuse_qkv=True,
+                # fuse_qkv=True,
                 fuse_gate_up=True,
             )
             end_time = time.perf_counter()

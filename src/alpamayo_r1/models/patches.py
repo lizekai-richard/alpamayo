@@ -12,6 +12,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import rotate_half
 from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 import logging
+import gc
 
 logger = logging.getLogger(__name__)
 
@@ -248,45 +249,49 @@ class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
             )
 
             # Remove original separate projections
-            del self.q_proj
-            del self.k_proj
-            del self.v_proj
+            delattr(self, "q_proj")
+            delattr(self, "k_proj")
+            delattr(self, "v_proj")
 
-            # Register hook to fuse q/k/v weights when loading from checkpoint
+            # Register hook to fuse q/k/v weights when loading from state_dict
             self._register_load_state_dict_pre_hook(self._fuse_qkv_hook)
 
     def _fuse_qkv_hook(self, state_dict, prefix, *args, **kwargs):
         """Hook to fuse separate q/k/v weights into qkv_proj when loading state dict."""
-        q_weight_key = f"{prefix}q_proj.weight"
-        k_weight_key = f"{prefix}k_proj.weight"
-        v_weight_key = f"{prefix}v_proj.weight"
-        qkv_weight_key = f"{prefix}qkv_proj.weight"
+        q_key = f"{prefix}q_proj.weight"
+        k_key = f"{prefix}k_proj.weight"
+        v_key = f"{prefix}v_proj.weight"
 
-        # Check if we need to fuse (original separate weights exist)
-        if q_weight_key in state_dict and k_weight_key in state_dict and v_weight_key in state_dict:
-            q_weight = state_dict.pop(q_weight_key)
-            k_weight = state_dict.pop(k_weight_key)
-            v_weight = state_dict.pop(v_weight_key)
+        if q_key in state_dict and k_key in state_dict and v_key in state_dict:
+            q_weight = state_dict.pop(q_key).cpu()
+            k_weight = state_dict.pop(k_key).cpu()
+            v_weight = state_dict.pop(v_key).cpu()
 
-            # Pre-allocate and copy to avoid intermediate tensors from torch.cat
-            q_size, k_size, v_size = q_weight.shape[0], k_weight.shape[0], v_weight.shape[0]
-            qkv_weight = torch.empty(q_size + k_size + v_size, q_weight.shape[1], dtype=q_weight.dtype, device='cpu')
+            q_size, k_size = q_weight.shape[0], k_weight.shape[0]
+            qkv_weight = torch.empty(q_size + k_size + v_weight.shape[0], q_weight.shape[1], dtype=q_weight.dtype, device='cpu')
             qkv_weight[:q_size].copy_(q_weight)
             qkv_weight[q_size:q_size + k_size].copy_(k_weight)
             qkv_weight[q_size + k_size:].copy_(v_weight)
-            state_dict[qkv_weight_key] = qkv_weight
+            state_dict[f"{prefix}qkv_proj.weight"] = qkv_weight
+
+            del q_weight, k_weight, v_weight
 
             # Handle bias if exists
             q_bias_key = f"{prefix}q_proj.bias"
             if q_bias_key in state_dict:
-                q_bias = state_dict.pop(q_bias_key)
-                k_bias = state_dict.pop(f"{prefix}k_proj.bias")
-                v_bias = state_dict.pop(f"{prefix}v_proj.bias")
-                qkv_bias = torch.empty(q_size + k_size + v_size, dtype=q_bias.dtype, device='cpu')
+                q_bias = state_dict.pop(q_bias_key).cpu()
+                k_bias = state_dict.pop(f"{prefix}k_proj.bias").cpu()
+                v_bias = state_dict.pop(f"{prefix}v_proj.bias").cpu()
+                qkv_bias = torch.empty(q_size + k_size + v_bias.shape[0], dtype=q_bias.dtype, device='cpu')
                 qkv_bias[:q_size].copy_(q_bias)
                 qkv_bias[q_size:q_size + k_size].copy_(k_bias)
                 qkv_bias[q_size + k_size:].copy_(v_bias)
                 state_dict[f"{prefix}qkv_proj.bias"] = qkv_bias
+
+                del q_bias, k_bias, v_bias
+            
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def forward(
         self,
@@ -354,24 +359,29 @@ class Qwen3VLTextMLP(qwen3vl.Qwen3VLTextMLP):
                 output_sizes=[self.intermediate_size, self.intermediate_size],
                 bias=False,
             )
-            del self.gate_proj
-            del self.up_proj
+            delattr(self, "gate_proj")
+            delattr(self, "up_proj")
+
+            # Register hook to fuse gate/up weights when loading from state_dict
             self._register_load_state_dict_pre_hook(self._fuse_gate_up_hook)
-    
+
     def _fuse_gate_up_hook(self, state_dict, prefix, *args, **kwargs):
-        gate_weight_key = f"{prefix}gate_proj.weight"
-        up_weight_key = f"{prefix}up_proj.weight"
-        gate_up_weight_key = f"{prefix}gate_up_proj.weight"
-        if gate_weight_key in state_dict and up_weight_key in state_dict:
-            gate_weight = state_dict.pop(gate_weight_key)
-            up_weight = state_dict.pop(up_weight_key)
-            # Pre-allocate and copy to avoid intermediate tensors from torch.cat
-            gate_size = gate_weight.shape[0]
-            up_size = up_weight.shape[0]
-            gate_up_weight = torch.empty(gate_size + up_size, gate_weight.shape[1], dtype=gate_weight.dtype, device='cpu')
-            gate_up_weight[:gate_size].copy_(gate_weight)
-            gate_up_weight[gate_size:].copy_(up_weight)
-            state_dict[gate_up_weight_key] = gate_up_weight
+        """Hook to fuse separate gate/up weights into gate_up_proj when loading state dict."""
+        gate_key = f"{prefix}gate_proj.weight"
+        up_key = f"{prefix}up_proj.weight"
+
+        if gate_key in state_dict and up_key in state_dict:
+            gate_weight = state_dict.pop(gate_key).cpu()
+            up_weight = state_dict.pop(up_key).cpu()
+
+            gate_up_weight = torch.empty(gate_weight.shape[0] + up_weight.shape[0], gate_weight.shape[1], dtype=gate_weight.dtype, device='cpu')
+            gate_up_weight[:gate_weight.shape[0]].copy_(gate_weight)
+            gate_up_weight[gate_weight.shape[0]:].copy_(up_weight)
+            state_dict[f"{prefix}gate_up_proj.weight"] = gate_up_weight
+
+            del gate_weight, up_weight
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def forward(self, x):
         if self.fuse_gate_up:
@@ -488,6 +498,7 @@ def _replace_module(
     else:
         new_module = new_class(config)
     new_module.load_state_dict(old_module.state_dict(), assign=True)
+
     if device.type != "meta":
         new_module = new_module.to(device=device, dtype=dtype)
 
