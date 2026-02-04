@@ -198,14 +198,19 @@ def run_streaming_inference(model, model_inputs, _logging: bool = True):
             num_traj_samples=1,
             max_generation_length=256,
             return_extra=True,
+            torch_compile="max-autotune",
         )
-        min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
+        if pred_xyz is not None:
+            min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
     
     if _logging:
         logger.info("Chain-of-Causation:\n%s", extra["cot"][0])
         logger.info(f"MinADE: {min_ade}")
     
-    return float(min_ade), extra["cot"][0]
+    if pred_xyz is not None:
+        return float(min_ade), extra["cot"][0][0][0]
+    else:
+        return float('inf'), None
 
 
 @torch.inference_mode()
@@ -221,6 +226,7 @@ def run_non_streaming_inference(model, model_inputs, _logging: bool = True):
             num_traj_samples=1,
             max_generation_length=256,
             return_extra=True,
+            torch_compile="max-autotune",
         )
         min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
 
@@ -228,7 +234,7 @@ def run_non_streaming_inference(model, model_inputs, _logging: bool = True):
         logger.info("Chain-of-Causation:\n%s", extra["cot"][0])
         logger.info(f"MinADE: {min_ade}")
     
-    return float(min_ade), extra["cot"][0]
+    return float(min_ade), extra["cot"][0][0][0]
 
 @torch.inference_mode()
 def test_non_streaming_inference(args, model, processor):

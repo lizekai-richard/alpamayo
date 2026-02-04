@@ -567,8 +567,12 @@ class StreamingAlpamayoR1(ReasoningVLA):
         total_batch = B * n_samples_total
         if diffusion_kwargs is None:
             diffusion_kwargs = {}
-
+        
+        noise = torch.randn(
+            total_batch, *self.action_space.get_action_space_dims(), device=device, dtype=torch.bfloat16
+        )
         sampled_action = self.diffusion.sample(
+            noise=noise,
             batch_size=total_batch,
             step_fn=step_fn,
             device=device,

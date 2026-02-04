@@ -88,6 +88,54 @@ class QKVLinear(nn.Module):
         v = out[:, self.num_heads + self.num_kv_heads :]
         
         return q, k, v
+
+
+class MergedColumnLinear(nn.Module):
+    """Fused column-parallel linear layer for MLP.
+    
+    Combines multiple linear projections (e.g., gate and up in SwiGLU)
+    into a single matrix multiplication:
+    
+        [gate, up] = x @ W^T  where W = [W_gate; W_up]
+    
+    The outputs are split along the last dimension.
+    """
+    
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = False,
+    ):
+        """Initialize merged linear layer.
+        
+        Args:
+            input_size: Input dimension.
+            output_sizes: List of output dimensions for each split.
+            bias: Whether to include bias terms.
+        """
+        super().__init__()
+        self.input_size = input_size
+        self.output_sizes = list(output_sizes)
+        
+        output_size = sum(self.output_sizes)
+        self.weight = nn.Parameter(torch.empty(output_size, input_size))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(output_size))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Project and split input.
+        
+        Args:
+            x: Input tensor [..., input_size].
+            
+        Returns:
+            Tuple of tensors, one for each output_size.
+        """
+        out = F.linear(x, self.weight, self.bias)
+        return torch.split(out, self.output_sizes, dim=-1)
         
 
 class Qwen3VLVisionPatchEmbed(qwen3vl.Qwen3VLVisionPatchEmbed):
@@ -182,27 +230,30 @@ def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):
 
 
 class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
-    """Patched Qwen3VL Text Attention with fused QKV projection."""
+    """Patched Qwen3VL Text Attention with optional fused QKV projection."""
 
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, fuse_qkv: bool = False):
         super().__init__(config, layer_idx)
 
-        # Replace separate q/k/v projections with fused QKVLinear
-        self.qkv_proj = QKVLinear(
-            hidden_size=config.hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=config.num_attention_heads,
-            total_num_kv_heads=config.num_key_value_heads,
-            bias=config.attention_bias,
-        )
+        self.fuse_qkv = fuse_qkv
 
-        # Remove original separate projections
-        del self.q_proj
-        del self.k_proj
-        del self.v_proj
+        if fuse_qkv:
+            # Replace separate q/k/v projections with fused QKVLinear
+            self.qkv_proj = QKVLinear(
+                hidden_size=config.hidden_size,
+                head_size=self.head_dim,
+                total_num_heads=config.num_attention_heads,
+                total_num_kv_heads=config.num_key_value_heads,
+                bias=config.attention_bias,
+            )
 
-        # Register hook to fuse q/k/v weights when loading from checkpoint
-        self._register_load_state_dict_pre_hook(self._fuse_qkv_hook)
+            # Remove original separate projections
+            del self.q_proj
+            del self.k_proj
+            del self.v_proj
+
+            # Register hook to fuse q/k/v weights when loading from checkpoint
+            self._register_load_state_dict_pre_hook(self._fuse_qkv_hook)
 
     def _fuse_qkv_hook(self, state_dict, prefix, *args, **kwargs):
         """Hook to fuse separate q/k/v weights into qkv_proj when loading state dict."""
@@ -217,17 +268,25 @@ class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
             k_weight = state_dict.pop(k_weight_key)
             v_weight = state_dict.pop(v_weight_key)
 
-            # Fuse weights: [q_dim, hidden] + [kv_dim, hidden] + [kv_dim, hidden]
-            state_dict[qkv_weight_key] = torch.cat([q_weight, k_weight, v_weight], dim=0)
+            # Pre-allocate and copy to avoid intermediate tensors from torch.cat
+            q_size, k_size, v_size = q_weight.shape[0], k_weight.shape[0], v_weight.shape[0]
+            qkv_weight = torch.empty(q_size + k_size + v_size, q_weight.shape[1], dtype=q_weight.dtype, device='cpu')
+            qkv_weight[:q_size].copy_(q_weight)
+            qkv_weight[q_size:q_size + k_size].copy_(k_weight)
+            qkv_weight[q_size + k_size:].copy_(v_weight)
+            state_dict[qkv_weight_key] = qkv_weight
 
             # Handle bias if exists
             q_bias_key = f"{prefix}q_proj.bias"
             if q_bias_key in state_dict:
-                state_dict[f"{prefix}qkv_proj.bias"] = torch.cat([
-                    state_dict.pop(q_bias_key),
-                    state_dict.pop(f"{prefix}k_proj.bias"),
-                    state_dict.pop(f"{prefix}v_proj.bias"),
-                ], dim=0)
+                q_bias = state_dict.pop(q_bias_key)
+                k_bias = state_dict.pop(f"{prefix}k_proj.bias")
+                v_bias = state_dict.pop(f"{prefix}v_proj.bias")
+                qkv_bias = torch.empty(q_size + k_size + v_size, dtype=q_bias.dtype, device='cpu')
+                qkv_bias[:q_size].copy_(q_bias)
+                qkv_bias[q_size:q_size + k_size].copy_(k_bias)
+                qkv_bias[q_size + k_size:].copy_(v_bias)
+                state_dict[f"{prefix}qkv_proj.bias"] = qkv_bias
 
     def forward(
         self,
@@ -239,13 +298,20 @@ class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
         **kwargs,
     ):
         input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        # QKVLinear returns (q, k, v) each with shape [B, H, L, D]
-        query_states, key_states, value_states = self.qkv_proj(hidden_states)
+        if self.fuse_qkv:
+            # QKVLinear returns (q, k, v) each with shape [B, H, L, D]
+            query_states, key_states, value_states = self.qkv_proj(hidden_states)
 
-        # Apply norms: transpose to [B, L, H, D] for norm, then back to [B, H, L, D]
-        query_states = self.q_norm(query_states.transpose(1, 2)).transpose(1, 2)
-        key_states = self.k_norm(key_states.transpose(1, 2)).transpose(1, 2)
+            # Apply norms: transpose to [B, L, H, D] for norm, then back to [B, H, L, D]
+            query_states = self.q_norm(query_states.transpose(1, 2)).transpose(1, 2)
+            key_states = self.k_norm(key_states.transpose(1, 2)).transpose(1, 2)
+        else:
+            # Original separate q/k/v projections
+            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         cos_q, sin_q = cos[:, cache_position, :], sin[:, cache_position, :]
@@ -274,6 +340,47 @@ class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+
+
+class Qwen3VLTextMLP(qwen3vl.Qwen3VLTextMLP):
+    def __init__(self, config, fuse_gate_up: bool = False):
+        super().__init__(config)
+
+        self.fuse_gate_up = fuse_gate_up
+
+        if fuse_gate_up:
+            self.gate_up_proj = MergedColumnLinear(
+                input_size=self.hidden_size,
+                output_sizes=[self.intermediate_size, self.intermediate_size],
+                bias=False,
+            )
+            del self.gate_proj
+            del self.up_proj
+            self._register_load_state_dict_pre_hook(self._fuse_gate_up_hook)
+    
+    def _fuse_gate_up_hook(self, state_dict, prefix, *args, **kwargs):
+        gate_weight_key = f"{prefix}gate_proj.weight"
+        up_weight_key = f"{prefix}up_proj.weight"
+        gate_up_weight_key = f"{prefix}gate_up_proj.weight"
+        if gate_weight_key in state_dict and up_weight_key in state_dict:
+            gate_weight = state_dict.pop(gate_weight_key)
+            up_weight = state_dict.pop(up_weight_key)
+            # Pre-allocate and copy to avoid intermediate tensors from torch.cat
+            gate_size = gate_weight.shape[0]
+            up_size = up_weight.shape[0]
+            gate_up_weight = torch.empty(gate_size + up_size, gate_weight.shape[1], dtype=gate_weight.dtype, device='cpu')
+            gate_up_weight[:gate_size].copy_(gate_weight)
+            gate_up_weight[gate_size:].copy_(up_weight)
+            state_dict[gate_up_weight_key] = gate_up_weight
+
+    def forward(self, x):
+        if self.fuse_gate_up:
+            gate, up = self.gate_up_proj(x)
+        else:
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+        down_proj = self.down_proj(self.act_fn(gate) * up)
+        return down_proj
 
 
 class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
@@ -358,7 +465,12 @@ def _get_device_dtype(module: nn.Module) -> tuple[torch.device, torch.dtype]:
 
 
 def _replace_module(
-    model: nn.Module, module_path: str, old_module: nn.Module, new_class: type
+    model: nn.Module,
+    module_path: str,
+    old_module: nn.Module,
+    new_class: type,
+    fuse_qkv: bool = False,
+    fuse_gate_up: bool = False,
 ) -> None:
     *parent_parts, name = module_path.split(".")
     parent = model
@@ -370,7 +482,9 @@ def _replace_module(
 
     if new_class is Qwen3VLTextAttention:
         layer_idx = getattr(old_module, "layer_idx", None)
-        new_module = new_class(config, layer_idx)
+        new_module = new_class(config, layer_idx, fuse_qkv=fuse_qkv)
+    elif new_class is Qwen3VLTextMLP:
+        new_module = new_class(config, fuse_gate_up=fuse_gate_up)
     else:
         new_module = new_class(config)
     new_module.load_state_dict(old_module.state_dict(), assign=True)
@@ -380,13 +494,38 @@ def _replace_module(
     setattr(parent, name, new_module)
 
 
-def patch_for_torch_compile(model: nn.Module, mode: ["streaming", "non-streaming"] = "streaming") -> None:
-    """Patch Qwen3-VL modules for torch.compile compatibility."""
+def patch_for_torch_compile(
+    model: nn.Module,
+    mode: str = "streaming",
+    fuse_qkv: bool = False,
+    fuse_gate_up: bool = False,
+) -> None:
+    """Patch Qwen3-VL modules for torch.compile compatibility.
+
+    Args:
+        model: The model to patch.
+        mode: "streaming" or "non-streaming".
+        fuse_qkv: If True, fuse q/k/v projections into a single QKVLinear.
+        fuse_gate_up: If True, fuse gate/up projections into a single MergedColumnLinear.
+    """
     if mode == "streaming":
-        _PATCHED_CLASSES = _PATCHED_CLASSES_STREAMING
+        patched_classes = _PATCHED_CLASSES_STREAMING.copy()  # Copy to avoid modifying global
+        if fuse_gate_up:
+            patched_classes["Qwen3VLTextMLP"] = Qwen3VLTextMLP
     else:
-        _PATCHED_CLASSES = _PATCHED_CLASSES_NON_STREAMING
-    for class_name, patched_class in _PATCHED_CLASSES.items():
-        for module_path, module in model.named_modules():
-            if type(module).__name__ == class_name:
-                _replace_module(model, module_path, module, patched_class)
+        patched_classes = _PATCHED_CLASSES_NON_STREAMING.copy()
+        if fuse_gate_up:
+            patched_classes["Qwen3VLTextMLP"] = Qwen3VLTextMLP
+
+    # Collect modules to replace first (avoid modifying during iteration)
+    modules_to_replace = []
+    for module_path, module in model.named_modules():
+        class_name = type(module).__name__
+        if class_name in patched_classes:
+            # Skip if already patched
+            if type(module) is patched_classes[class_name]:
+                continue
+            modules_to_replace.append((module_path, module, patched_classes[class_name]))
+
+    for module_path, module, patched_class in modules_to_replace:
+        _replace_module(model, module_path, module, patched_class, fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)

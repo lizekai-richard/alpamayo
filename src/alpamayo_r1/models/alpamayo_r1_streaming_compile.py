@@ -132,9 +132,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
 
-    def _set_processor(self, processor):
-        self.processor = processor
-
     # ==================== Properties ====================
 
     @property
@@ -167,8 +164,8 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         vision_start_token = "<|vision_start|>"
         vision_end_token = "<|vision_end|>"
-        vision_start_token_id = self.processor.tokenizer.encode(vision_start_token)[0]
-        vision_end_token_id = self.processor.tokenizer.encode(vision_end_token)[0]
+        vision_start_token_id = self.tokenizer.encode(vision_start_token)[0]
+        vision_end_token_id = self.tokenizer.encode(vision_end_token)[0]
 
         vision_start_token_mask = (input_ids == vision_start_token_id)
         vision_end_token_mask = (input_ids == vision_end_token_id)
@@ -489,7 +486,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
     # ==================== Main Inference ====================
 
     # We don't need any output from the first prefill. Only need to cache key/values, position_ids, and attention_mask.
-    def _non_streaming_rollout(
+    def _first_prefill(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -559,6 +556,8 @@ class StreamingAlpamayoR1(ReasoningVLA):
         num_traj_sets: int = 1,
         diffusion_kwargs: dict[str, Any] | None = None,
         torch_compile: str = "max-autotune",
+        fuse_qkv: bool = False,
+        fuse_gate_up: bool = False,
         *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -573,7 +572,8 @@ class StreamingAlpamayoR1(ReasoningVLA):
             num_traj_sets: Number of trajectory sets.
             diffusion_kwargs: Additional kwargs for diffusion sampling.
             use_compile: Whether to use torch.compile for optimization.
-
+            fuse_qkv: Whether to fuse q/k/v projections into a single QKVLinear.
+            fuse_gate_up: Whether to fuse gate/up projections into a single MergedColumnLinear.
         Returns:
             pred_xyz: Predicted xyz trajectories.
             pred_rot: Predicted rotation trajectories.
@@ -581,7 +581,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         """
         self._torch_compile = torch_compile
         if self._torch_compile and not hasattr(self, "_patched_for_compile"):
-            patch_for_torch_compile(self)
+            patch_for_torch_compile(self, mode="streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
             self._patched_for_compile = True
 
         # Extract inputs
@@ -623,7 +623,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             return
 
         # Prepare input_ids for streaming (slice off system prompt for non-first prefill)
-        vision_start_token_id = self.processor.tokenizer.encode("<|vision_start|>")[0]
+        vision_start_token_id = self.tokenizer.encode("<|vision_start|>")[0]
         first_vision_start = torch.where(input_ids == vision_start_token_id)[1][0].item()
         input_ids = input_ids[:, first_vision_start:]
 

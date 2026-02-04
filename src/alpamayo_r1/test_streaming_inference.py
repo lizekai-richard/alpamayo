@@ -21,7 +21,7 @@ import logging
 import torch
 import time
 import numpy as np
-from alpamayo_r1.models.alpamayo_r1_streaming import StreamingAlpamayoR1
+from alpamayo_r1.models.alpamayo_r1_streaming_compile import StreamingAlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
@@ -193,6 +193,8 @@ def test_streaming_inference_compiled(model, processor):
                 num_traj_samples=1,
                 max_generation_length=256,
                 torch_compile="max-autotune",
+                fuse_qkv=True,
+                fuse_gate_up=True,
             )
 
     print("Running streaming inference...")
@@ -209,6 +211,8 @@ def test_streaming_inference_compiled(model, processor):
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 return_extra=True,
+                fuse_qkv=True,
+                fuse_gate_up=True,
             )
             end_time = time.perf_counter()
             print(f"Time taken: {end_time - start_time} seconds")
