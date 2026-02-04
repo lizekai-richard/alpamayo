@@ -62,6 +62,7 @@ HOW TO RUN
 
 import argparse
 import copy
+import gc
 import json
 import logging
 import os
@@ -645,6 +646,11 @@ def run_compiled_benchmark(
     plot_suffix = f"{mode_suffix}_{compile_mode}{fuse_suffix}"
     plot_latency_breakdown(all_timings, step_stats, output_dir, timestamp, plot_suffix)
     plot_timing_trace(all_timings, output_dir, timestamp, plot_suffix)
+
+    # Clean up model to free GPU memory
+    del model_wrapper
+    gc.collect()
+    torch.cuda.empty_cache()
 
     return results
 
