@@ -168,12 +168,13 @@ def create_non_streaming_inputs(
     return non_streaming_inputs
 
 
-def calc_minADE(gt_future_xy, pred_xyz):
-    gt_xy = gt_future_xy.cpu()[0, 0, :, :2].T.numpy()
+def calc_minADE(gt_future_xyz, pred_xyz):
+    gt_xy = gt_future_xyz.cpu()[0, 0, :, :2].T.numpy()
     pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
     diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
     min_ade = diff.min()
-    return min_ade
+    min_ade_idx = diff.argmin()
+    return min_ade, min_ade_idx
 
 
 @torch.inference_mode()
@@ -203,14 +204,14 @@ def run_streaming_inference(model, model_inputs, _logging: bool = True):
             fuse_gate_up=True,
         )
         if pred_xyz is not None:
-            min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
+            min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
     
     if _logging:
-        logger.info("Chain-of-Causation:\n%s", extra["cot"][0])
+        logger.info("Chain-of-Causation:\n%s", extra["cot"][0][0][min_ade_idx])
         logger.info(f"MinADE: {min_ade}")
     
     if pred_xyz is not None:
-        return float(min_ade), extra["cot"][0][0][0]
+        return float(min_ade), extra["cot"][0][0][min_ade_idx]
     else:
         return float('inf'), None
 
@@ -232,13 +233,13 @@ def run_non_streaming_inference(model, model_inputs, _logging: bool = True):
             fuse_qkv=True,
             fuse_gate_up=True,
         )
-        min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
+        min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
 
     if _logging:
-        logger.info("Chain-of-Causation:\n%s", extra["cot"][0])
+        logger.info("Chain-of-Causation:\n%s", extra["cot"][0][0][min_ade_idx])
         logger.info(f"MinADE: {min_ade}")
     
-    return float(min_ade), extra["cot"][0][0][0]
+    return float(min_ade), extra["cot"][0][0][min_ade_idx]
 
 @torch.inference_mode()
 def test_non_streaming_inference(args, model, processor):
@@ -335,7 +336,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_traj_samples", type=int, default=1)
     parser.add_argument("--clip_id", type=str, default="53baf60a-902f-446d-8e30-5eb7dbc992e7")
-    parser.add_argument("--t0_us", type=int, default=2_000_000)
+    parser.add_argument("--t0_us", type=int, default=1_600_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
     parser.add_argument("--output_dir", type=str, default="./test_results")
 

@@ -666,13 +666,12 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # ===== Decode =====
         output_ids = input_ids.clone()
-
-        if num_samples > 1:
-            self._past_key_values.expand_batch()
-            logits = logits.expand(num_samples, -1).contiguous()
-            output_ids = output_ids.expand(num_samples, -1).contiguous()
-
-        unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
+        # if num_samples > 1:
+        #     self._past_key_values.expand_batch()
+        #     logits = logits.expand(num_samples, -1).contiguous()
+        #     output_ids = output_ids.expand(num_samples, -1).contiguous()
+        # unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
+        unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
         cur_pos = cache_position[-1].item() + 1
 
         for _ in range(max_new_tokens):
@@ -702,7 +701,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # Find <traj_future_start> position
         traj_start_pos = self._find_traj_start_positions(output_ids)
-        logger.info(f"traj_start_pos shape: {traj_start_pos.shape}")
 
         # ===== Action (Diffusion) =====
         # Note: Action only attends to prompt tokens, NOT reasoning tokens (they are masked out).
@@ -716,8 +714,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
         else:
             action_start_pos = traj_start_pos + 1
         
-        print(f"action_start_pos: {action_start_pos}")
-
         # Build position_ids for action tokens
         # position_ids = torch.arange(self.num_action_tokens, device=device)
         # position_ids = einops.repeat(position_ids, "t -> 3 b t", b=batch_size).clone()

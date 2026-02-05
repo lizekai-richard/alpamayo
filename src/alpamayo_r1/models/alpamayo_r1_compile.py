@@ -99,6 +99,7 @@ class AlpamayoR1(ReasoningVLA):
             for key, value in config.expert_cfg.items():
                 setattr(expert_config, key, value)
         self.expert = AutoModel.from_config(expert_config)
+
         self.action_space: ActionSpace = hyu.instantiate(config.action_space_cfg)
         self.diffusion: BaseDiffusion = hyu.instantiate(
             config.diffusion_cfg,
@@ -381,6 +382,7 @@ class AlpamayoR1(ReasoningVLA):
         if self._torch_compile and not hasattr(self, "_patched_for_compile"):
             patch_for_torch_compile(self, mode="non_streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
             self._patched_for_compile = True
+            del self.expert.embed_tokens
 
         # Extract inputs
         tokenized = data["tokenized_data"]
@@ -437,13 +439,12 @@ class AlpamayoR1(ReasoningVLA):
 
         # ===== Decode =====
         output_ids = input_ids.clone()
-
-        if num_samples > 1:
-            self._past_key_values.expand_batch()
-            logits = logits.expand(num_samples, -1).contiguous()
-            output_ids = output_ids.expand(num_samples, -1).contiguous()
-
-        unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
+        # if num_samples > 1:
+        #     self._past_key_values.expand_batch()
+        #     logits = logits.expand(num_samples, -1).contiguous()
+        #     output_ids = output_ids.expand(num_samples, -1).contiguous()
+        # unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
+        unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
         cur_pos = seq_len
 
         for _ in range(max_new_tokens):
