@@ -29,7 +29,7 @@ from alpamayo_r1 import helper
 torch.set_float32_matmul_precision("high")
 
 # Example clip ID
-clip_id = "030c760c-ae38-49aa-9ad8-f5650a545d26"
+clip_id = "2d50798c-a96e-4164-b791-bbad2a59c2de"
 
 def load_model():
     model = StreamingAlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
@@ -40,7 +40,7 @@ def create_sliding_window_inputs(
     processor,
     num_windows: int,
     clip_id: str,
-    t0_us: int = 5_100_000,
+    t0_us: int = 2_000_000,
     time_step_us: int = 100_000,  # 0.1s = 100_000 us
 ):
     """
@@ -109,7 +109,8 @@ def calc_minADE(gt_future_xy, pred_xyz):
     pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
     diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
     min_ade = diff.min()
-    return min_ade
+    min_ade_idx = diff.argmin()
+    return min_ade, min_ade_idx
 
 
 def reset_streaming_state(model):
@@ -247,7 +248,7 @@ def test_streaming_inference(model, processor):
         processor=processor,
         num_windows=10,
         clip_id=clip_id,
-        t0_us=5_100_000,
+        t0_us=2_000_000,
     )
 
     print(f"Created {len(streaming_inputs)} windows:")
@@ -266,9 +267,9 @@ def test_streaming_inference_compiled(model, processor):
     print("Warming up model...")
     streaming_inputs = create_sliding_window_inputs(
         processor=processor,
-        num_windows=10,
+        num_windows=15,
         clip_id=clip_id,
-        t0_us=5_100_000,
+        t0_us=2_000_000,
     )
     
     # warmup the model
@@ -279,7 +280,7 @@ def test_streaming_inference_compiled(model, processor):
                 data=helper.to_device(streaming_input, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=1,
+                num_traj_samples=3,
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 fuse_qkv=True,
@@ -288,7 +289,7 @@ def test_streaming_inference_compiled(model, processor):
 
     print("Running streaming inference...")
     total_time = 0
-    for i in range(3, 10):
+    for i in range(3, 15):
         streaming_input = streaming_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
             start_time = time.perf_counter()
@@ -296,7 +297,7 @@ def test_streaming_inference_compiled(model, processor):
                 data=helper.to_device(streaming_input, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=1,
+                num_traj_samples=3,
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 return_extra=True,
@@ -305,151 +306,15 @@ def test_streaming_inference_compiled(model, processor):
             )
             end_time = time.perf_counter()
             print(f"Time taken: {end_time - start_time} seconds")
-            min_ade = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
+            min_ade, min_ade_idx = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
             print(f"MinADE: {min_ade}")
-            print("Chain-of-Causation:\n", extra["cot"][0])
+            print("Chain-of-Causation:\n", extra["cot"][0][0][min_ade_idx])
             total_time += end_time - start_time
     print(f"Total time taken: {total_time} seconds")
-    print(f"Average time per step: {total_time / 7} seconds")
-
-
-@torch.inference_mode()
-def eval_all_clips(model, processor, clip_ids_path: str = "./clip_ids.json", output_path: str = "./eval_results.json", num_warmup_steps: int = 3):
-    """Evaluate on all clips and compute average minADE.
-
-    For each clip:
-    - Step 0 to num_warmup_steps-1: warmup (cache + compile), not measured
-    - Step num_warmup_steps to 9: compiled streaming, measure minADE
-    """
-    # Load clip IDs
-    with open(clip_ids_path, "r") as f:
-        clip_ids = json.load(f)
-
-    print(f"Loaded {len(clip_ids)} clip IDs")
-
-    # Evaluate all clips
-    all_results = []
-
-    for idx, cid in enumerate(clip_ids):
-        print(f"\n[{idx + 1}/{len(clip_ids)}] Evaluating clip: {cid}")
-
-        try:
-            streaming_inputs = create_sliding_window_inputs(
-                processor=processor,
-                num_windows=15,
-                clip_id=cid,
-                t0_us=2_000_000,
-            )
-        except Exception as e:
-            print(f"  Failed to load clip: {e}")
-            all_results.append({"clip_id": cid, "error": str(e)})
-            reset_streaming_state(model)
-            continue
-
-        clip_minADEs = []
-        clip_time = 0
-        step_results = []
-
-        for step_idx, streaming_input in enumerate(streaming_inputs):
-            is_prefill = streaming_input.pop("is_prefill", step_idx == 0)
-            is_warmup = step_idx < num_warmup_steps
-
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                start_time = time.perf_counter()
-                if is_warmup:
-                    # Warmup steps: cache + compile, no return_extra needed
-                    model.sample_trajectories_from_data_with_streaming_vlm_rollout(
-                        data=helper.to_device(streaming_input, "cuda"),
-                        top_p=0.98,
-                        temperature=0.6,
-                        num_traj_samples=1,
-                        max_generation_length=256,
-                        torch_compile="max-autotune",
-                        fuse_qkv=False,
-                        fuse_gate_up=False,
-                    )
-                else:
-                    # Compiled streaming steps: measure minADE
-                    pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
-                        data=helper.to_device(streaming_input, "cuda"),
-                        top_p=0.98,
-                        temperature=0.6,
-                        num_traj_samples=1,
-                        max_generation_length=256,
-                        torch_compile="max-autotune",
-                        return_extra=True,
-                        fuse_qkv=False,
-                        fuse_gate_up=False,
-                    )
-                end_time = time.perf_counter()
-
-            step_time = end_time - start_time
-
-            if not is_warmup:
-                clip_time += step_time
-                min_ade = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
-                clip_minADEs.append(float(min_ade))
-
-                # Log each step's results
-                print(f"  Step {step_idx}: minADE={min_ade:.4f}, time={step_time:.2f}s")
-                print(f"    CoT: {extra['cot'][0]}")
-
-                step_results.append({
-                    "step": step_idx,
-                    "minADE": float(min_ade),
-                    "time_seconds": step_time,
-                    "cot": extra["cot"][0],
-                })
-
-        avg_minADE = np.mean(clip_minADEs)
-        print(f"  [Clip Summary] avg_minADE: {avg_minADE:.4f}, total_time: {clip_time:.2f}s")
-
-        all_results.append({
-            "clip_id": cid,
-            "avg_minADE": float(avg_minADE),
-            "step_results": step_results,
-            "total_time_seconds": clip_time,
-        })
-
-        # Reset streaming state for next clip
-        reset_streaming_state(model)
-
-    # Calculate overall statistics
-    successful_results = [r for r in all_results if "avg_minADE" in r]
-    if successful_results:
-        overall_avg_minADE = np.mean([r["avg_minADE"] for r in successful_results])
-        overall_std_minADE = np.std([r["avg_minADE"] for r in successful_results])
-    else:
-        overall_avg_minADE = 0.0
-        overall_std_minADE = 0.0
-
-    # Save results
-    final_results = {
-        "summary": {
-            "total_clips": len(clip_ids),
-            "successful_clips": len(successful_results),
-            "failed_clips": len(clip_ids) - len(successful_results),
-            "overall_avg_minADE": float(overall_avg_minADE),
-            "overall_std_minADE": float(overall_std_minADE),
-        },
-        "per_clip_results": all_results,
-    }
-
-    with open(output_path, "w") as f:
-        json.dump(final_results, f, indent=2)
-
-    print(f"\n{'='*60}")
-    print("Evaluation Summary")
-    print(f"{'='*60}")
-    print(f"Total clips: {len(clip_ids)}")
-    print(f"Successful: {len(successful_results)}")
-    print(f"Failed: {len(clip_ids) - len(successful_results)}")
-    print(f"Overall avg minADE: {overall_avg_minADE:.4f} +/- {overall_std_minADE:.4f}")
-    print(f"Results saved to: {output_path}")
+    print(f"Average time per step: {total_time / 12} seconds")
 
 
 if __name__ == "__main__":
     model, processor = load_model()
     # test_streaming_inference(model, processor)
-    # test_streaming_inference_compiled(model, processor)
-    eval_all_clips(model, processor)
+    test_streaming_inference_compiled(model, processor)

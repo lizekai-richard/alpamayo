@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers.models.qwen3_vl.modeling_qwen3_vl as qwen3vl
-from transformers.cache_utils import Cache
+import transformers.cache_utils as cache_utils
+from transformers.utils import is_torchdynamo_compiling
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
@@ -15,6 +16,129 @@ import logging
 import gc
 
 logger = logging.getLogger(__name__)
+
+
+class StaticLayer(cache_utils.CacheLayerMixin):
+
+    def __init__(self, max_cache_len, max_batch_size=1):
+        super().__init__()
+        self.max_cache_len = max_cache_len
+        self._max_batch_size = max_batch_size
+
+    def lazy_initialization(self, key_states, value_states):
+
+        self.dtype, self.device = key_states.dtype, key_states.device
+        # Use pre-configured max_batch_size (allows pre-allocating for multi-sample decode)
+        self.max_batch_size = max(self._max_batch_size, key_states.shape[0])
+        self.num_heads = key_states.shape[1]
+        self.v_head_dim = value_states.shape[-1]
+        self.k_head_dim = key_states.shape[-1]
+
+        self.keys = torch.zeros(
+            (self.max_batch_size, self.num_heads, self.max_cache_len, self.k_head_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.values = torch.zeros(
+            (self.max_batch_size, self.num_heads, self.max_cache_len, self.v_head_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        # Note: `mark_static_address` is used to tag the cache as a fixed data pointer, preventing compiled graph
+        # breaks when updating the cache. However, it is not supported when tracing the graph, so we skip it in this case.
+        # As prefill should never be compiled, this is not an issue and it will still be run (except when users compile
+        # prefill explicitly, but this should be avoided!)
+        if not is_torchdynamo_compiling():
+            torch._dynamo.mark_static_address(self.keys)
+            torch._dynamo.mark_static_address(self.values)
+
+        self.is_initialized = True
+
+    def expand_batch(self):
+        """Copy batch 0's KV to all other batch slots.
+
+        Call this after prefill (batch=1) and before multi-sample decode,
+        so all samples start with the same prompt KV.
+        """
+        if self.max_batch_size > 1 and self.is_initialized:
+            self.keys[1:].copy_(self.keys[:1].expand(self.max_batch_size - 1, -1, -1, -1))
+            self.values[1:].copy_(self.values[:1].expand(self.max_batch_size - 1, -1, -1, -1))
+
+    def update(
+        self,
+        key_states,
+        value_states,
+        cache_kwargs=None,
+    ):
+        """
+        Update the key and value caches in-place.
+
+        Handles batch size mismatch:
+          - src_batch < dst_batch (prefill batch=1 into multi-batch cache): write batch 0 only
+          - src_batch == dst_batch (decode with num_samples): normal update
+        """
+        # Lazy initialization
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+
+        cache_position = cache_kwargs.get("cache_position") if cache_kwargs is not None else None
+        cache_position = (
+            cache_position if cache_position is not None else torch.arange(key_states.shape[-2], device=self.device)
+        )
+
+        # Update the cache
+        src_batch_size = key_states.shape[0]
+        dst_batch_size = self.keys.shape[0]
+
+        if src_batch_size < dst_batch_size:
+            # Prefill (batch=1) writing into larger cache: only update batch 0
+            self.keys[:src_batch_size].index_copy_(2, cache_position, key_states)
+            self.values[:src_batch_size].index_copy_(2, cache_position, value_states)
+            return self.keys[:src_batch_size], self.values[:src_batch_size]
+        else:
+            # Normal: src_batch == dst_batch (during multi-sample decode)
+            self.keys.index_copy_(2, cache_position, key_states)
+            self.values.index_copy_(2, cache_position, value_states)
+            return self.keys, self.values
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        """Return the length and offset of the cache, used to generate the attention mask"""
+        kv_offset = 0
+        kv_length = self.max_cache_len
+        return kv_length, kv_offset
+
+    def get_seq_length(self) -> int:
+        """Returns the sequence length of the cached states."""
+        return (self.keys[0, 0].any(dim=-1)).sum() if self.is_initialized else 0
+
+    def get_max_cache_shape(self) -> int:
+        """Return the maximum cache shape of the cache"""
+        return self.max_cache_len
+
+
+class StaticCache(cache_utils.Cache):
+    def __init__(
+        self,
+        config,
+        max_cache_len,
+        max_batch_size=1,
+        offloading=False,
+        offload_only_non_sliding=True,
+        **kwargs,
+    ):
+        config = config.get_text_config(decoder=True)
+        layers = []
+        for _ in range(config.num_hidden_layers):
+            layer = StaticLayer(max_cache_len=max_cache_len, max_batch_size=max_batch_size)
+            layers.append(layer)
+
+        super().__init__(layers=layers, offloading=offloading, offload_only_non_sliding=offload_only_non_sliding)
+
+    def expand_batch(self):
+        """Copy batch 0's KV to all batch slots. Call before multi-sample decode."""
+        for layer in self.layers:
+            if layer.is_initialized:
+                layer.expand_batch()
 
 
 class QKVLinear(nn.Module):
@@ -28,11 +152,11 @@ class QKVLinear(nn.Module):
     
     def __init__(
         self,
-        hidden_size: int,
-        head_size: int,
-        total_num_heads: int,
-        total_num_kv_heads: int | None = None,
-        bias: bool = False,
+        hidden_size,
+        head_size,
+        total_num_heads,
+        total_num_kv_heads=None,
+        bias=False,
     ):
         """Initialize fused QKV projection.
         
@@ -60,7 +184,7 @@ class QKVLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x):
         """Project input to Q, K, V tensors.
         
         Args:
@@ -104,9 +228,9 @@ class MergedColumnLinear(nn.Module):
     
     def __init__(
         self,
-        input_size: int,
-        output_sizes: list[int],
-        bias: bool = False,
+        input_size,
+        output_sizes,
+        bias=False,
     ):
         """Initialize merged linear layer.
         
@@ -126,7 +250,7 @@ class MergedColumnLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def forward(self, x):
         """Project and split input.
         
         Args:
@@ -140,7 +264,7 @@ class MergedColumnLinear(nn.Module):
         
 
 class Qwen3VLVisionPatchEmbed(qwen3vl.Qwen3VLVisionPatchEmbed):
-    def __init__(self, config) -> None:
+    def __init__(self, config):
         nn.Module.__init__(self)
         self.in_features = (
             config.in_channels * config.temporal_patch_size * config.patch_size**2
@@ -155,18 +279,18 @@ class Qwen3VLVisionPatchEmbed(qwen3vl.Qwen3VLVisionPatchEmbed):
 
         self.proj._register_load_state_dict_pre_hook(convert_conv3d_weights, with_module=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states):
         return self.proj(hidden_states.reshape(-1, self.in_features))
 
 
 class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        hidden_states,
+        cu_seqlens,
+        position_embeddings,
         **kwargs,
-    ) -> torch.Tensor:
+    ):
         seq_len = hidden_states.shape[0]
 
         if not hasattr(self, "_num_chunks"):
@@ -187,7 +311,7 @@ class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
 
 
 class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
-    def _init_caches(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> None:
+    def _init_caches(self, hidden_states, grid_thw):
         seq_len = hidden_states.size(0)
 
         self._cached_pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -200,7 +324,7 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
         cu_seqlens = cu_seqlens.cumsum(dim=0, dtype=torch.int32)
         self._cached_cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, hidden_states, grid_thw, **kwargs):
         hidden_states = self.patch_embed(hidden_states)
 
         if not hasattr(self, "_cached_pos_embeds"):
@@ -233,7 +357,7 @@ def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):
 class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
     """Patched Qwen3VL Text Attention with optional fused QKV projection."""
 
-    def __init__(self, config, layer_idx: int, mode: str = "streaming", fuse_qkv: bool = False):
+    def __init__(self, config, layer_idx, mode="streaming", fuse_qkv=False):
         super().__init__(config, layer_idx)
 
         self.fuse_qkv = fuse_qkv
@@ -403,18 +527,18 @@ class Qwen3VLTextMLP(qwen3vl.Qwen3VLTextMLP):
 class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        visual_pos_masks: Optional[torch.Tensor] = None,
-        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
-        streaming_attention_mask: Optional[torch.Tensor] = None,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        cache_position=None,
+        visual_pos_masks=None,
+        deepstack_visual_embeds=None,
+        streaming_attention_mask=None,
         **kwargs,
-    ) -> Union[tuple, BaseModelOutputWithPast]:
+    ):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         

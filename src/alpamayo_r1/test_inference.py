@@ -19,11 +19,13 @@
 
 import torch
 import numpy as np
+import time
 
 from alpamayo_r1.models.alpamayo_r1_compile import AlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
+torch.set_float32_matmul_precision("high")
 
 def create_sliding_window_inputs(
     processor,
@@ -88,36 +90,62 @@ def create_sliding_window_inputs(
 
 @torch.inference_mode()
 def run_inference(model, processor, sliding_window_inputs):
-    for step_idx, model_inputs in enumerate(sliding_window_inputs):
+
+    warmup_steps = 3
+    for i in range(warmup_steps):
+        model_inputs = sliding_window_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=1,  # Feel free to raise this for more output trajectories and CoC traces.
+                num_traj_samples=3,  # Feel free to raise this for more output trajectories and CoC traces.
                 max_generation_length=256,
                 return_extra=True,
+                torch_compile="max-autotune",
+                fuse_qkv=True,
+                fuse_gate_up=True,
             )
-
-        # the size is [batch_size, num_traj_sets, num_traj_samples]
-        print(f"\n=== Step {step_idx} ===")
-        print("Chain-of-Causation:\n", extra["cot"][0])
-
+    print(f"Warmup steps completed")
+    
+    time_list = []
+    for i in range(warmup_steps, len(sliding_window_inputs)):
+        model_inputs = sliding_window_inputs[i]
+        start_time = time.perf_counter()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+                data=helper.to_device(model_inputs, "cuda"),
+                top_p=0.98,
+                temperature=0.6,
+                num_traj_samples=3,  # Feel free to raise this for more output trajectories and CoC traces.
+                max_generation_length=256,
+                torch_compile="max-autotune",
+                return_extra=True,
+                fuse_qkv=True,
+                fuse_gate_up=True,
+            )
+        end_time = time.perf_counter()
+        print(f"Time taken: {end_time - start_time} seconds")
+        time_list.append(end_time - start_time)
         gt_xy = model_inputs["ego_future_xyz"].cpu()[0, 0, :, :2].T.numpy()
         pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
         diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
         min_ade = diff.min()
+        min_ade_idx = diff.argmin()
         print(f"MinADE: {min_ade}")
+        print("Chain-of-Causation:\n", extra["cot"][0][0][min_ade_idx])
+    
+    print("Average time per step: ", np.mean(time_list))
 
 
 def test_inference():
     # Example clip ID
-    clip_id = "eb6d28c4-fcca-447f-bcf0-08f94c973d84"
+    clip_id = "2d50798c-a96e-4164-b791-bbad2a59c2de"
     print(f"Loading dataset for clip_id: {clip_id}...")
 
     model = AlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
     processor = helper.get_processor(model.tokenizer)
-    sliding_window_inputs = create_sliding_window_inputs(processor, 10, clip_id)
+    sliding_window_inputs = create_sliding_window_inputs(processor, 15, clip_id)
     run_inference(model, processor, sliding_window_inputs)
 
 

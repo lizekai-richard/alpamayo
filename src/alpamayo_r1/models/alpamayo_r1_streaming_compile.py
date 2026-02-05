@@ -21,7 +21,8 @@ import einops
 import hydra.utils as hyu
 import numpy as np
 import torch
-from transformers import AutoConfig, AutoModel, StaticCache
+from transformers import AutoConfig, AutoModel
+from transformers import StaticCache
 from transformers.generation.logits_process import (
     LogitsProcessor,
     LogitsProcessorList,
@@ -35,6 +36,7 @@ from alpamayo_r1.models.streaming_model import ReasoningVLA
 from alpamayo_r1.config import AlpamayoR1Config
 from alpamayo_r1.diffusion.base import BaseDiffusion
 from alpamayo_r1.models.patches import patch_for_torch_compile
+from alpamayo_r1.models.patches import StaticCache
 from alpamayo_r1.models.token_utils import (
     extract_text_tokens,
     replace_padding_after_eos,
@@ -334,21 +336,18 @@ class StreamingAlpamayoR1(ReasoningVLA):
     def _decode(
         self,
         input_ids: torch.Tensor,
-        # attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         cache_position: torch.Tensor,
     ) -> torch.Tensor:
         """Run decode forward pass for a single token."""
         if not hasattr(self, "_decode_fn"):
             self._decode_input_ids = torch.empty_like(input_ids)
-            # self._decode_attention_mask = torch.empty_like(attention_mask)
             self._decode_position_ids = torch.empty_like(position_ids)
             self._decode_cache_position = torch.empty_like(cache_position)
 
             def decode_fn():
                 hidden = self.vlm.model.language_model(
                     input_ids=self._decode_input_ids,
-                    # attention_mask=self._decode_attention_mask,
                     position_ids=self._decode_position_ids,
                     past_key_values=self._past_key_values,
                     cache_position=self._decode_cache_position,
@@ -359,7 +358,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
             self._decode_fn = decode_fn
 
         self._decode_input_ids.copy_(input_ids)
-        # self._decode_attention_mask.copy_(attention_mask)
         self._decode_position_ids.copy_(position_ids)
         self._decode_cache_position.copy_(cache_position)
 
@@ -492,6 +490,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         attention_mask: torch.Tensor,
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
+        num_samples: int,
         device: torch.device,
     ):
         # Cache all streaming related inputs
@@ -499,7 +498,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             vision_start_end_ids_ranges,
             image_token_ids_ranges,
             traj_and_text_ids_range,
-        ) = self._retrieve_streaming_related_inputs(input_ids)
+        ) = self._retrieve_streaming_related_inputs(input_ids[:1])
 
         cache_position = self._create_cache_position().to(device)
 
@@ -541,9 +540,15 @@ class StreamingAlpamayoR1(ReasoningVLA):
             delattr(self.vlm.model.visual, "_cached_pos_embeds")
             logger.info("Deleted _cached_pos_embeds in Qwen3VLVisionModel")
         
+        for block in self.vlm.model.visual.blocks:
+            if hasattr(block.attn, "_num_chunks"):
+                delattr(block.attn, "_num_chunks")
+            logger.info("Deleted _num_chunks in Qwen3VLVisionModel")
+        
         if hasattr(self.vlm.model.language_model, "_cached_deepstack_indices"):
             delattr(self.vlm.model.language_model, "_cached_deepstack_indices")
             logger.info("Deleted _cached_deepstack_indices in Qwen3VLTextModel")
+            logger.info("Deleted _num_chunks in Qwen3VLTextModel")
 
     @torch.inference_mode()
     def sample_trajectories_from_data_with_streaming_vlm_rollout(
@@ -594,6 +599,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         ego_history_rot = data["ego_history_rot"]
 
         batch_size, num_traj_groups, _, _ = ego_history_xyz.shape
+        num_samples = num_traj_samples * num_traj_sets
         assert num_traj_groups == 1, "Only one trajectory group is supported."
         device = input_ids.device
 
@@ -605,19 +611,20 @@ class StreamingAlpamayoR1(ReasoningVLA):
         # Setup generation
         max_new_tokens = kwargs.get("max_generation_length", self.config.tokens_per_future_traj)
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
-        self.max_cache_len = self.prefill_seq_length + max_new_tokens
+        self.max_cache_len = self.prefill_seq_length + max_new_tokens + self.num_action_tokens
 
         # Initialize KV cache on first call
         if self._past_key_values is None:
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
                 max_cache_len=self.max_cache_len,
+                max_batch_size=num_samples * batch_size,
                 offloading=False,
             )
         
         if self.is_first_prefill:
             logger.info("First prefill: caching KV and returning (no streaming logs yet).")
-            self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, device)
+            self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, num_samples, device)
             self._update_past_key_values()
             self.is_first_prefill = False
             return
@@ -659,7 +666,13 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # ===== Decode =====
         output_ids = input_ids.clone()
-        unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        if num_samples > 1:
+            self._past_key_values.expand_batch()
+            logits = logits.expand(num_samples, -1).contiguous()
+            output_ids = output_ids.expand(num_samples, -1).contiguous()
+
+        unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
         cur_pos = cache_position[-1].item() + 1
 
         for _ in range(max_new_tokens):
@@ -689,12 +702,11 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # Find <traj_future_start> position
         traj_start_pos = self._find_traj_start_positions(output_ids)
+        logger.info(f"traj_start_pos shape: {traj_start_pos.shape}")
 
         # ===== Action (Diffusion) =====
         # Note: Action only attends to prompt tokens, NOT reasoning tokens (they are masked out).
         # This is by design - the expert model conditions only on the original prompt.
-        num_samples = num_traj_samples * num_traj_sets
-        # action_start_pos = traj_start_pos + 1
 
         # MODIFIED: Calculate offset for action tokens. In streaming setting, the offset is wrong without the modification due to truncated input length.
         # But the length of kv cache is always the same.
@@ -703,14 +715,16 @@ class StreamingAlpamayoR1(ReasoningVLA):
             action_start_pos = self.prefill_seq_length + (traj_start_pos - streaming_input_len) + 1
         else:
             action_start_pos = traj_start_pos + 1
+        
+        print(f"action_start_pos: {action_start_pos}")
 
         # Build position_ids for action tokens
-        position_ids = torch.arange(self.num_action_tokens, device=device)
-        position_ids = einops.repeat(position_ids, "t -> 3 b t", b=batch_size).clone()
-        position_ids += (self._cached_rope_deltas + action_start_pos[:, None]).to(device)
+        # position_ids = torch.arange(self.num_action_tokens, device=device)
+        # position_ids = einops.repeat(position_ids, "t -> 3 b t", b=batch_size).clone()
+        # position_ids += (self._cached_rope_deltas + action_start_pos[:, None]).to(device)
 
         # Build attention mask: attend to prompt only, mask out reasoning tokens
-        indices = torch.arange(self._past_key_values.max_cache_len, device=device)
+        indices = torch.arange(self._past_key_values.max_cache_len, device=device).expand(num_samples, -1)
         is_prompt = indices < action_start_pos[:, None]
         is_action = (indices >= cur_pos) & (indices < cur_pos + self.num_action_tokens)
         attention_mask = torch.where(

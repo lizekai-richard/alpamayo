@@ -40,7 +40,8 @@ import einops
 import hydra.utils as hyu
 import numpy as np
 import torch
-from transformers import AutoConfig, AutoModel, StaticCache
+from transformers import AutoConfig, AutoModel
+from alpamayo_r1.models.patches import StaticCache
 from transformers.generation.logits_process import (
     LogitsProcessor,
     LogitsProcessorList,
@@ -599,6 +600,11 @@ class AlpamayoR1(ReasoningVLA):
         # Delete cached embeddings for next calls
         if hasattr(self.vlm.model.visual, "_cached_pos_embeds"):
             delattr(self.vlm.model.visual, "_cached_pos_embeds")
+        
+        for block in self.vlm.model.visual.blocks:
+            if hasattr(block.attn, "_num_chunks"):
+                delattr(block.attn, "_num_chunks")
+
         if hasattr(self.vlm.model.language_model, "_cached_deepstack_indices"):
             delattr(self.vlm.model.language_model, "_cached_deepstack_indices")
 
@@ -633,6 +639,7 @@ class AlpamayoR1(ReasoningVLA):
         ego_history_rot = data["ego_history_rot"]
 
         batch_size, num_traj_groups, _, _ = ego_history_xyz.shape
+        num_samples = num_traj_samples * num_traj_sets
         assert num_traj_groups == 1, "Only one trajectory group is supported."
         device = input_ids.device
 
@@ -653,6 +660,7 @@ class AlpamayoR1(ReasoningVLA):
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
                 max_cache_len=cache_len,
+                max_batch_size=num_samples,
                 offloading=False,
             )
 
@@ -702,7 +710,11 @@ class AlpamayoR1(ReasoningVLA):
 
         # ===== Decode =====
         output_ids = input_ids.clone()
-        unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
+        if num_samples > 1:
+            self._past_key_values.expand_batch()
+            logits = logits.expand(num_samples, -1).contiguous()
+            output_ids = output_ids.expand(num_samples, -1).contiguous()
+        unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
         cur_pos = cache_position[-1].item() + 1
 
         for _ in range(max_new_tokens):
@@ -741,13 +753,8 @@ class AlpamayoR1(ReasoningVLA):
         # Note: we must add back the truncated input length in the streaming step.
         action_start_pos = self.prefill_seq_length + (traj_start_pos - streaming_input_len) + 1
 
-        # Build position_ids for action tokens
-        position_ids = torch.arange(self.num_action_tokens, device=device)
-        position_ids = einops.repeat(position_ids, "t -> 3 b t", b=batch_size).clone()
-        position_ids += (self._cached_rope_deltas + action_start_pos[:, None]).to(device)
-
         # Build attention mask
-        indices = torch.arange(self._past_key_values.max_cache_len, device=device)
+        indices = torch.arange(self._past_key_values.max_cache_len, device=device).expand(num_samples, -1)
         is_prompt = indices < action_start_pos[:, None]
         is_action = (indices >= cur_pos) & (indices < cur_pos + self.num_action_tokens)
         attention_mask = torch.where(
@@ -810,7 +817,7 @@ class AlpamayoR1(ReasoningVLA):
         """Non-streaming mode: resets KV cache each call, processes all frames."""
         self._torch_compile = torch_compile
         if not hasattr(self, "_patched_for_compile"):
-            patch_for_torch_compile(self, mode="non-streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+            patch_for_torch_compile(self, mode="non_streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
             self._patched_for_compile = True
 
         # Extract inputs
@@ -822,6 +829,7 @@ class AlpamayoR1(ReasoningVLA):
         ego_history_rot = data["ego_history_rot"]
 
         batch_size, num_traj_groups, _, _ = ego_history_xyz.shape
+        num_samples = num_traj_samples * num_traj_sets
         assert num_traj_groups == 1, "Only one trajectory group is supported."
         device = input_ids.device
 
@@ -842,6 +850,7 @@ class AlpamayoR1(ReasoningVLA):
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
                 max_cache_len=cache_len,
+                max_batch_size=num_samples,
                 offloading=False,
             )
         self._past_key_values.reset()
@@ -870,7 +879,11 @@ class AlpamayoR1(ReasoningVLA):
 
         # ===== Decode =====
         output_ids = input_ids.clone()
-        unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
+        if num_samples > 1:
+            self._past_key_values.expand_batch()
+            logits = logits.expand(num_samples, -1).contiguous()
+            output_ids = output_ids.expand(num_samples, -1).contiguous()
+        unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
         cur_pos = seq_len
 
         for _ in range(max_new_tokens):
@@ -908,11 +921,11 @@ class AlpamayoR1(ReasoningVLA):
 
         # Build position_ids for action tokens
         position_ids = torch.arange(self.num_action_tokens, device=device)
-        position_ids = einops.repeat(position_ids, "t -> 3 b t", b=batch_size).clone()
-        position_ids += (rope_deltas + action_start_pos[:, None]).to(device)
+        position_ids = einops.repeat(position_ids, "t -> 3 b t", b=batch_size * num_samples).clone()
+        position_ids += (rope_deltas + action_start_pos[None, :, None]).to(device)
 
         # Build attention mask
-        indices = torch.arange(self._past_key_values.max_cache_len, device=device)
+        indices = torch.arange(self._past_key_values.max_cache_len, device=device).expand(num_samples, -1)
         is_prompt = indices < action_start_pos[:, None]
         is_action = (indices >= cur_pos) & (indices < cur_pos + self.num_action_tokens)
         attention_mask = torch.where(

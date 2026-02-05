@@ -199,6 +199,8 @@ def run_streaming_inference(model, model_inputs, _logging: bool = True):
             max_generation_length=256,
             return_extra=True,
             torch_compile="max-autotune",
+            fuse_qkv=True,
+            fuse_gate_up=True,
         )
         if pred_xyz is not None:
             min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
@@ -227,8 +229,9 @@ def run_non_streaming_inference(model, model_inputs, _logging: bool = True):
             max_generation_length=256,
             return_extra=True,
             torch_compile="max-autotune",
+            fuse_qkv=True,
+            fuse_gate_up=True,
         )
-        print(pred_xyz.shape)
         min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
 
     if _logging:
@@ -330,8 +333,8 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_steps", type=int, default=3)
     parser.add_argument("--num_steps", type=int, default=15)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_traj_samples", type=int, default=6)
-    parser.add_argument("--clip_id", type=str, default="030c760c-ae38-49aa-9ad8-f5650a545d26")
+    parser.add_argument("--num_traj_samples", type=int, default=1)
+    parser.add_argument("--clip_id", type=str, default="53baf60a-902f-446d-8e30-5eb7dbc992e7")
     parser.add_argument("--t0_us", type=int, default=2_000_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
     parser.add_argument("--output_dir", type=str, default="./test_results")
