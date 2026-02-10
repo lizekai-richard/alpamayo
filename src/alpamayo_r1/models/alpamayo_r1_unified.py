@@ -1044,8 +1044,12 @@ class AlpamayoR1(ReasoningVLA):
         self._cached_rope_deltas = None
         self.vision_start_end_ids_ranges = None
         self.traj_and_text_ids_range = None
-        if self._past_key_values is not None:
-            self._past_key_values.reset()
+        # if self._past_key_values is not None:
+        #     self._past_key_values.reset()
+
+        for layer in self._past_key_values.layers:
+            layer.keys.zero_()
+            layer.values.zero_()
 
         # Reset VLM internal caches
         for block in self.vlm.model.visual.blocks:

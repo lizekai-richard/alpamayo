@@ -148,6 +148,14 @@ def extract_between_special_tokens(decoded_batch: list[str], token: str) -> list
     return out
 
 
+def _truncate_after_first_period(text: str) -> str:
+    """Truncate a string after the first '.' character (inclusive)."""
+    idx = text.find(".")
+    if idx == -1:
+        return text
+    return text[: idx + 1]
+
+
 def extract_text_tokens(
     tokenizer: AutoTokenizer, output_tokens: torch.Tensor
 ) -> dict[str, list[str]]:
@@ -165,7 +173,8 @@ def extract_text_tokens(
     extract_tokens = ["cot", "meta_action", "answer"]
     extracted_text = {}
     for token in extract_tokens:
-        extracted_text[token] = extract_between_special_tokens(decoded_batch, token)
+        extracted = extract_between_special_tokens(decoded_batch, token)
+        extracted_text[token] = [_truncate_after_first_period(text) for text in extracted]
     return extracted_text
 
 

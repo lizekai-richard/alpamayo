@@ -287,6 +287,22 @@ def test_non_streaming_inference(args, model, processor):
         json.dump(results, f)
 
 
+def warmup_model(args, model, processor, warmup_clip_id):
+    """Warmup the model."""
+    warmup_steps = args.warmup_steps
+    streaming_inputs = create_streaming_inputs(
+        processor=processor,
+        num_windows=args.num_steps,
+        clip_id=warmup_clip_id,
+        t0_us=args.t0_us,
+        time_step_us=args.time_step_us,
+    )
+    for i in range(warmup_steps):
+        model_inputs = streaming_inputs[i]
+        run_streaming_inference(model, model_inputs, _logging=False)
+    logger.info("Warmup completed")
+
+
 @torch.inference_mode()
 def test_streaming_inference(args, model, processor):
     """Test streaming inference."""
@@ -306,7 +322,6 @@ def test_streaming_inference(args, model, processor):
         run_streaming_inference(model, model_inputs, _logging=False)
     logger.info("Warmup completed")
 
-    logger.info(f"Running streaming inference for {len(streaming_inputs)} windows:")
     min_ade_list = []
     cot_list = []
     for i in range(warmup_steps, len(streaming_inputs)):

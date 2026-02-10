@@ -481,6 +481,47 @@ class StreamingAlpamayoR1(ReasoningVLA):
             output_ids.shape[1] - 1,
         )
 
+    def _find_first_truncation_positions(
+        self,
+        output_ids: torch.Tensor,
+        prompt_length: int | torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Find first truncation position (sentence-ending '.' or <|im_end|>) after prompt tokens."""
+        if not hasattr(self, "_truncation_token_mask"):
+            vocab_size = len(self.tokenizer)
+            token_strings = self.tokenizer.convert_ids_to_tokens(list(range(vocab_size)))
+            im_end_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+            self._truncation_token_mask = torch.tensor(
+                [(token is not None and token.endswith(".")) or tid == im_end_token_id
+                 for tid, token in enumerate(token_strings)],
+                dtype=torch.bool,
+            )
+
+        period_token_mask = self._truncation_token_mask.to(output_ids.device)[output_ids]
+        if prompt_length is None:
+            prompt_length = getattr(self, "_cached_prompt_length", 0)
+
+        seq_len = output_ids.shape[1]
+        if isinstance(prompt_length, int):
+            position_indices = torch.arange(seq_len, device=output_ids.device)
+            mask_after_prompt = position_indices >= prompt_length
+        else:
+            prompt_length = torch.as_tensor(prompt_length, device=output_ids.device).long()
+            position_indices = torch.arange(seq_len, device=output_ids.device).unsqueeze(0)
+            if prompt_length.dim() == 0:
+                mask_after_prompt = position_indices >= prompt_length.item()
+            else:
+                mask_after_prompt = position_indices >= prompt_length[:, None]
+
+        period_token_mask = period_token_mask & mask_after_prompt
+        has_period = period_token_mask.any(dim=1)
+
+        period_positions = period_token_mask.int().argmax(dim=1)
+        if has_period.all():
+            return period_positions
+
+        return -1
+
     # ==================== Main Inference ====================
 
     # We don't need any output from the first prefill. Only need to cache key/values, position_ids, and attention_mask.
@@ -538,17 +579,16 @@ class StreamingAlpamayoR1(ReasoningVLA):
         # Delete the cached_pos_embeds in QwenVLVisionModel
         if hasattr(self.vlm.model.visual, "_cached_pos_embeds"):
             delattr(self.vlm.model.visual, "_cached_pos_embeds")
-            logger.info("Deleted _cached_pos_embeds in Qwen3VLVisionModel")
+        logger.info("Deleted _cached_pos_embeds in Qwen3VLVisionModel")
         
         for block in self.vlm.model.visual.blocks:
             if hasattr(block.attn, "_num_chunks"):
                 delattr(block.attn, "_num_chunks")
-            logger.info("Deleted _num_chunks in Qwen3VLVisionModel")
+        logger.info("Deleted _num_chunks in Qwen3VLVisionModel")
         
         if hasattr(self.vlm.model.language_model, "_cached_deepstack_indices"):
             delattr(self.vlm.model.language_model, "_cached_deepstack_indices")
-            logger.info("Deleted _cached_deepstack_indices in Qwen3VLTextModel")
-            logger.info("Deleted _num_chunks in Qwen3VLTextModel")
+        logger.info("Deleted _cached_deepstack_indices in Qwen3VLTextModel")
 
     @torch.inference_mode()
     def sample_trajectories_from_data_with_streaming_vlm_rollout(
@@ -637,6 +677,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         # Create cache position and position IDs
         cache_position = self._create_cache_position().to(device)
         seq_len = input_ids.shape[1]
+        self._cached_prompt_length = seq_len
 
         # Get embeddings
         inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
@@ -666,12 +707,11 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # ===== Decode =====
         output_ids = input_ids.clone()
-        # if num_samples > 1:
-        #     self._past_key_values.expand_batch()
-        #     logits = logits.expand(num_samples, -1).contiguous()
-        #     output_ids = output_ids.expand(num_samples, -1).contiguous()
-        # unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
-        unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
+        if num_samples > 1:
+            self._past_key_values.expand_batch()
+            logits = logits.expand(num_samples, -1).contiguous()
+            output_ids = output_ids.expand(num_samples, -1).contiguous()
+        unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
         cur_pos = cache_position[-1].item() + 1
 
         for _ in range(max_new_tokens):
@@ -701,6 +741,10 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # Find <traj_future_start> position
         traj_start_pos = self._find_traj_start_positions(output_ids)
+        truncation_pos = self._find_first_truncation_positions(output_ids, prompt_length=seq_len)
+        if truncation_pos != -1:
+            traj_start_pos = torch.min(traj_start_pos, truncation_pos)
+            logger.info(f"traj_start_pos: {traj_start_pos.item()}, truncation_pos: {truncation_pos.item()}")
 
         # ===== Action (Diffusion) =====
         # Note: Action only attends to prompt tokens, NOT reasoning tokens (they are masked out).

@@ -14,6 +14,7 @@ from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 import logging
 import gc
+from flash_colreduce import flash_colreduce
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +290,7 @@ class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
         hidden_states,
         cu_seqlens,
         position_embeddings,
+        return_colsum=False,
         **kwargs,
     ):
         seq_len = hidden_states.shape[0]
@@ -307,7 +309,36 @@ class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
         value = value.reshape(self._num_chunks, chunk_size, self.num_heads, -1).transpose(1, 2)
 
         output = F.scaled_dot_product_attention(query, key, value, scale=self.scaling)
-        return self.proj(output.transpose(1, 2).reshape(seq_len, -1))
+        output = self.proj(output.transpose(1, 2).reshape(seq_len, -1))
+
+        if return_colsum:
+            colsum = flash_colreduce(query, key, reduction="sum")
+            return output, colsum
+        else:
+            return output, None
+
+
+class Qwen3VLVisionBlock(qwen3vl.Qwen3VLVisionBlock):
+    def forward(
+        self,
+        hidden_states,
+        cu_seqlens,
+        rotary_pos_emb=None,
+        position_embeddings=None,
+        return_colsum=False,
+        **kwargs,
+    ): 
+        attn_output, colsum = self.attn(
+            self.norm1(hidden_states),
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=rotary_pos_emb,
+            position_embeddings=position_embeddings,
+            return_colsum=return_colsum,
+            **kwargs,
+        )
+        hidden_states = hidden_states + attn_output
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        return hidden_states, colsum
 
 
 class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
@@ -324,7 +355,19 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
         cu_seqlens = cu_seqlens.cumsum(dim=0, dtype=torch.int32)
         self._cached_cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-    def forward(self, hidden_states, grid_thw, **kwargs):
+    def _merge_colsum(self, colsums, image_grid_thw):
+        # colsums is a list of tensors, each tensor is of shape [B, H, L].
+        colsums = torch.stack(colsums, dim=0)  # [num_layers, B, H, L]
+        colsums = colsums.mean(dim=(0, 2))  # [B, L]
+        B, H, W = colsums.shape[0], image_grid_thw[0, 2], image_grid_thw[0, 3]
+        colsums = colsums.reshape(B, H, W)
+
+        ratio = self.spatial_merge_size
+        colsums = colsums.view(B, H // ratio,  W // ratio, ratio**2)
+        colsums = colsums.sum(dim=-1).reshape(B, -1)
+        return colsums
+
+    def forward(self, hidden_states, grid_thw, target_layers=None,**kwargs):
         hidden_states = self.patch_embed(hidden_states)
 
         if not hasattr(self, "_cached_pos_embeds"):
@@ -333,17 +376,21 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
         hidden_states = (hidden_states + self._cached_pos_embeds).reshape(hidden_states.size(0), -1)
 
         deepstack_features = []
+        colsums = []
         for layer_idx, block in enumerate(self.blocks):
-            hidden_states = block(
+            hidden_states, colsum = block(
                 hidden_states,
                 cu_seqlens=self._cached_cu_seqlens,
                 position_embeddings=self._cached_position_embeddings,
+                return_colsum=target_layers is not None and layer_idx in target_layers,
             )
+            if colsum is not None:
+                colsums.append(colsum)
             if layer_idx in self.deepstack_visual_indexes:
                 merger_idx = self.deepstack_visual_indexes.index(layer_idx)
                 deepstack_features.append(self.deepstack_merger_list[merger_idx](hidden_states))
 
-        return self.merger(hidden_states), deepstack_features
+        return self.merger(hidden_states), deepstack_features, self._merge_colsum(colsums, grid_thw)
 
 
 def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):
@@ -584,6 +631,7 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
 _PATCHED_CLASSES = {
     "Qwen3VLVisionModel": Qwen3VLVisionModel,
     "Qwen3VLVisionPatchEmbed": Qwen3VLVisionPatchEmbed,
+    "Qwen3VLVisionBlock": Qwen3VLVisionBlock,
     "Qwen3VLVisionAttention": Qwen3VLVisionAttention,
     "Qwen3VLTextModel": Qwen3VLTextModel,
     "Qwen3VLTextAttention": Qwen3VLTextAttention,
@@ -628,6 +676,13 @@ def _replace_module(
         # offload for fusion
         old_module = old_module.to("cpu")
         new_module.load_state_dict(old_module.state_dict(), assign=True)
+    elif new_class in (Qwen3VLVisionModel, Qwen3VLVisionBlock, Qwen3VLVisionAttention, Qwen3VLTextModel):
+        # These patched classes only override forward/add methods (no __init__ changes),
+        # so swapping __class__ is sufficient. This also avoids the ordering problem
+        # where replacing a parent (e.g. VisionModel) via new instance would recreate
+        # unpatched children, invalidating collected references to the old children.
+        old_module.__class__ = new_class
+        return
     else:
         new_module = new_class(config)
         new_module.load_state_dict(old_module.state_dict(), assign=True)

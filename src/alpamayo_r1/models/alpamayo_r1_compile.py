@@ -325,6 +325,172 @@ class AlpamayoR1(ReasoningVLA):
         if self._torch_compile:
             torch.compiler.cudagraph_mark_step_begin()
         return self._compiled_action_fn()
+    
+    def _prune_tokens(self, colsums: torch.Tensor, sparsity_ratio: float) -> torch.Tensor:
+        """Select top-k tokens per image based on colsum importance scores.
+
+        Args:
+            colsums: [num_images, tokens_per_image] importance scores.
+            sparsity_ratio: Fraction of tokens to remove (0.5 = keep 50%).
+
+        Returns:
+            Sorted indices of kept tokens, shape [num_images, K].
+        """
+        num_tokens = colsums.shape[-1]
+        num_keep = int(num_tokens * (1 - sparsity_ratio))
+        _, indices = torch.topk(colsums, num_keep, dim=-1)
+        return indices.sort(dim=-1).values
+
+    def _get_pruned_rope_index(
+        self,
+        input_ids: torch.LongTensor,
+        image_grid_thw: torch.LongTensor,
+        token_indices: torch.LongTensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reconstruct mRoPE position_ids after token pruning.
+
+        Mirrors Qwen3VLModel.get_rope_index but replaces the full T×H×W grid
+        with only the kept tokens, remapping h and w independently to contiguous
+        0..N-1 values.
+
+        Args:
+            input_ids: [B, seq_len] original (unpruned) input IDs.
+            image_grid_thw: [num_images, 3] with (T, H, W) per image.
+            token_indices: [num_images, K] sorted kept token indices per image.
+
+        Returns:
+            position_ids: [3, B, new_seq_len] with remapped mRoPE positions.
+            rope_deltas: [B, 1] position delta for decode phase.
+            keep_mask: [B, seq_len] bool mask (True = keep this position).
+        """
+        spatial_merge_size = self.vlm.config.vision_config.spatial_merge_size
+        image_token_id = self.vlm.config.image_token_id
+        vision_start_token_id = self.vlm.config.vision_start_token_id
+
+        total_input_ids = input_ids
+        batch_size, seq_len = total_input_ids.shape
+        keep_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=input_ids.device)
+        K = token_indices.shape[1]
+
+        mrope_position_deltas = []
+        all_new_position_ids = []
+        image_index = 0
+
+        for i in range(batch_size):
+            ids = total_input_ids[i]
+            input_tokens = ids.tolist()
+
+            # Count images
+            vision_start_indices = torch.argwhere(ids == vision_start_token_id).squeeze(1)
+            vision_tokens = ids[vision_start_indices + 1]
+            image_nums = (vision_tokens == image_token_id).sum().item()
+
+            llm_pos_ids_list: list = []
+            st = 0
+
+            for _ in range(image_nums):
+                ed = input_tokens.index(image_token_id, st)
+
+                t, h, w = (
+                    image_grid_thw[image_index][0],
+                    image_grid_thw[image_index][1],
+                    image_grid_thw[image_index][2],
+                )
+                llm_grid_h = h.item() // spatial_merge_size
+                llm_grid_w = w.item() // spatial_merge_size
+                original_num_tokens = t.item() * llm_grid_h * llm_grid_w
+
+                # --- Text segment before this image (includes <|vision_start|>) ---
+                text_len = ed - st
+                if text_len > 0:
+                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                    llm_pos_ids_list.append(
+                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                    )
+
+                # --- Pruned image tokens ---
+                kept = token_indices[image_index]  # [K], sorted indices within this image
+                h_orig = kept // llm_grid_w
+                w_orig = kept % llm_grid_w
+
+                # Remap each dimension to contiguous 0..N-1
+                h_unique = torch.unique(h_orig, sorted=True)
+                w_unique = torch.unique(w_orig, sorted=True)
+                h_new = torch.searchsorted(h_unique, h_orig)
+                w_new = torch.searchsorted(w_unique, w_orig)
+                t_new = torch.zeros_like(h_new)
+
+                st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                llm_pos_ids_list.append(
+                    torch.stack([t_new, h_new, w_new]) + text_len + st_idx
+                )
+
+                # --- Update keep_mask: keep first K of the image placeholders ---
+                keep_mask[i, ed + K : ed + original_num_tokens] = False
+
+                # Advance past all original image tokens in input_ids
+                st = ed + original_num_tokens
+                image_index += 1
+
+            # --- Trailing text segment ---
+            if st < len(input_tokens):
+                st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(
+                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                )
+
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            all_new_position_ids.append(llm_positions)
+
+            new_seq_len = keep_mask[i].sum().item()
+            mrope_position_deltas.append(llm_positions.max() + 1 - new_seq_len)
+
+        # Stack across batch
+        position_ids = torch.stack(all_new_position_ids, dim=1).to(input_ids.device)  # [3, B, new_seq_len]
+        rope_deltas = torch.tensor(
+            mrope_position_deltas, device=input_ids.device
+        ).unsqueeze(1)  # [B, 1]
+
+        return position_ids, rope_deltas, keep_mask
+
+    def _prune_embeddings(
+        self,
+        image_embeds: torch.Tensor,
+        deepstack_image_embeds: list[torch.Tensor],
+        image_grid_thw: torch.LongTensor,
+        token_indices: torch.LongTensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Prune image embeddings to keep only selected tokens per image.
+
+        Args:
+            image_embeds: [total_img_tokens, hidden_dim] all images concatenated.
+            deepstack_image_embeds: list of [total_img_tokens, hidden_dim] tensors.
+            image_grid_thw: [num_images, 3] with (T, H, W) per image.
+            token_indices: [num_images, K] sorted kept indices per image.
+
+        Returns:
+            Pruned image_embeds and deepstack_image_embeds with same structure.
+        """
+        spatial_merge_size = self.vlm.config.vision_config.spatial_merge_size
+        tokens_per_image = (
+            image_grid_thw[:, 0]
+            * (image_grid_thw[:, 1] // spatial_merge_size)
+            * (image_grid_thw[:, 2] // spatial_merge_size)
+        )  # [num_images]
+
+        # Split by image, select kept tokens, concatenate back
+        per_image = image_embeds.split(tokens_per_image.tolist(), dim=0)
+        pruned = torch.cat([emb[idx] for emb, idx in zip(per_image, token_indices)], dim=0)
+
+        pruned_deepstack = []
+        for ds_embeds in deepstack_image_embeds:
+            per_image_ds = ds_embeds.split(tokens_per_image.tolist(), dim=0)
+            pruned_deepstack.append(
+                torch.cat([emb[idx] for emb, idx in zip(per_image_ds, token_indices)], dim=0)
+            )
+
+        return pruned, pruned_deepstack
 
     @property
     def traj_start_token_id(self) -> int:
@@ -406,18 +572,35 @@ class AlpamayoR1(ReasoningVLA):
         max_new_tokens = kwargs.get("max_generation_length", self.config.tokens_per_future_traj)
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
 
-        # Initialize positions and embeddings
-        seq_len = input_ids.shape[1]
-        position_ids, rope_deltas = self.vlm.model.get_rope_index(input_ids, image_grid_thw)
+        # ===== Encode + Prune =====
+        image_embeds, deepstack_image_embeds, colsums = self._encode(pixel_values, image_grid_thw)
+        token_indices = self._prune_tokens(colsums, sparsity_ratio=0.5)
+        logger.info(f"token_indices: {token_indices.shape}")
+
+        # Prune image embeddings
+        image_embeds, deepstack_image_embeds = self._prune_embeddings(
+            image_embeds, deepstack_image_embeds, image_grid_thw, token_indices
+        )
+
+        # Reconstruct position IDs with contiguous h/w remapping
+        position_ids, rope_deltas, keep_mask = self._get_pruned_rope_index(
+            input_ids, image_grid_thw, token_indices
+        )
+        logger.info(f"position_ids: {position_ids.shape}")
+        logger.info(f"rope_deltas: {rope_deltas}")
+
+        # Prune input_ids using keep_mask and recompute embeddings
+        input_ids = input_ids[keep_mask].view(batch_size, -1)
         inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
+        seq_len = input_ids.shape[1]
+        logger.info(f"seq_len: {seq_len}")
 
-        # ===== Encode =====
-        image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)
-
+        # Scatter pruned image embeds into pruned inputs_embeds
         image_mask = (
             (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
         )
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        logger.info(f"inputs_embeds: {inputs_embeds.shape}")
 
         # Initialize KV cache (includes space for action tokens)
         if not hasattr(self, "_past_key_values"):
@@ -439,12 +622,11 @@ class AlpamayoR1(ReasoningVLA):
 
         # ===== Decode =====
         output_ids = input_ids.clone()
-        # if num_samples > 1:
-        #     self._past_key_values.expand_batch()
-        #     logits = logits.expand(num_samples, -1).contiguous()
-        #     output_ids = output_ids.expand(num_samples, -1).contiguous()
-        # unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
-        unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
+        if num_samples > 1:
+            self._past_key_values.expand_batch()
+            logits = logits.expand(num_samples, -1).contiguous()
+            output_ids = output_ids.expand(num_samples, -1).contiguous()
+        unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
         cur_pos = seq_len
 
         for _ in range(max_new_tokens):

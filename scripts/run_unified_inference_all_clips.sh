@@ -11,7 +11,7 @@ MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/Alpamayo-R1-10B}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results}"
 CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clip_ids.json}"
 
-NUM_STEPS="${NUM_STEPS:-15}"
+NUM_STEPS="${NUM_STEPS:-100}"
 WARMUP_STEPS="${WARMUP_STEPS:-3}"
 NUM_TRAJ_SAMPLES="${NUM_TRAJ_SAMPLES:-6}"
 SEED="${SEED:-42}"
@@ -32,6 +32,7 @@ if [[ ! -f "$CLIP_IDS_FILE" ]]; then
   exit 1
 fi
 
+OUTPUT_DIR="$OUTPUT_DIR/${NUM_TRAJ_SAMPLES}samples"
 mkdir -p "$OUTPUT_DIR"
 
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
@@ -93,7 +94,7 @@ for mode in $MODES; do
     fi
 
     if [[ "$SKIP_EXISTING" == "1" && -f "$result_file" ]]; then
-      echo "  [SKIP] $clip_id (found $(basename "$result_file"))"
+      echo "  [SKIP] $clip_id (found ${NUM_TRAJ_SAMPLES}samples/$(basename "$result_file"))"
       continue
     fi
 

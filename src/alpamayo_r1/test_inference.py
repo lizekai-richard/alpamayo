@@ -99,7 +99,7 @@ def run_inference(model, processor, sliding_window_inputs):
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=3,  # Feel free to raise this for more output trajectories and CoC traces.
+                num_traj_samples=6,  # Feel free to raise this for more output trajectories and CoC traces.
                 max_generation_length=256,
                 return_extra=True,
                 torch_compile="max-autotune",
@@ -109,6 +109,7 @@ def run_inference(model, processor, sliding_window_inputs):
     print(f"Warmup steps completed")
     
     time_list = []
+    min_ade_list = []
     for i in range(warmup_steps, len(sliding_window_inputs)):
         model_inputs = sliding_window_inputs[i]
         start_time = time.perf_counter()
@@ -117,7 +118,7 @@ def run_inference(model, processor, sliding_window_inputs):
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=3,  # Feel free to raise this for more output trajectories and CoC traces.
+                num_traj_samples=6,  # Feel free to raise this for more output trajectories and CoC traces.
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 return_extra=True,
@@ -132,15 +133,17 @@ def run_inference(model, processor, sliding_window_inputs):
         diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
         min_ade = diff.min()
         min_ade_idx = diff.argmin()
+        min_ade_list.append(min_ade)
         print(f"MinADE: {min_ade}")
         print("Chain-of-Causation:\n", extra["cot"][0][0][min_ade_idx])
     
     print("Average time per step: ", np.mean(time_list))
+    print("Average MinADE: ", np.mean(min_ade_list))
 
 
 def test_inference():
     # Example clip ID
-    clip_id = "2d50798c-a96e-4164-b791-bbad2a59c2de"
+    clip_id = "b80a15fc-d540-4c8f-81d1-5db83216b2e0"
     print(f"Loading dataset for clip_id: {clip_id}...")
 
     model = AlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
