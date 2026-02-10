@@ -52,7 +52,6 @@ if not logging.getLogger().handlers:
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-logger.setLevel(logging.INFO)
 
 
 class ExpertLogitsProcessor(LogitsProcessor):

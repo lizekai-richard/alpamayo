@@ -43,6 +43,11 @@ from alpamayo_r1.models.token_utils import (
 )
 
 logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 
 
 class ExpertLogitsProcessor(LogitsProcessor):
@@ -138,7 +143,11 @@ class AlpamayoR1(ReasoningVLA):
 
             def encode_fn():
                 pixels = self._encode_pixel_values.type(self.vlm.model.visual.dtype)
-                return self.vlm.model.visual(pixels, grid_thw=self._encode_image_grid_thw)
+                return self.vlm.model.visual(
+                    pixels, 
+                    grid_thw=self._encode_image_grid_thw,
+                    target_layers=[25, 26],
+                )
 
             self._encode_fn = encode_fn
 
@@ -326,6 +335,17 @@ class AlpamayoR1(ReasoningVLA):
             torch.compiler.cudagraph_mark_step_begin()
         return self._compiled_action_fn()
     
+    def _merge_colsum(self, colsums, image_grid_thw):
+        # colsums is a list of tensors, each tensor is of shape [B, H, L].
+        colsums = torch.stack(colsums, dim=0)  # [num_layers, B, H, L]
+        colsums = colsums.mean(dim=(0, 2))  # [B, L]
+        B, H, W = colsums.shape[0], image_grid_thw[0, 1], image_grid_thw[0, 2]
+
+        ratio = self.vlm.config.vision_config.spatial_merge_size
+        colsums = colsums.view(B, H // ratio, ratio, W // ratio, ratio)
+        colsums = colsums.sum(dim=(2, 4)).reshape(B, -1)
+        return colsums
+    
     def _prune_tokens(self, colsums: torch.Tensor, sparsity_ratio: float) -> torch.Tensor:
         """Select top-k tokens per image based on colsum importance scores.
 
@@ -405,7 +425,7 @@ class AlpamayoR1(ReasoningVLA):
                 if text_len > 0:
                     st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
                     llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                        torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx
                     )
 
                 # --- Pruned image tokens ---
@@ -437,7 +457,7 @@ class AlpamayoR1(ReasoningVLA):
                 st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
                 text_len = len(input_tokens) - st
                 llm_pos_ids_list.append(
-                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                    torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx
                 )
 
             llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
@@ -574,6 +594,7 @@ class AlpamayoR1(ReasoningVLA):
 
         # ===== Encode + Prune =====
         image_embeds, deepstack_image_embeds, colsums = self._encode(pixel_values, image_grid_thw)
+        colsums = self._merge_colsum(colsums, image_grid_thw)
         token_indices = self._prune_tokens(colsums, sparsity_ratio=0.5)
         logger.info(f"token_indices: {token_indices.shape}")
 

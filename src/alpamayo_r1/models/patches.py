@@ -355,18 +355,6 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
         cu_seqlens = cu_seqlens.cumsum(dim=0, dtype=torch.int32)
         self._cached_cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-    def _merge_colsum(self, colsums, image_grid_thw):
-        # colsums is a list of tensors, each tensor is of shape [B, H, L].
-        colsums = torch.stack(colsums, dim=0)  # [num_layers, B, H, L]
-        colsums = colsums.mean(dim=(0, 2))  # [B, L]
-        B, H, W = colsums.shape[0], image_grid_thw[0, 2], image_grid_thw[0, 3]
-        colsums = colsums.reshape(B, H, W)
-
-        ratio = self.spatial_merge_size
-        colsums = colsums.view(B, H // ratio,  W // ratio, ratio**2)
-        colsums = colsums.sum(dim=-1).reshape(B, -1)
-        return colsums
-
     def forward(self, hidden_states, grid_thw, target_layers=None,**kwargs):
         hidden_states = self.patch_embed(hidden_states)
 
@@ -390,7 +378,7 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
                 merger_idx = self.deepstack_visual_indexes.index(layer_idx)
                 deepstack_features.append(self.deepstack_merger_list[merger_idx](hidden_states))
 
-        return self.merger(hidden_states), deepstack_features, self._merge_colsum(colsums, grid_thw)
+        return self.merger(hidden_states), deepstack_features, colsums
 
 
 def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):

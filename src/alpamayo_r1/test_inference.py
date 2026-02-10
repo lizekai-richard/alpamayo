@@ -99,7 +99,7 @@ def run_inference(model, processor, sliding_window_inputs):
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=6,  # Feel free to raise this for more output trajectories and CoC traces.
+                num_traj_samples=1,  # Feel free to raise this for more output trajectories and CoC traces.
                 max_generation_length=256,
                 return_extra=True,
                 torch_compile="max-autotune",
@@ -118,7 +118,7 @@ def run_inference(model, processor, sliding_window_inputs):
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=6,  # Feel free to raise this for more output trajectories and CoC traces.
+                num_traj_samples=1,  # Feel free to raise this for more output trajectories and CoC traces.
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 return_extra=True,
