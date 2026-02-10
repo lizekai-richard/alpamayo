@@ -335,6 +335,8 @@ class AlpamayoR1(ReasoningVLA):
             torch.compiler.cudagraph_mark_step_begin()
         return self._compiled_action_fn()
     
+    # ==================== Token Pruning ====================
+    
     def _merge_colsum(self, colsums, image_grid_thw):
         # colsums is a list of tensors, each tensor is of shape [B, H, L].
         colsums = torch.stack(colsums, dim=0)  # [num_layers, B, H, L]

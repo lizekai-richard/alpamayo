@@ -355,7 +355,7 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
         cu_seqlens = cu_seqlens.cumsum(dim=0, dtype=torch.int32)
         self._cached_cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-    def forward(self, hidden_states, grid_thw, target_layers=None,**kwargs):
+    def forward(self, hidden_states, grid_thw, **kwargs):
         hidden_states = self.patch_embed(hidden_states)
 
         if not hasattr(self, "_cached_pos_embeds"):
@@ -370,7 +370,7 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
                 hidden_states,
                 cu_seqlens=self._cached_cu_seqlens,
                 position_embeddings=self._cached_position_embeddings,
-                return_colsum=target_layers is not None and layer_idx in target_layers,
+                return_colsum=layer_idx == len(self.blocks) - 1,
             )
             if colsum is not None:
                 colsums.append(colsum)

@@ -29,7 +29,7 @@ from alpamayo_r1 import helper
 torch.set_float32_matmul_precision("high")
 
 # Example clip ID
-clip_id = "ee76a44e-0087-4afd-be52-401eab2205ae"
+clip_id = "b80a15fc-d540-4c8f-81d1-5db83216b2e0"
 
 def load_model():
     model = StreamingAlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
@@ -267,7 +267,7 @@ def test_streaming_inference_compiled(model, processor):
     print("Warming up model...")
     streaming_inputs = create_sliding_window_inputs(
         processor=processor,
-        num_windows=105,
+        num_windows=50,
         clip_id=clip_id,
         t0_us=2_000_000,
     )
@@ -280,7 +280,7 @@ def test_streaming_inference_compiled(model, processor):
                 data=helper.to_device(streaming_input, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=1,
+                num_traj_samples=6,
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 fuse_qkv=True,
@@ -290,7 +290,7 @@ def test_streaming_inference_compiled(model, processor):
     print("Running streaming inference...")
     total_time = 0
     total_minade = 0
-    for i in range(3, 103):
+    for i in range(3, len(streaming_inputs)):
         streaming_input = streaming_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
             start_time = time.perf_counter()
@@ -298,7 +298,7 @@ def test_streaming_inference_compiled(model, processor):
                 data=helper.to_device(streaming_input, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=1,
+                num_traj_samples=6,
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 return_extra=True,
@@ -313,8 +313,8 @@ def test_streaming_inference_compiled(model, processor):
             total_time += end_time - start_time
             total_minade += min_ade
     print(f"Total time taken: {total_time} seconds")
-    print(f"Average time per step: {total_time / 100} seconds")
-    print(f"Average MinADE: {total_minade / 100}")
+    print(f"Average time per step: {total_time / (len(streaming_inputs) - 3)} seconds")
+    print(f"Average MinADE: {total_minade / (len(streaming_inputs) - 3)}")
 
 
 if __name__ == "__main__":
