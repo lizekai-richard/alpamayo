@@ -522,6 +522,34 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         return -1
 
+    def _find_first_period_positions(
+        self,
+        output_ids: torch.Tensor,
+        start_pos: torch.Tensor,
+        end_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        """Find first token containing '.' between start_pos and end_pos (inclusive)."""
+        output_ids_cpu = output_ids.tolist()
+        start_pos_cpu = start_pos.tolist()
+        end_pos_cpu = end_pos.tolist()
+        first_period_positions = []
+        for seq_ids, seq_start, seq_end in zip(output_ids_cpu, start_pos_cpu, end_pos_cpu):
+            if seq_end < seq_start:
+                first_period_positions.append(seq_end)
+                continue
+            tokens = self.tokenizer.convert_ids_to_tokens(seq_ids[seq_start : seq_end + 1])
+            found = None
+            for idx, token in enumerate(tokens):
+                if "." in token:
+                    found = seq_start + idx
+                    break
+            if found is None:
+                found = seq_end
+            first_period_positions.append(found)
+        return torch.tensor(
+            first_period_positions, device=output_ids.device, dtype=end_pos.dtype
+        )
+
     # ==================== Main Inference ====================
 
     # We don't need any output from the first prefill. Only need to cache key/values, position_ids, and attention_mask.
@@ -745,6 +773,14 @@ class StreamingAlpamayoR1(ReasoningVLA):
         if truncation_pos != -1:
             traj_start_pos = torch.min(traj_start_pos, truncation_pos)
             logger.info(f"traj_start_pos: {traj_start_pos.item()}, truncation_pos: {truncation_pos.item()}")
+        streaming_input_len = seq_len
+        # Clamp prompt conditioning to the first sentence in decoded text.
+        first_period_pos = self._find_first_period_positions(
+            output_ids=output_ids,
+            start_pos=torch.full_like(traj_start_pos, streaming_input_len),
+            end_pos=traj_start_pos,
+        )
+        traj_start_pos = first_period_pos
 
         # ===== Action (Diffusion) =====
         # Note: Action only attends to prompt tokens, NOT reasoning tokens (they are masked out).
@@ -753,7 +789,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
         # MODIFIED: Calculate offset for action tokens. In streaming setting, the offset is wrong without the modification due to truncated input length.
         # But the length of kv cache is always the same.
         if not self.is_first_prefill:
-            streaming_input_len = seq_len
             action_start_pos = self.prefill_seq_length + (traj_start_pos - streaming_input_len) + 1
         else:
             action_start_pos = traj_start_pos + 1
