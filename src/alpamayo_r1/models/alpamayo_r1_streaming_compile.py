@@ -554,11 +554,12 @@ class StreamingAlpamayoR1(ReasoningVLA):
         # colsums is a list of tensors, each tensor is of shape [B, H, L].
         colsums = torch.stack(colsums, dim=0)  # [num_layers, B, H, L]
         colsums = colsums.mean(dim=(0, 2))  # [B, L]
-        B, H, W = colsums.shape[0], image_grid_thw[0, 1], image_grid_thw[0, 2]
 
         ratio = self.vlm.config.vision_config.spatial_merge_size
-        colsums = colsums.view(B, H // ratio, ratio, W // ratio, ratio)
-        colsums = colsums.sum(dim=(2, 4)).reshape(B, -1)
+        # PatchMerger groups every consecutive m² tokens via x.view(-1, hidden_size * m²),
+        # so we must sum every consecutive m² colsums to match.
+        colsums = colsums.view(colsums.shape[0], -1, ratio * ratio)
+        colsums = colsums.sum(dim=2)
         return colsums
     
     def _prune_tokens(self, colsums: torch.Tensor, sparsity_ratio: float) -> torch.Tensor:
@@ -657,7 +658,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
                 st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
                 llm_pos_ids_list.append(
-                    torch.stack([t_new, h_new, w_new]) + text_len + st_idx
+                    torch.stack([t_new, h_new, w_new]) + st_idx
                 )
 
                 # --- Update keep_mask: keep first K of the image placeholders ---
