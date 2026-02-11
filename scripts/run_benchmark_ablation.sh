@@ -1,112 +1,73 @@
 #!/bin/bash
-# Ablation study benchmark script for Alpamayo-R1
-# This script runs all combinations of streaming/non-streaming and fusion options
+# Benchmark script for Alpamayo-R1
+# Runs 5 settings: original, sysopt, sysopt+pruning, streaming, streaming+pruning
 
 set -e
 
 # Configuration
 MODEL_PATH="${MODEL_PATH:-./Alpamayo-R1-10B}"
 OUTPUT_DIR="${OUTPUT_DIR:-./benchmark_results}"
-NUM_STEPS="${NUM_STEPS:-15}"
+NUM_STEPS="${NUM_STEPS:-50}"
 WARMUP_STEPS="${WARMUP_STEPS:-3}"
+NUM_SAMPLES="${NUM_SAMPLES:-1}"
+SPARSITY_RATIO="${SPARSITY_RATIO:-0.5}"
 CLIP_ID="${CLIP_ID:-030c760c-ae38-49aa-9ad8-f5650a545d26}"
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
 echo "=============================================="
-echo "Alpamayo-R1 Benchmark Ablation Study"
+echo "Alpamayo-R1 Benchmark"
 echo "=============================================="
 echo "Model path: $MODEL_PATH"
 echo "Output dir: $OUTPUT_DIR"
 echo "Num steps: $NUM_STEPS"
 echo "Warmup steps: $WARMUP_STEPS"
+echo "Num samples: $NUM_SAMPLES"
+echo "Sparsity ratio: $SPARSITY_RATIO"
 echo "=============================================="
 echo ""
 
-# Common args
-COMMON_ARGS="--model_path $MODEL_PATH --output_dir $OUTPUT_DIR --num_steps $NUM_STEPS --warmup_steps $WARMUP_STEPS --clip_id $CLIP_ID"
-
-# Function to check if benchmark result already exists
-check_exists() {
-    local pattern="$1"
-    if ls "$OUTPUT_DIR"/$pattern 1> /dev/null 2>&1; then
-        return 0  # exists
-    else
-        return 1  # not exists
-    fi
-}
+COMMON_ARGS="--model_path $MODEL_PATH --output_dir $OUTPUT_DIR --num_steps $NUM_STEPS --warmup_steps $WARMUP_STEPS --num_samples $NUM_SAMPLES --clip_id $CLIP_ID"
 
 # =============================================================================
-# Streaming mode ablations (supports fuse options)
+# 1. Original model (HF generate, no compile)
 # =============================================================================
 
-echo ">>> [1/7] Streaming mode - baseline (no fusion)"
-if check_exists "benchmark_streaming_max-autotune_2*.json"; then
-    echo "    [SKIP] Result already exists"
-else
-    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS
-fi
-
-echo ""
-echo ">>> [2/7] Streaming mode - fuse_qkv only"
-if check_exists "benchmark_streaming_max-autotune_fuse_qkv_2*.json"; then
-    echo "    [SKIP] Result already exists"
-else
-    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --fuse_qkv
-fi
-
-echo ""
-echo ">>> [3/7] Streaming mode - fuse_gate_up only"
-if check_exists "benchmark_streaming_max-autotune_fuse_gate_up_2*.json"; then
-    echo "    [SKIP] Result already exists"
-else
-    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --fuse_gate_up
-fi
-
-echo ""
-echo ">>> [4/7] Streaming mode - fuse_qkv + fuse_gate_up"
-if check_exists "benchmark_streaming_max-autotune_fuse_qkv_fuse_gate_up_2*.json"; then
-    echo "    [SKIP] Result already exists"
-else
-    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --fuse_qkv --fuse_gate_up
-fi
+echo ">>> [1/5] alpamayo (original)"
+python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --setting alpamayo
 
 # =============================================================================
-# Non-streaming mode (fuse options not supported)
+# 2. Non-streaming + torch.compile + QKV/MLP fusion
 # =============================================================================
 
 echo ""
-echo ">>> [5/7] Non-streaming mode - baseline"
-if check_exists "benchmark_non_streaming_max-autotune_2*.json"; then
-    echo "    [SKIP] Result already exists"
-else
-    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --non_streaming
-fi
+echo ">>> [2/5] alpamayo_sysopt (non-streaming + compile + fusion)"
+python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --setting alpamayo_sysopt
 
 # =============================================================================
-# Original model (no streaming, no compile)
+# 3. Non-streaming + torch.compile + QKV/MLP fusion + token pruning
 # =============================================================================
 
 echo ""
-echo ">>> [6/7] Original model (no streaming, no compile)"
-if check_exists "benchmark_original_2*.json"; then
-    echo "    [SKIP] Result already exists"
-else
-    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --original
-fi
+echo ">>> [3/5] alpamayo_sysopt_pruning (non-streaming + compile + fusion + pruning)"
+python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --setting alpamayo_sysopt_pruning --sparsity_ratio $SPARSITY_RATIO
 
 # =============================================================================
-# Comparison: compiled vs non-compiled (streaming + full fusion)
+# 4. Streaming + torch.compile + QKV/MLP fusion
 # =============================================================================
 
 echo ""
-echo ">>> [7/7] Comparison: compiled vs non-compiled (streaming + full fusion)"
-if check_exists "comparison_2*.png"; then
-    echo "    [SKIP] Result already exists"
-else
-    python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --compare --fuse_qkv --fuse_gate_up
-fi
+echo ">>> [4/5] alpamayo_sysopt_streaming (streaming + compile + fusion)"
+python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --setting alpamayo_sysopt_streaming
+
+# =============================================================================
+# 5. Streaming + torch.compile + QKV/MLP fusion + token pruning
+# =============================================================================
+
+echo ""
+echo ">>> [5/5] alpamayo_sysopt_streaming_pruning (streaming + compile + fusion + pruning)"
+python -m alpamayo_r1.benchmark_compile $COMMON_ARGS --setting alpamayo_sysopt_streaming_pruning --sparsity_ratio $SPARSITY_RATIO
 
 echo ""
 echo "=============================================="
