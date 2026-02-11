@@ -540,6 +540,7 @@ class AlpamayoR1(ReasoningVLA):
         torch_compile: str = "max-autotune",
         fuse_qkv: bool = False,
         fuse_gate_up: bool = False,
+        sparsity_ratio: float = 0.0,
         *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -557,6 +558,7 @@ class AlpamayoR1(ReasoningVLA):
                 "max-autotune" is recommended.
             fuse_qkv: Whether to fuse the QKV linear layers.
             fuse_gate_up: Whether to fuse the gate and up linear layers.
+            sparsity_ratio: Fraction of image tokens to prune (0 = no pruning).
             *args: Variable length argument list.
             **kwargs: Arbitrary keyword arguments.
 
@@ -594,36 +596,40 @@ class AlpamayoR1(ReasoningVLA):
         max_new_tokens = kwargs.get("max_generation_length", self.config.tokens_per_future_traj)
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
 
-        # ===== Encode + Prune =====
+        # ===== Encode =====
         image_embeds, deepstack_image_embeds, colsums = self._encode(pixel_values, image_grid_thw)
-        colsums = self._merge_colsum(colsums, image_grid_thw)
-        token_indices = self._prune_tokens(colsums, sparsity_ratio=0.5)
-        logger.info(f"token_indices: {token_indices.shape}")
 
-        # Prune image embeddings
-        image_embeds, deepstack_image_embeds = self._prune_embeddings(
-            image_embeds, deepstack_image_embeds, image_grid_thw, token_indices
-        )
+        if sparsity_ratio > 0:
+            # ===== Prune =====
+            colsums = self._merge_colsum(colsums, image_grid_thw)
+            token_indices = self._prune_tokens(colsums, sparsity_ratio=sparsity_ratio)
 
-        # Reconstruct position IDs with contiguous h/w remapping
-        position_ids, rope_deltas, keep_mask = self._get_pruned_rope_index(
-            input_ids, image_grid_thw, token_indices
-        )
-        logger.info(f"position_ids: {position_ids.shape}")
-        logger.info(f"rope_deltas: {rope_deltas}")
+            # Prune image embeddings
+            image_embeds, deepstack_image_embeds = self._prune_embeddings(
+                image_embeds, deepstack_image_embeds, image_grid_thw, token_indices
+            )
 
-        # Prune input_ids using keep_mask and recompute embeddings
-        input_ids = input_ids[keep_mask].view(batch_size, -1)
+            # Reconstruct position IDs with contiguous h/w remapping
+            position_ids, rope_deltas, keep_mask = self._get_pruned_rope_index(
+                input_ids, image_grid_thw, token_indices
+            )
+
+            # Prune input_ids using keep_mask and recompute embeddings
+            input_ids = input_ids[keep_mask].view(batch_size, -1)
+        else:
+            # No pruning: use standard rope index
+            position_ids, rope_deltas = self.vlm.model.get_rope_index(
+                input_ids, image_grid_thw, None, None,
+            )
+
         inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
         seq_len = input_ids.shape[1]
-        logger.info(f"seq_len: {seq_len}")
 
-        # Scatter pruned image embeds into pruned inputs_embeds
+        # Scatter image embeds into inputs_embeds
         image_mask = (
             (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
         )
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-        logger.info(f"inputs_embeds: {inputs_embeds.shape}")
 
         # Initialize KV cache (includes space for action tokens)
         if not hasattr(self, "_past_key_values"):

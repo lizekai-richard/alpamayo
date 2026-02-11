@@ -20,11 +20,15 @@ Settings:
   - alpamayo: Original model (HF generate, no compile)
   - alpamayo_sysopt: Non-streaming + torch.compile + QKV/MLP fusion
   - alpamayo_sysopt_streaming: Streaming + torch.compile + QKV/MLP fusion
+  - alpamayo_sysopt_pruning: Non-streaming + torch.compile + QKV/MLP fusion + token pruning
+  - alpamayo_sysopt_streaming_pruning: Streaming + torch.compile + QKV/MLP fusion + token pruning
 
 Usage:
   python -m alpamayo_r1.benchmark_compile --setting alpamayo --num_samples 1
   python -m alpamayo_r1.benchmark_compile --setting alpamayo_sysopt --num_samples 3
   python -m alpamayo_r1.benchmark_compile --setting alpamayo_sysopt_streaming --num_samples 1
+  python -m alpamayo_r1.benchmark_compile --setting alpamayo_sysopt_pruning --sparsity_ratio 0.5
+  python -m alpamayo_r1.benchmark_compile --setting alpamayo_sysopt_streaming_pruning --sparsity_ratio 0.5
 """
 
 import argparse
@@ -244,13 +248,14 @@ class InstrumentedAlpamayo:
 class InstrumentedAlpamayoSysopt:
     """Non-streaming compile model instrumented via monkey-patching _encode/_prefill/_decode/_action."""
 
-    def __init__(self, model_path, dtype=torch.bfloat16):
+    def __init__(self, model_path, sparsity_ratio=0.0, dtype=torch.bfloat16):
         from alpamayo_r1.models.alpamayo_r1_compile import AlpamayoR1
         logger.info("Loading AlpamayoR1 (compile) model...")
         self.model = AlpamayoR1.from_pretrained(model_path, dtype=dtype).to("cuda")
         self.processor = helper.get_processor(self.model.tokenizer)
+        self.sparsity_ratio = sparsity_ratio
         self._instrument()
-        logger.info("Compile model loaded and instrumented.")
+        logger.info(f"Compile model loaded and instrumented (sparsity_ratio={sparsity_ratio}).")
 
     def _instrument(self):
         self._timing = {
@@ -319,6 +324,7 @@ class InstrumentedAlpamayoSysopt:
                     torch_compile="max-autotune",
                     fuse_qkv=True,
                     fuse_gate_up=True,
+                    sparsity_ratio=self.sparsity_ratio,
                 )
 
         return StepResult(
@@ -339,13 +345,14 @@ class InstrumentedAlpamayoSysopt:
 class InstrumentedAlpamayoSysoptStreaming:
     """Streaming compile model instrumented via monkey-patching _encode/_prefill/_decode/_action."""
 
-    def __init__(self, model_path, dtype=torch.bfloat16):
+    def __init__(self, model_path, sparsity_ratio=0.0, dtype=torch.bfloat16):
         from alpamayo_r1.models.alpamayo_r1_streaming_compile import StreamingAlpamayoR1
         logger.info("Loading StreamingAlpamayoR1 model...")
         self.model = StreamingAlpamayoR1.from_pretrained(model_path, dtype=dtype).to("cuda")
         self.processor = helper.get_processor(self.model.tokenizer)
+        self.sparsity_ratio = sparsity_ratio
         self._instrument()
-        logger.info("Streaming model loaded and instrumented.")
+        logger.info(f"Streaming model loaded and instrumented (sparsity_ratio={sparsity_ratio}).")
 
     def _instrument(self):
         self._timing = {
@@ -415,6 +422,7 @@ class InstrumentedAlpamayoSysoptStreaming:
                     torch_compile="max-autotune",
                     fuse_qkv=True,
                     fuse_gate_up=True,
+                    sparsity_ratio=self.sparsity_ratio,
                 )
 
         # First prefill returns None (no phase breakdown)
@@ -443,15 +451,17 @@ def run_benchmark(args):
     # Load model
     if setting == "alpamayo":
         wrapper = InstrumentedAlpamayo(args.model_path)
-    elif setting == "alpamayo_sysopt":
-        wrapper = InstrumentedAlpamayoSysopt(args.model_path)
-    elif setting == "alpamayo_sysopt_streaming":
-        wrapper = InstrumentedAlpamayoSysoptStreaming(args.model_path)
+    elif setting in ("alpamayo_sysopt", "alpamayo_sysopt_pruning"):
+        sparsity = args.sparsity_ratio if setting == "alpamayo_sysopt_pruning" else 0.0
+        wrapper = InstrumentedAlpamayoSysopt(args.model_path, sparsity_ratio=sparsity)
+    elif setting in ("alpamayo_sysopt_streaming", "alpamayo_sysopt_streaming_pruning"):
+        sparsity = args.sparsity_ratio if setting == "alpamayo_sysopt_streaming_pruning" else 0.0
+        wrapper = InstrumentedAlpamayoSysoptStreaming(args.model_path, sparsity_ratio=sparsity)
     else:
         raise ValueError(f"Unknown setting: {setting}")
 
     processor = wrapper.processor
-    is_streaming = (setting == "alpamayo_sysopt_streaming")
+    is_streaming = setting in ("alpamayo_sysopt_streaming", "alpamayo_sysopt_streaming_pruning")
 
     # Create inputs
     if is_streaming:
@@ -465,8 +475,9 @@ def run_benchmark(args):
             processor, total_windows, args.clip_id, args.t0_us, args.time_step_us,
         )
 
+    sparsity_ratio = getattr(wrapper, "sparsity_ratio", 0.0)
     logger.info(f"{'='*70}")
-    logger.info(f"BENCHMARK: {setting} | num_traj_samples={num_samples}")
+    logger.info(f"BENCHMARK: {setting} | num_traj_samples={num_samples} | sparsity_ratio={sparsity_ratio}")
     logger.info(f"{'='*70}")
     logger.info(f"Warmup: {args.warmup_steps} | Steps: {args.num_steps}")
 
@@ -524,7 +535,7 @@ def run_benchmark(args):
 
     # Summary
     logger.info(f"\n{'='*70}")
-    logger.info(f"SUMMARY: {setting} | num_traj_samples={num_samples}")
+    logger.info(f"SUMMARY: {setting} | num_traj_samples={num_samples} | sparsity_ratio={sparsity_ratio}")
     logger.info(f"{'='*70}")
     logger.info(f"Encode  (s):     {np.mean(encode_vals):.4f} +/- {np.std(encode_vals):.4f}")
     logger.info(f"Prefill (s):     {np.mean(prefill_vals):.4f} +/- {np.std(prefill_vals):.4f}")
@@ -540,6 +551,7 @@ def run_benchmark(args):
     output = {
         "setting": setting,
         "num_traj_samples": num_samples,
+        "sparsity_ratio": sparsity_ratio,
         "torch_compile": "max-autotune" if setting != "alpamayo" else None,
         "fuse_qkv": setting != "alpamayo",
         "fuse_gate_up": setting != "alpamayo",
@@ -566,7 +578,10 @@ def run_benchmark(args):
     if first_prefill_s is not None:
         output["first_prefill_s"] = first_prefill_s
 
-    filename = f"{setting}_n{num_samples}.json"
+    if sparsity_ratio > 0:
+        filename = f"{setting}_n{num_samples}_s{sparsity_ratio}.json"
+    else:
+        filename = f"{setting}_n{num_samples}.json"
     filepath = os.path.join(args.output_dir, filename)
     with open(filepath, "w") as f:
         json.dump(output, f, indent=2)
@@ -583,10 +598,15 @@ def main():
     )
     parser.add_argument(
         "--setting", type=str, required=True,
-        choices=["alpamayo", "alpamayo_sysopt", "alpamayo_sysopt_streaming"],
+        choices=[
+            "alpamayo", "alpamayo_sysopt", "alpamayo_sysopt_streaming",
+            "alpamayo_sysopt_pruning", "alpamayo_sysopt_streaming_pruning",
+        ],
     )
     parser.add_argument("--num_samples", type=int, default=1,
                         help="num_traj_samples")
+    parser.add_argument("--sparsity_ratio", type=float, default=0.5,
+                        help="Fraction of image tokens to prune (only for *_pruning settings)")
     parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
     parser.add_argument("--clip_id", type=str,
                         default="2d50798c-a96e-4164-b791-bbad2a59c2de")

@@ -792,6 +792,10 @@ class StreamingAlpamayoR1(ReasoningVLA):
                 input_ids, image_grid_thw, token_indices
             )
             input_ids = input_ids[keep_mask].view(batch_size, -1)
+        else:
+            position_ids, rope_deltas = self.vlm.model.get_rope_index(
+                input_ids, image_grid_thw, None, None
+            )
 
         inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
         image_mask = (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
