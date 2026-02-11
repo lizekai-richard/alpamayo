@@ -933,7 +933,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         
         if self.is_first_prefill:
             logger.info("First prefill: caching KV and returning (no streaming logs yet).")
-            self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, batch_size, device)
+            self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, batch_size, sparsity_ratio, device)
             self._update_past_key_values()
             self.is_first_prefill = False
             return

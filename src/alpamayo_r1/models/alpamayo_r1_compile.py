@@ -143,11 +143,7 @@ class AlpamayoR1(ReasoningVLA):
 
             def encode_fn():
                 pixels = self._encode_pixel_values.type(self.vlm.model.visual.dtype)
-                return self.vlm.model.visual(
-                    pixels, 
-                    grid_thw=self._encode_image_grid_thw,
-                    target_layers=[25, 26],
-                )
+                return self.vlm.model.visual(pixels, grid_thw=self._encode_image_grid_thw)
 
             self._encode_fn = encode_fn
 

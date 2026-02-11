@@ -17,6 +17,7 @@
 # This script loads a dataset, runs inference, and computes the minADE.
 # It can be used to test the inference pipeline.
 
+import argparse
 import json
 import torch
 import time
@@ -267,9 +268,9 @@ def test_streaming_inference_compiled(model, processor):
     print("Warming up model...")
     streaming_inputs = create_sliding_window_inputs(
         processor=processor,
-        num_windows=50,
+        num_windows=103,
         clip_id=clip_id,
-        t0_us=2_000_000,
+        t0_us=1_700_000,
     )
     
     # warmup the model
@@ -285,6 +286,7 @@ def test_streaming_inference_compiled(model, processor):
                 torch_compile="max-autotune",
                 fuse_qkv=True,
                 fuse_gate_up=True,
+                sparsity_ratio=0.0
             )
 
     print("Running streaming inference...")
@@ -304,6 +306,7 @@ def test_streaming_inference_compiled(model, processor):
                 return_extra=True,
                 fuse_qkv=True,
                 fuse_gate_up=True,
+                sparsity_ratio=0.0,
             )
             end_time = time.perf_counter()
             print(f"Time taken: {end_time - start_time} seconds")
@@ -318,6 +321,16 @@ def test_streaming_inference_compiled(model, processor):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run streaming inference on a clip.")
+    parser.add_argument(
+        "--clip-id",
+        type=str,
+        default=clip_id,
+        help="Clip ID to run inference on (default: script default).",
+    )
+    args = parser.parse_args()
+    clip_id = args.clip_id
+
     model, processor = load_model()
     # test_streaming_inference(model, processor)
     test_streaming_inference_compiled(model, processor)

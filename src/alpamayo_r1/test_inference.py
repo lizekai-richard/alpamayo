@@ -17,6 +17,7 @@
 # This script loads a dataset, runs inference, and computes the minADE.
 # It can be used to test the inference pipeline.
 
+import argparse
 import torch
 import numpy as np
 import time
@@ -99,12 +100,13 @@ def run_inference(model, processor, sliding_window_inputs):
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=1,  # Feel free to raise this for more output trajectories and CoC traces.
+                num_traj_samples=6,  # Feel free to raise this for more output trajectories and CoC traces.
                 max_generation_length=256,
                 return_extra=True,
                 torch_compile="max-autotune",
                 fuse_qkv=True,
                 fuse_gate_up=True,
+                sparsity_ratio=0.0,
             )
     print(f"Warmup steps completed")
     
@@ -118,12 +120,13 @@ def run_inference(model, processor, sliding_window_inputs):
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=1,  # Feel free to raise this for more output trajectories and CoC traces.
+                num_traj_samples=6,  # Feel free to raise this for more output trajectories and CoC traces.
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 return_extra=True,
                 fuse_qkv=True,
                 fuse_gate_up=True,
+                sparsity_ratio=0.0,
             )
         end_time = time.perf_counter()
         print(f"Time taken: {end_time - start_time} seconds")
@@ -141,9 +144,7 @@ def run_inference(model, processor, sliding_window_inputs):
     print("Average MinADE: ", np.mean(min_ade_list))
 
 
-def test_inference():
-    # Example clip ID
-    clip_id = "b80a15fc-d540-4c8f-81d1-5db83216b2e0"
+def test_inference(clip_id: str):
     print(f"Loading dataset for clip_id: {clip_id}...")
 
     model = AlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
@@ -153,4 +154,12 @@ def test_inference():
 
 
 if __name__ == "__main__":
-    test_inference()
+    parser = argparse.ArgumentParser(description="Run compile-model inference on a clip.")
+    parser.add_argument(
+        "--clip-id",
+        type=str,
+        default="b80a15fc-d540-4c8f-81d1-5db83216b2e0",
+        help="Clip ID to run inference on.",
+    )
+    args = parser.parse_args()
+    test_inference(args.clip_id)

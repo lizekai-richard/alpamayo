@@ -350,6 +350,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_steps", type=int, default=15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_traj_samples", type=int, default=1)
+    parser.add_argument("--sparsity_ratio", type=float, default=0.0)
     parser.add_argument("--clip_id", type=str, default="53baf60a-902f-446d-8e30-5eb7dbc992e7")
     parser.add_argument("--t0_us", type=int, default=1_600_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
