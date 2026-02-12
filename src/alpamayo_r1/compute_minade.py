@@ -4,9 +4,10 @@
 """
 Compute average minADE across all clips in a results directory.
 
-Each JSON file represents one clip. The per-clip minADE is the mean of
-all step-level min_ade values in that file. The overall minADE is the
-mean across all per-clip minADE values.
+Each JSON file represents one clip. Supports files with prefix "streaming"
+or "compile" (e.g. streaming_*.json, compile_*.json). The per-clip minADE
+is the mean of all step-level min_ade values in that file. The overall
+minADE is the mean across all per-clip minADE values.
 
 Usage:
     python -m alpamayo_r1.compute_minade [results_dir]
@@ -21,14 +22,22 @@ import sys
 
 
 def compute_avg_minade(results_dir):
-    json_files = sorted(glob.glob(os.path.join(results_dir, "streaming_*.json")))
+    json_files = sorted(
+        glob.glob(os.path.join(results_dir, "streaming_*.json"))
+        + glob.glob(os.path.join(results_dir, "compile_*.json"))
+    )
     if not json_files:
-        print(f"No streaming_*.json files found in {results_dir}")
+        print(f"No streaming_*.json or compile_*.json files found in {results_dir}")
         return None, []
 
     per_clip = []
     for fpath in json_files:
-        clip_id = os.path.basename(fpath).replace("streaming_", "").replace(".json", "")
+        clip_id = (
+            os.path.basename(fpath)
+            .replace("streaming_", "")
+            .replace("compile_", "")
+            .replace(".json", "")
+        )
         with open(fpath) as f:
             data = json.load(f)
 

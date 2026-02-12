@@ -18,22 +18,47 @@
 # It can be used to test the inference pipeline.
 
 import argparse
-import torch
-import numpy as np
+import json
+import logging
+import os
 import time
+
+import numpy as np
+import torch
 
 from alpamayo_r1.models.alpamayo_r1_compile import AlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 torch.set_float32_matmul_precision("high")
+
+
+def load_model(args):
+    model = AlpamayoR1.from_pretrained(args.model_path, dtype=torch.bfloat16).to("cuda")
+    processor = helper.get_processor(model.tokenizer)
+    return model, processor
+
+
+def calc_minADE(gt_future_xyz, pred_xyz):
+    gt_xy = gt_future_xyz.cpu()[0, 0, :, :2].T.numpy()
+    pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
+    diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
+    min_ade = diff.min()
+    min_ade_idx = diff.argmin()
+    return min_ade, min_ade_idx
 
 def create_sliding_window_inputs(
     processor,
     num_windows: int,
     clip_id: str,
     t0_us: int = 2_000_000,
-    time_step_us: int = 100_000,  # 0.1s = 100_000 us
+    time_step_us: int = 100_000,
 ):
     """
     Create sliding window inputs for streaming inference.
@@ -90,28 +115,29 @@ def create_sliding_window_inputs(
 
 
 @torch.inference_mode()
-def run_inference(model, processor, sliding_window_inputs):
-
-    warmup_steps = 3
+def run_inference(args, model, processor, sliding_window_inputs):
+    warmup_steps = args.warmup_steps
+    logger.info("Warming up model...")
     for i in range(warmup_steps):
         model_inputs = sliding_window_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+            model.sample_trajectories_from_data_with_vlm_rollout(
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=6,  # Feel free to raise this for more output trajectories and CoC traces.
+                num_traj_samples=args.num_traj_samples,
                 max_generation_length=256,
                 return_extra=True,
                 torch_compile="max-autotune",
                 fuse_qkv=True,
                 fuse_gate_up=True,
-                sparsity_ratio=0.0,
+                sparsity_ratio=args.sparsity_ratio,
             )
-    print(f"Warmup steps completed")
-    
+    logger.info("Warmup completed")
+
     time_list = []
     min_ade_list = []
+    cot_list = []
     for i in range(warmup_steps, len(sliding_window_inputs)):
         model_inputs = sliding_window_inputs[i]
         start_time = time.perf_counter()
@@ -120,46 +146,70 @@ def run_inference(model, processor, sliding_window_inputs):
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=6,  # Feel free to raise this for more output trajectories and CoC traces.
+                num_traj_samples=args.num_traj_samples,
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 return_extra=True,
                 fuse_qkv=True,
                 fuse_gate_up=True,
-                sparsity_ratio=0.0,
+                sparsity_ratio=args.sparsity_ratio,
             )
         end_time = time.perf_counter()
-        print(f"Time taken: {end_time - start_time} seconds")
+        min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
+        cot = extra["cot"][0][0][min_ade_idx]
         time_list.append(end_time - start_time)
-        gt_xy = model_inputs["ego_future_xyz"].cpu()[0, 0, :, :2].T.numpy()
-        pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
-        diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
-        min_ade = diff.min()
-        min_ade_idx = diff.argmin()
-        min_ade_list.append(min_ade)
-        print(f"MinADE: {min_ade}")
-        print("Chain-of-Causation:\n", extra["cot"][0][0][min_ade_idx])
-    
-    print("Average time per step: ", np.mean(time_list))
-    print("Average MinADE: ", np.mean(min_ade_list))
+        min_ade_list.append(float(min_ade))
+        cot_list.append(cot)
+        logger.info("Step %s: latency=%.3fs, MinADE=%.4f", i, end_time - start_time, min_ade)
+        logger.info("Chain-of-Causation:\n%s", cot)
+
+    logger.info(
+        "Total time: %.2fs, avg latency: %.3fs, avg MinADE: %.4f",
+        sum(time_list),
+        sum(time_list) / len(time_list),
+        sum(min_ade_list) / len(min_ade_list),
+    )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    results = {}
+    for j in range(len(min_ade_list)):
+        results[j] = {
+            "latency": time_list[j],
+            "min_ade": min_ade_list[j],
+            "cot": cot_list[j],
+        }
+    out_path = os.path.join(args.output_dir, f"compile_{args.clip_id}.json")
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    logger.info("Results saved to %s", out_path)
 
 
-def test_inference(clip_id: str):
-    print(f"Loading dataset for clip_id: {clip_id}...")
-
-    model = AlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
-    processor = helper.get_processor(model.tokenizer)
-    sliding_window_inputs = create_sliding_window_inputs(processor, 15, clip_id)
-    run_inference(model, processor, sliding_window_inputs)
+def test_inference(args, model, processor):
+    logger.info("Creating sliding window inputs for clip_id: %s", args.clip_id)
+    sliding_window_inputs = create_sliding_window_inputs(
+        processor=processor,
+        num_windows=args.num_steps,
+        clip_id=args.clip_id,
+        t0_us=args.t0_us,
+        time_step_us=args.time_step_us,
+    )
+    logger.info("Created %s windows", len(sliding_window_inputs))
+    run_inference(args, model, processor, sliding_window_inputs)
+    logger.info("Completed compile inference")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run compile-model inference on a clip.")
-    parser.add_argument(
-        "--clip-id",
-        type=str,
-        default="b80a15fc-d540-4c8f-81d1-5db83216b2e0",
-        help="Clip ID to run inference on.",
-    )
+    parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
+    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="b80a15fc-d540-4c8f-81d1-5db83216b2e0")
+    parser.add_argument("--warmup_steps", type=int, default=3)
+    parser.add_argument("--num_steps", type=int, default=103)
+    parser.add_argument("--t0_us", type=int, default=2_000_000)
+    parser.add_argument("--time_step_us", type=int, default=100_000)
+    parser.add_argument("--output_dir", type=str, default="./test_results/sys_pruning_logs")
+    parser.add_argument("--num_traj_samples", type=int, default=6)
+    parser.add_argument("--sparsity_ratio", type=float, default=0.5)
     args = parser.parse_args()
-    test_inference(args.clip_id)
+
+    model, processor = load_model(args)
+    test_inference(args, model, processor)

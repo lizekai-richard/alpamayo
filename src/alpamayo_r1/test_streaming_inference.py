@@ -19,21 +19,26 @@
 
 import argparse
 import json
+import logging
+import os
 import torch
 import time
 import numpy as np
-from pathlib import Path
 from alpamayo_r1.models.alpamayo_r1_streaming_compile import StreamingAlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 torch.set_float32_matmul_precision("high")
 
-# Example clip ID
-clip_id = "b80a15fc-d540-4c8f-81d1-5db83216b2e0"
 
-def load_model():
-    model = StreamingAlpamayoR1.from_pretrained("./Alpamayo-R1-10B", dtype=torch.bfloat16).to("cuda")
+def load_model(args):
+    model = StreamingAlpamayoR1.from_pretrained(args.model_path, dtype=torch.bfloat16).to("cuda")
     processor = helper.get_processor(model.tokenizer)
     return model, processor
 
@@ -234,65 +239,62 @@ def run_streaming_inference(model, streaming_inputs):
                 return_extra=True,
             )
 
-        min_ade = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
-        print(f"\n=== Step {step_idx} ({'prefill' if is_prefill else 'streaming'}) ===")
-        print("Chain-of-Causation:\n", extra["cot"][0])
-        print(f"MinADE: {min_ade}")
+        min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
+        logger.info("=== Step %s (%s) ===", step_idx, "prefill" if is_prefill else "streaming")
+        logger.info("Chain-of-Causation:\n%s", extra["cot"][0][0][min_ade_idx] if pred_xyz.shape[2] > 1 else extra["cot"][0])
+        logger.info("MinADE: %s", min_ade)
 
 
-def test_streaming_inference(model, processor):
-    """Test streaming inference with sliding window."""
-    print(f"Creating sliding window inputs for clip_id: {clip_id}")
-
-    # Create 3 windows: 1 prefill + 2 streaming steps
+def test_streaming_inference(args, model, processor):
+    """Test streaming inference with sliding window (non-compiled, single clip)."""
+    logger.info("Creating sliding window inputs for clip_id: %s", args.clip_id)
     streaming_inputs = create_sliding_window_inputs(
         processor=processor,
-        num_windows=10,
-        clip_id=clip_id,
-        t0_us=2_000_000,
+        num_windows=args.num_steps,
+        clip_id=args.clip_id,
+        t0_us=args.t0_us,
+        time_step_us=args.time_step_us,
     )
-
-    print(f"Created {len(streaming_inputs)} windows:")
-    for i, inp in enumerate(streaming_inputs):
-        pixel_values = inp["tokenized_data"]["pixel_values"]
-        print(f"  Window {i}: pixel_values shape = {pixel_values.shape}, is_prefill = {inp.get('is_prefill', False)}")
-
+    logger.info("Created %s windows", len(streaming_inputs))
     run_streaming_inference(model, streaming_inputs)
-    print(f"\nCompleted streaming inference")
+    logger.info("Completed streaming inference")
 
 
 @torch.inference_mode()
-def test_streaming_inference_compiled(model, processor):
-    """Test streaming inference with compiled model."""
-    print("Loading model...")
-    print("Warming up model...")
+def test_streaming_inference_compiled(args, model, processor):
+    """Test streaming inference with compiled model and save results."""
+    reset_streaming_state(model)
+    warmup_steps = args.warmup_steps
     streaming_inputs = create_sliding_window_inputs(
         processor=processor,
-        num_windows=103,
-        clip_id=clip_id,
-        t0_us=1_700_000,
+        num_windows=args.num_steps,
+        clip_id=args.clip_id,
+        t0_us=args.t0_us,
+        time_step_us=args.time_step_us,
     )
-    
-    # warmup the model
-    for i in range(3):
+
+    logger.info("Warming up model...")
+    for i in range(warmup_steps):
         streaming_input = streaming_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
             model.sample_trajectories_from_data_with_streaming_vlm_rollout(
                 data=helper.to_device(streaming_input, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=6,
+                num_traj_samples=args.num_traj_samples,
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 fuse_qkv=True,
                 fuse_gate_up=True,
-                sparsity_ratio=0.5
+                sparsity_ratio=args.sparsity_ratio,
             )
+    logger.info("Warmup completed")
 
-    print("Running streaming inference...")
-    total_time = 0
-    total_minade = 0
-    for i in range(3, len(streaming_inputs)):
+    logger.info("Running streaming inference for %s windows...", len(streaming_inputs) - warmup_steps)
+    time_list = []
+    min_ade_list = []
+    cot_list = []
+    for i in range(warmup_steps, len(streaming_inputs)):
         streaming_input = streaming_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
             start_time = time.perf_counter()
@@ -300,37 +302,52 @@ def test_streaming_inference_compiled(model, processor):
                 data=helper.to_device(streaming_input, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=6,
+                num_traj_samples=args.num_traj_samples,
                 max_generation_length=256,
                 torch_compile="max-autotune",
                 return_extra=True,
                 fuse_qkv=True,
                 fuse_gate_up=True,
-                sparsity_ratio=0.5,
+                sparsity_ratio=args.sparsity_ratio,
             )
             end_time = time.perf_counter()
-            print(f"Time taken: {end_time - start_time} seconds")
-            min_ade, min_ade_idx = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
-            print(f"MinADE: {min_ade}")
-            print("Chain-of-Causation:\n", extra["cot"][0][0][min_ade_idx])
-            total_time += end_time - start_time
-            total_minade += min_ade
-    print(f"Total time taken: {total_time} seconds")
-    print(f"Average time per step: {total_time / (len(streaming_inputs) - 3)} seconds")
-    print(f"Average MinADE: {total_minade / (len(streaming_inputs) - 3)}")
+        min_ade, min_ade_idx = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
+        cot = extra["cot"][0][0][min_ade_idx]
+        time_list.append(end_time - start_time)
+        min_ade_list.append(float(min_ade))
+        cot_list.append(cot)
+        logger.info("Step %s: latency=%.3fs, MinADE=%.4f", i, end_time - start_time, min_ade)
+        logger.info("Chain-of-Causation:\n%s", cot)
+
+    logger.info("Total time: %.2fs, avg latency: %.3fs, avg MinADE: %.4f",
+                sum(time_list), sum(time_list) / len(time_list), sum(min_ade_list) / len(min_ade_list))
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    results = {}
+    for j in range(len(min_ade_list)):
+        results[j] = {
+            "latency": time_list[j],
+            "min_ade": min_ade_list[j],
+            "cot": cot_list[j],
+        }
+    out_path = os.path.join(args.output_dir, f"streaming_{args.clip_id}.json")
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    logger.info("Results saved to %s", out_path)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run streaming inference on a clip.")
-    parser.add_argument(
-        "--clip-id",
-        type=str,
-        default=clip_id,
-        help="Clip ID to run inference on (default: script default).",
-    )
+    parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
+    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="b80a15fc-d540-4c8f-81d1-5db83216b2e0")
+    parser.add_argument("--warmup_steps", type=int, default=3)
+    parser.add_argument("--num_steps", type=int, default=103)
+    parser.add_argument("--t0_us", type=int, default=1_700_000)
+    parser.add_argument("--time_step_us", type=int, default=100_000)
+    parser.add_argument("--output_dir", type=str, default="./test_results/sys_streaming_pruning_logs")
+    parser.add_argument("--num_traj_samples", type=int, default=6)
+    parser.add_argument("--sparsity_ratio", type=float, default=0.5)
     args = parser.parse_args()
-    clip_id = args.clip_id
 
-    model, processor = load_model()
-    # test_streaming_inference(model, processor)
-    test_streaming_inference_compiled(model, processor)
+    model, processor = load_model(args)
+    test_streaming_inference_compiled(args, model, processor)

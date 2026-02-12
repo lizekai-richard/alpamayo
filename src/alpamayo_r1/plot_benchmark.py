@@ -16,7 +16,7 @@ def plot_comparison():
     # Latency values in ms: [Encode, Prefill, Decode, Action, Total]
     phases = ["Encode", "Prefill", "Decode", "Action", "Total"]
     original_vals = [90.1, 165.6, 290.8, 222.7, 769.2]      # Alpamayo-R1
-    optimized_vals = [12.7, 60.2, 84.3, 25.3, 182.5]        # FlashDriveVLA
+    optimized_vals = [12.5, 63.6, 40.0, 42.1, 158.2]        # FlashDriveVLA
 
     y = np.arange(len(phases))
     height = 0.35
@@ -54,31 +54,38 @@ def plot_comparison():
 
 
 def plot_minade():
-    # minADE values (n_samples=6)
-    models = ["Alpamayo1", "FlashDriveVLA"]
-    values = [0.798, 0.924]  # TODO: Replace with actual minADE values
+    # minADE and ADE values
+    metrics = [r"$\mathrm{minADE}_{6}$", "ADE"]
+    alpamayo1_vals = [0.798, 1.846]  # minADE_6, ADE
+    flashdrive_vals = [1.203, 2.184]  # minADE_6, ADE
 
-    x = np.arange(len(models)) * 0.6
-    width = 0.2
+    x = np.arange(len(metrics))
+    width = 0.3
 
     fig, ax = plt.subplots(figsize=(4, 5))
-    bars = ax.bar(x, values, width, color=["#1f77b4", "#ff7f0e"], alpha=0.7)
+    bars1 = ax.bar(x - width/2, alpamayo1_vals, width, label="Alpamayo1", alpha=0.7, color="#1f77b4")
+    bars2 = ax.bar(x + width/2, flashdrive_vals, width, label="FlashDriveVLA", alpha=0.7, color="#ff7f0e")
 
     # Add value labels on bars
-    for bar in bars:
-        height = bar.get_height()
-        ax.annotate(f'{height:.2f}',
-                    xy=(bar.get_x() + bar.get_width() / 2, height),
-                    xytext=(0, 3),
-                    textcoords="offset points",
-                    ha='center', va='bottom', fontsize=12)
+    def add_labels(bars):
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.2f}',
+                        xy=(bar.get_x() + bar.get_width() / 2, height),
+                        xytext=(0, 3),
+                        textcoords="offset points",
+                        ha='center', va='bottom', fontsize=12)
 
-    ax.set_ylabel(r"$\mathrm{minADE}_{6}$ @ 6.4s (m)", fontsize=14)
+    add_labels(bars1)
+    add_labels(bars2)
+
+    ax.set_ylabel("Error @ 6.4s (m)", fontsize=14)
     ax.tick_params(axis='y', labelsize=12)
-    ax.set_ylim(0, max(values) * 1.25)
-    ax.set_yticks([0, 1.0])
+    max_val = max(max(alpamayo1_vals), max(flashdrive_vals))
+    ax.set_ylim(0, max_val * 1.25)
     ax.set_xticks(x)
-    ax.set_xticklabels(models, fontsize=14)
+    ax.set_xticklabels(metrics, fontsize=14)
+    ax.legend(loc="upper left", fontsize=14)
     ax.grid(True, axis='y', linestyle='--', alpha=0.5)
 
     plt.tight_layout()
