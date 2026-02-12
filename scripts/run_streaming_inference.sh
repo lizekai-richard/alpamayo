@@ -17,8 +17,8 @@ LOG_DIR="${LOG_DIR:-$REPO_ROOT/test_results/sys_streaming_pruning_logs}"
 # -----------------------------------------------------------------------------
 CLIP_IDS=(
   "b80a15fc-d540-4c8f-81d1-5db83216b2e0"
-  "ee76a44e-0087-4afd-be52-401eab2205ae"
-  "b252537e-58a6-48a4-b5a1-04929c81c88b"
+  # "ee76a44e-0087-4afd-be52-401eab2205ae"
+  # "b252537e-58a6-48a4-b5a1-04929c81c88b"
   # Add more clip IDs here, one per line:
   # "your-clip-id-1"
   # "your-clip-id-2"

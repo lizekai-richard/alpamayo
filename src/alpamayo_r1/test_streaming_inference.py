@@ -286,7 +286,7 @@ def test_streaming_inference_compiled(model, processor):
                 torch_compile="max-autotune",
                 fuse_qkv=True,
                 fuse_gate_up=True,
-                sparsity_ratio=0.0
+                sparsity_ratio=0.5
             )
 
     print("Running streaming inference...")
@@ -306,7 +306,7 @@ def test_streaming_inference_compiled(model, processor):
                 return_extra=True,
                 fuse_qkv=True,
                 fuse_gate_up=True,
-                sparsity_ratio=0.0,
+                sparsity_ratio=0.5,
             )
             end_time = time.perf_counter()
             print(f"Time taken: {end_time - start_time} seconds")
