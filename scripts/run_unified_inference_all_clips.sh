@@ -11,12 +11,13 @@ MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/Alpamayo-R1-10B}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results}"
 CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clip_ids.json}"
 
-NUM_STEPS="${NUM_STEPS:-100}"
+NUM_STEPS="${NUM_STEPS:-120}"
 WARMUP_STEPS="${WARMUP_STEPS:-3}"
 NUM_TRAJ_SAMPLES="${NUM_TRAJ_SAMPLES:-6}"
 SEED="${SEED:-42}"
-T0_US="${T0_US:-2000000}"
+T0_US="${T0_US:-1700000}"
 TIME_STEP_US="${TIME_STEP_US:-100000}"
+SPARSITY_RATIO="${SPARSITY_RATIO:-0.5}"
 
 # Modes to run: "streaming", "non_streaming", or both.
 MODES="${MODES:-streaming}"
@@ -32,7 +33,7 @@ if [[ ! -f "$CLIP_IDS_FILE" ]]; then
   exit 1
 fi
 
-OUTPUT_DIR="$OUTPUT_DIR/${NUM_TRAJ_SAMPLES}samples"
+OUTPUT_DIR="$OUTPUT_DIR/${NUM_TRAJ_SAMPLES}samples_sparsity${SPARSITY_RATIO}"
 mkdir -p "$OUTPUT_DIR"
 
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
@@ -53,6 +54,7 @@ echo "time_step_us:   $TIME_STEP_US"
 echo "Modes:          $MODES"
 echo "Skip existing:  $SKIP_EXISTING"
 echo "Max clips:      $MAX_CLIPS"
+echo "Sparsity ratio: $SPARSITY_RATIO"
 echo "=============================================="
 echo ""
 
@@ -109,6 +111,7 @@ for mode in $MODES; do
       --clip_id "$clip_id" \
       --t0_us "$T0_US" \
       --time_step_us "$TIME_STEP_US" \
+      --sparsity_ratio "$SPARSITY_RATIO" \
       --output_dir "$OUTPUT_DIR"
   done
 done

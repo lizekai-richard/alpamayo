@@ -11,9 +11,11 @@ CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clip_ids.json}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/Alpamayo-R1-10B}"
-OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/6samples_pruning_non_streaming}"
-SPARSITY_RATIO="${SPARSITY_RATIO:-0.5}"
 
+SPARSITY_RATIO="${SPARSITY_RATIO:-0.5}"
+ROPE_MODE="${ROPE_MODE:-direct}"
+
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/6samples_sparsity${SPARSITY_RATIO}_${ROPE_MODE}}"
 # -----------------------------------------------------------------------------
 # Load clip IDs from clip_ids.json, or fall back to default list
 # -----------------------------------------------------------------------------
@@ -53,7 +55,8 @@ for clip_id in "${CLIP_IDS[@]}"; do
     --clip-id "$clip_id" \
     --model_path "$MODEL_PATH" \
     --output_dir "$OUTPUT_DIR" \
-    --sparsity_ratio "$SPARSITY_RATIO"
+    --sparsity_ratio "$SPARSITY_RATIO" \
+    --rope_mode "$ROPE_MODE"
   echo ""
 done
 

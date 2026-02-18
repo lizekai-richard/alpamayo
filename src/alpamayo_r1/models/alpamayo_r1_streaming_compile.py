@@ -577,22 +577,39 @@ class StreamingAlpamayoR1(ReasoningVLA):
         _, indices = torch.topk(colsums, num_keep, dim=-1)
         return indices.sort(dim=-1).values
 
+    @staticmethod
+    def _compute_reshape_dims(K: int, orig_h: int, orig_w: int) -> tuple[int, int]:
+        """Find new_h, new_w such that new_h * new_w == K with aspect ratio closest to orig_h:orig_w."""
+        ratio = orig_h / orig_w
+        best_h, best_w, best_diff = 1, K, float('inf')
+        for h in range(1, int(K**0.5) + 1):
+            if K % h == 0:
+                w = K // h
+                diff = abs(h / w - ratio)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_h, best_w = h, w
+        return best_h, best_w
+
     def _get_pruned_rope_index(
         self,
         input_ids: torch.LongTensor,
         image_grid_thw: torch.LongTensor,
         token_indices: torch.LongTensor,
+        rope_mode: str = "contiguous",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reconstruct mRoPE position_ids after token pruning.
 
         Mirrors Qwen3VLModel.get_rope_index but replaces the full T×H×W grid
-        with only the kept tokens, remapping h and w independently to contiguous
-        0..N-1 values.
+        with only the kept tokens.
 
         Args:
             input_ids: [B, seq_len] original (unpruned) input IDs.
             image_grid_thw: [num_images, 3] with (T, H, W) per image.
             token_indices: [num_images, K] sorted kept token indices per image.
+            rope_mode: "contiguous" (remap h/w to 0..N-1),
+                       "direct" (keep original h/w, gaps allowed),
+                       "reshape" (assign new h/w grid matching aspect ratio).
 
         Returns:
             position_ids: [3, B, new_seq_len] with remapped mRoPE positions.
@@ -603,20 +620,37 @@ class StreamingAlpamayoR1(ReasoningVLA):
         image_token_id = self.vlm.config.image_token_id
         vision_start_token_id = self.vlm.config.vision_start_token_id
 
-        total_input_ids = input_ids
-        batch_size, seq_len = total_input_ids.shape
-        keep_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=input_ids.device)
+        batch_size, seq_len = input_ids.shape
         K = token_indices.shape[1]
 
+        keep_mask = self._get_keep_mask(input_ids, image_grid_thw, token_indices)
+
+        # --- Direct mode: use original positions, recompute rope_deltas ---
+        if rope_mode == "direct":
+            orig_position_ids, _ = self.vlm.model.get_rope_index(
+                input_ids, image_grid_thw, None, None,
+            )
+            # Filter position_ids by keep_mask: [3, B, seq_len] -> [3, B, new_seq_len]
+            position_ids = torch.stack([
+                orig_position_ids[:, i, keep_mask[i]] for i in range(batch_size)
+            ], dim=1)
+            # Recompute rope_deltas for the pruned sequence length.
+            # decode loop uses: position = new_seq_len + rope_delta
+            # which must equal max_pos + 1 to continue from where prefill left off.
+            new_seq_lens = keep_mask.sum(dim=1)  # [B]
+            max_pos = position_ids.amax(dim=(0, 2))  # [B]
+            rope_deltas = (max_pos + 1 - new_seq_lens).unsqueeze(1)  # [B, 1]
+            return position_ids, rope_deltas, keep_mask
+
+        # --- Contiguous / Reshape mode: reconstruct position_ids ---
         mrope_position_deltas = []
         all_new_position_ids = []
         image_index = 0
 
         for i in range(batch_size):
-            ids = total_input_ids[i]
+            ids = input_ids[i]
             input_tokens = ids.tolist()
 
-            # Count images
             vision_start_indices = torch.argwhere(ids == vision_start_token_id).squeeze(1)
             vision_tokens = ids[vision_start_indices + 1]
             image_nums = (vision_tokens == image_token_id).sum().item()
@@ -627,16 +661,12 @@ class StreamingAlpamayoR1(ReasoningVLA):
             for _ in range(image_nums):
                 ed = input_tokens.index(image_token_id, st)
 
-                t, h, w = (
-                    image_grid_thw[image_index][0],
-                    image_grid_thw[image_index][1],
-                    image_grid_thw[image_index][2],
-                )
+                t, h, w = image_grid_thw[image_index]
                 llm_grid_h = h.item() // spatial_merge_size
                 llm_grid_w = w.item() // spatial_merge_size
                 original_num_tokens = t.item() * llm_grid_h * llm_grid_w
 
-                # --- Text segment before this image (includes <|vision_start|>) ---
+                # --- Text segment before this image ---
                 text_len = ed - st
                 if text_len > 0:
                     st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
@@ -645,26 +675,32 @@ class StreamingAlpamayoR1(ReasoningVLA):
                     )
 
                 # --- Pruned image tokens ---
-                kept = token_indices[image_index]  # [K], sorted indices within this image
-                h_orig = kept // llm_grid_w
-                w_orig = kept % llm_grid_w
+                kept = token_indices[image_index]
 
-                # Remap each dimension to contiguous 0..N-1
-                h_unique = torch.unique(h_orig, sorted=True)
-                w_unique = torch.unique(w_orig, sorted=True)
-                h_new = torch.searchsorted(h_unique, h_orig)
-                w_new = torch.searchsorted(w_unique, w_orig)
-                t_new = torch.zeros_like(h_new)
+                if rope_mode == "reshape":
+                    new_h, new_w = self._compute_reshape_dims(K, llm_grid_h, llm_grid_w)
+                    t_new = torch.zeros(K, device=kept.device, dtype=kept.dtype)
+                    h_new = torch.arange(K, device=kept.device) // new_w
+                    w_new = torch.arange(K, device=kept.device) % new_w
+                else:  # "contiguous"
+                    h_orig = kept // llm_grid_w
+                    _, h_inv = torch.unique(h_orig, sorted=True, return_inverse=True)
+                    h_new = h_inv  # 0..new_h-1
+                    # Per-row contiguous w: rank 0,1,...,count-1 within each row.
+                    # kept is sorted so all tokens of each row appear consecutively.
+                    w_new = torch.empty(K, dtype=torch.long, device=kept.device)
+                    ptr = 0
+                    for hi in range(int(h_inv.max().item()) + 1):
+                        count = int((h_inv == hi).sum().item())
+                        w_new[ptr : ptr + count] = torch.arange(count, device=kept.device)
+                        ptr += count
+                    t_new = torch.zeros(K, dtype=torch.long, device=kept.device)
 
                 st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
                 llm_pos_ids_list.append(
                     torch.stack([t_new, h_new, w_new]) + st_idx
                 )
 
-                # --- Update keep_mask: keep first K of the image placeholders ---
-                keep_mask[i, ed + K : ed + original_num_tokens] = False
-
-                # Advance past all original image tokens in input_ids
                 st = ed + original_num_tokens
                 image_index += 1
 
@@ -682,11 +718,10 @@ class StreamingAlpamayoR1(ReasoningVLA):
             new_seq_len = keep_mask[i].sum().item()
             mrope_position_deltas.append(llm_positions.max() + 1 - new_seq_len)
 
-        # Stack across batch
-        position_ids = torch.stack(all_new_position_ids, dim=1).to(input_ids.device)  # [3, B, new_seq_len]
+        position_ids = torch.stack(all_new_position_ids, dim=1).to(input_ids.device)
         rope_deltas = torch.tensor(
             mrope_position_deltas, device=input_ids.device
-        ).unsqueeze(1)  # [B, 1]
+        ).unsqueeze(1)
 
         return position_ids, rope_deltas, keep_mask
 
@@ -728,35 +763,43 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         return pruned, pruned_deepstack
     
-    def _get_keep_mask(self, 
-        input_ids: torch.Tensor, 
-        image_grid_thw: torch.Tensor, 
-        token_indices: torch.Tensor,
-        image_token_id: int,
+    def _get_keep_mask(
+        self,
+        input_ids: torch.LongTensor,
+        image_grid_thw: torch.LongTensor,
+        token_indices: torch.LongTensor,
     ) -> torch.Tensor:
-        """Get keep mask for input_ids based on token_indices."""
+        """Build a boolean mask indicating which positions to keep after pruning.
+
+        Args:
+            input_ids: [B, seq_len] original (unpruned) input IDs.
+            image_grid_thw: [num_images, 3] with (T, H, W) per image.
+            token_indices: [num_images, K] sorted kept token indices per image.
+
+        Returns:
+            keep_mask: [B, seq_len] bool mask (True = keep this position).
+        """
+        spatial_merge_size = self.vlm.config.vision_config.spatial_merge_size
+        image_token_id = self.vlm.config.image_token_id
+        vision_start_token_id = self.vlm.config.vision_start_token_id
+
         batch_size, seq_len = input_ids.shape
-        keep_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=input_ids.device)
-        original_num_tokens = self.num_image_tokens_per_frame
         K = token_indices.shape[1]
+        keep_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=input_ids.device)
         image_index = 0
 
         for i in range(batch_size):
             ids = input_ids[i]
             input_tokens = ids.tolist()
-
-            # Count images
-            vision_start_indices = torch.argwhere(ids == self.vlm.config.vision_start_token_id).squeeze(1)
+            vision_start_indices = torch.argwhere(ids == vision_start_token_id).squeeze(1)
             vision_tokens = ids[vision_start_indices + 1]
             image_nums = (vision_tokens == image_token_id).sum().item()
             st = 0
-
             for _ in range(image_nums):
                 ed = input_tokens.index(image_token_id, st)
-
+                t, h, w = image_grid_thw[image_index]
+                original_num_tokens = t.item() * (h.item() // spatial_merge_size) * (w.item() // spatial_merge_size)
                 keep_mask[i, ed + K : ed + original_num_tokens] = False
-
-                # Advance past all original image tokens in input_ids
                 st = ed + original_num_tokens
                 image_index += 1
 
@@ -773,6 +816,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         image_grid_thw: torch.Tensor,
         batch_size: int,
         sparsity_ratio: float,
+        rope_mode: str,
         device: torch.device,
     ):
 
@@ -788,9 +832,9 @@ class StreamingAlpamayoR1(ReasoningVLA):
             image_embeds, deepstack_image_embeds = self._prune_embeddings(
                 image_embeds, deepstack_image_embeds, image_grid_thw, token_indices
             )
-            # Reconstruct position IDs with contiguous h/w remapping
+            # Reconstruct position IDs for pruned image tokens
             position_ids, rope_deltas, keep_mask = self._get_pruned_rope_index(
-                input_ids, image_grid_thw, token_indices
+                input_ids, image_grid_thw, token_indices, rope_mode=rope_mode
             )
             input_ids = input_ids[keep_mask].view(batch_size, -1)
         else:
@@ -822,9 +866,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
         self.vision_start_end_ids_ranges = vision_start_end_ids_ranges
         self.image_token_ids_ranges = image_token_ids_ranges
         self.traj_and_text_ids_range = traj_and_text_ids_range
-
-        logger.info(f"image_mask: {image_mask.shape}")
-        logger.info(f"inputs_embeds: {inputs_embeds.shape}")
 
         _ = self.vlm.model.language_model(
             inputs_embeds=inputs_embeds,
@@ -866,6 +907,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         fuse_qkv: bool = False,
         fuse_gate_up: bool = False,
         sparsity_ratio: float = 0.5,
+        rope_mode: str = "contiguous",
         *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -882,6 +924,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             use_compile: Whether to use torch.compile for optimization.
             fuse_qkv: Whether to fuse q/k/v projections into a single QKVLinear.
             fuse_gate_up: Whether to fuse gate/up projections into a single MergedColumnLinear.
+            rope_mode: mRoPE mode for pruned tokens ("contiguous", "direct", "reshape").
         Returns:
             pred_xyz: Predicted xyz trajectories.
             pred_rot: Predicted rotation trajectories.
@@ -934,7 +977,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         
         if self.is_first_prefill:
             logger.info("First prefill: caching KV and returning (no streaming logs yet).")
-            self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, batch_size, sparsity_ratio, device)
+            self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, batch_size, sparsity_ratio, rope_mode, device)
             self._update_past_key_values()
             self.is_first_prefill = False
             return
@@ -956,7 +999,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
                 image_embeds, deepstack_image_embeds, image_grid_thw, token_indices
             )
             if self._cached_keep_mask is None:
-                self._cached_keep_mask = self._get_keep_mask(input_ids, image_grid_thw, token_indices, self.vlm.config.image_token_id)
+                self._cached_keep_mask = self._get_keep_mask(input_ids, image_grid_thw, token_indices)
 
             input_ids = input_ids[self._cached_keep_mask].view(batch_size, -1)
         

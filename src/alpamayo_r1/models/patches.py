@@ -291,6 +291,7 @@ class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
         cu_seqlens,
         position_embeddings,
         return_colsum=False,
+        return_attn_weight=False,
         **kwargs,
     ):
         seq_len = hidden_states.shape[0]
@@ -313,9 +314,16 @@ class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
 
         if return_colsum:
             colsum = flash_colreduce(query, key, reduction="sum")
-            return output, colsum
         else:
-            return output, None
+            colsum = None
+        
+        if return_attn_weight:
+            with torch.no_grad():
+                attn_weight = query @ key.transpose(-2, -1) * self.scaling
+                attn_weight = torch.softmax(attn_weight, dim=-1)
+            return output, colsum, attn_weight
+        else:
+            return output, colsum, None
 
 
 class Qwen3VLVisionBlock(qwen3vl.Qwen3VLVisionBlock):
@@ -326,19 +334,21 @@ class Qwen3VLVisionBlock(qwen3vl.Qwen3VLVisionBlock):
         rotary_pos_emb=None,
         position_embeddings=None,
         return_colsum=False,
+        return_attn_weight=False,
         **kwargs,
     ): 
-        attn_output, colsum = self.attn(
+        attn_output, colsum, attn_weight = self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
             return_colsum=return_colsum,
+            return_attn_weight=return_attn_weight,
             **kwargs,
         )
         hidden_states = hidden_states + attn_output
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states, colsum
+        return hidden_states, colsum, attn_weight
 
 
 class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
@@ -365,20 +375,23 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
 
         deepstack_features = []
         colsums = []
+        attn_weights = []
         for layer_idx, block in enumerate(self.blocks):
-            hidden_states, colsum = block(
+            hidden_states, colsum, attn_weight = block(
                 hidden_states,
                 cu_seqlens=self._cached_cu_seqlens,
                 position_embeddings=self._cached_position_embeddings,
                 return_colsum=layer_idx == len(self.blocks) - 1,
+                return_attn_weight=layer_idx == len(self.blocks) - 1,
             )
             if colsum is not None:
                 colsums.append(colsum)
             if layer_idx in self.deepstack_visual_indexes:
                 merger_idx = self.deepstack_visual_indexes.index(layer_idx)
                 deepstack_features.append(self.deepstack_merger_list[merger_idx](hidden_states))
-
-        return self.merger(hidden_states), deepstack_features, colsums
+            if attn_weight is not None:
+                attn_weights.append(attn_weight)
+        return self.merger(hidden_states), deepstack_features, colsums, attn_weights
 
 
 def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):

@@ -178,7 +178,7 @@ def calc_minADE(gt_future_xyz, pred_xyz):
 
 
 @torch.inference_mode()
-def run_streaming_inference(model, model_inputs, _logging: bool = True):
+def run_streaming_inference(args, model, model_inputs, _logging: bool = True):
     """
     Run streaming inference with sliding window inputs.
 
@@ -202,6 +202,7 @@ def run_streaming_inference(model, model_inputs, _logging: bool = True):
             torch_compile="max-autotune",
             fuse_qkv=True,
             fuse_gate_up=True,
+            sparsity_ratio=args.sparsity_ratio
         )
         if pred_xyz is not None:
             min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
@@ -217,7 +218,7 @@ def run_streaming_inference(model, model_inputs, _logging: bool = True):
 
 
 @torch.inference_mode()
-def run_non_streaming_inference(model, model_inputs, _logging: bool = True):
+def run_non_streaming_inference(args, model, model_inputs, _logging: bool = True):
     """
     Run non-streaming inference with sliding window inputs.
     """
@@ -232,6 +233,7 @@ def run_non_streaming_inference(model, model_inputs, _logging: bool = True):
             torch_compile="max-autotune",
             fuse_qkv=True,
             fuse_gate_up=True,
+            sparsity_ratio=args.sparsity_ratio
         )
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
 
@@ -256,7 +258,7 @@ def test_non_streaming_inference(args, model, processor):
     logger.info("Warming up model...")
     for i in range(warmup_steps):
         model_inputs = non_streaming_inputs[i]
-        run_non_streaming_inference(model, model_inputs, _logging=False)
+        run_non_streaming_inference(args, model, model_inputs, _logging=False)
     logger.info("Warmup completed")
 
     logger.info(f"Running non-streaming inference for {len(non_streaming_inputs)} windows:")
@@ -266,7 +268,7 @@ def test_non_streaming_inference(args, model, processor):
     for i in range(warmup_steps, len(non_streaming_inputs)):
         model_inputs = non_streaming_inputs[i]
         start_time = time.perf_counter()
-        min_ade, cot = run_non_streaming_inference(model, model_inputs, _logging=True)
+        min_ade, cot = run_non_streaming_inference(args, model, model_inputs, _logging=True)
         min_ade_list.append(min_ade)
         cot_list.append(cot)
         end_time = time.perf_counter()
@@ -299,7 +301,7 @@ def warmup_model(args, model, processor, warmup_clip_id):
     )
     for i in range(warmup_steps):
         model_inputs = streaming_inputs[i]
-        run_streaming_inference(model, model_inputs, _logging=False)
+        run_streaming_inference(args, model, model_inputs, _logging=False)
     logger.info("Warmup completed")
 
 
@@ -319,14 +321,14 @@ def test_streaming_inference(args, model, processor):
     # warmup the model
     for i in range(warmup_steps):
         model_inputs = streaming_inputs[i]
-        run_streaming_inference(model, model_inputs, _logging=False)
+        run_streaming_inference(args, model, model_inputs, _logging=False)
     logger.info("Warmup completed")
 
     min_ade_list = []
     cot_list = []
     for i in range(warmup_steps, len(streaming_inputs)):
         model_inputs = streaming_inputs[i]
-        min_ade, cot = run_streaming_inference(model, model_inputs, _logging=True)
+        min_ade, cot = run_streaming_inference(args, model, model_inputs, _logging=True)
         min_ade_list.append(min_ade)
         cot_list.append(cot)
 

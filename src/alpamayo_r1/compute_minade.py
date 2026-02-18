@@ -25,6 +25,7 @@ def compute_avg_minade(results_dir):
     json_files = sorted(
         glob.glob(os.path.join(results_dir, "streaming_*.json"))
         + glob.glob(os.path.join(results_dir, "compile_*.json"))
+        + glob.glob(os.path.join(results_dir, "original_*.json"))
     )
     if not json_files:
         print(f"No streaming_*.json or compile_*.json files found in {results_dir}")
@@ -36,6 +37,7 @@ def compute_avg_minade(results_dir):
             os.path.basename(fpath)
             .replace("streaming_", "")
             .replace("compile_", "")
+            .replace("original_", "")
             .replace(".json", "")
         )
         with open(fpath) as f:

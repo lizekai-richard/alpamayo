@@ -118,10 +118,17 @@ def create_sliding_window_inputs(
 def run_inference(args, model, processor, sliding_window_inputs):
     warmup_steps = args.warmup_steps
     logger.info("Warming up model...")
+    min_ade_list = []
+    time_list = []
+    cot_list = []
+
     for i in range(warmup_steps):
         model_inputs = sliding_window_inputs[i]
+        start_time = time.perf_counter()
+        attn_weights_path = os.path.join("saved_attn_weights", args.clip_id, f"attn_weights_step{i}.pt")
+        os.makedirs(os.path.dirname(attn_weights_path), exist_ok=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            model.sample_trajectories_from_data_with_vlm_rollout(
+            pred_xyz, _, extra = model.sample_trajectories_from_data_with_vlm_rollout(
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
@@ -132,15 +139,21 @@ def run_inference(args, model, processor, sliding_window_inputs):
                 fuse_qkv=True,
                 fuse_gate_up=True,
                 sparsity_ratio=args.sparsity_ratio,
+                rope_mode=args.rope_mode,
+                attn_weights_path=attn_weights_path,
             )
+        end_time = time.perf_counter()
+        min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
+        cot = extra["cot"][0][0][min_ade_idx]
+        min_ade_list.append(float(min_ade))
+        time_list.append(end_time - start_time)
+        cot_list.append(cot)
     logger.info("Warmup completed")
 
-    time_list = []
-    min_ade_list = []
-    cot_list = []
     for i in range(warmup_steps, len(sliding_window_inputs)):
         model_inputs = sliding_window_inputs[i]
         start_time = time.perf_counter()
+        attn_weights_path = os.path.join("saved_attn_weights", args.clip_id, f"attn_weights_step{i}.pt")
         with torch.autocast("cuda", dtype=torch.bfloat16):
             pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
                 data=helper.to_device(model_inputs, "cuda"),
@@ -153,6 +166,8 @@ def run_inference(args, model, processor, sliding_window_inputs):
                 fuse_qkv=True,
                 fuse_gate_up=True,
                 sparsity_ratio=args.sparsity_ratio,
+                rope_mode=args.rope_mode,
+                attn_weights_path=attn_weights_path,
             )
         end_time = time.perf_counter()
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
@@ -165,8 +180,8 @@ def run_inference(args, model, processor, sliding_window_inputs):
 
     logger.info(
         "Total time: %.2fs, avg latency: %.3fs, avg MinADE: %.4f",
-        sum(time_list),
-        sum(time_list) / len(time_list),
+        sum(time_list[warmup_steps:]),
+        sum(time_list[warmup_steps:]) / len(time_list[warmup_steps:]),
         sum(min_ade_list) / len(min_ade_list),
     )
 
@@ -203,13 +218,15 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
     parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="b80a15fc-d540-4c8f-81d1-5db83216b2e0")
     parser.add_argument("--warmup_steps", type=int, default=3)
-    parser.add_argument("--num_steps", type=int, default=103)
-    parser.add_argument("--t0_us", type=int, default=2_000_000)
+    parser.add_argument("--num_steps", type=int, default=120)
+    parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
     parser.add_argument("--output_dir", type=str, default="./test_results/sys_pruning_logs")
     parser.add_argument("--num_traj_samples", type=int, default=6)
     parser.add_argument("--sparsity_ratio", type=float, default=0.5)
+    parser.add_argument("--rope_mode", type=str, default="direct")
     args = parser.parse_args()
 
     model, processor = load_model(args)
+    
     test_inference(args, model, processor)

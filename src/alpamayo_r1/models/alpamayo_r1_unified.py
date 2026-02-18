@@ -150,7 +150,6 @@ class AlpamayoR1(ReasoningVLA):
         self.num_image_tokens_per_frame = 180
 
         # Streaming state (will be initialized on first call)
-        self._past_key_values = None
         self._cached_position_ids = None
         self._cached_attention_mask = None
         self._cached_streaming_attention_mask = None
@@ -545,6 +544,219 @@ class AlpamayoR1(ReasoningVLA):
             traj_start_mask.int().argmax(dim=1),
             output_ids.shape[1] - 1,
         )
+    
+    # ==================== Token Pruning ====================
+    
+    def _merge_colsum(self, colsums, image_grid_thw):
+        # colsums is a list of tensors, each tensor is of shape [B, H, L].
+        colsums = torch.stack(colsums, dim=0)  # [num_layers, B, H, L]
+        colsums = colsums.mean(dim=(0, 2))  # [B, L]
+
+        ratio = self.vlm.config.vision_config.spatial_merge_size
+        # PatchMerger groups every consecutive m² tokens via x.view(-1, hidden_size * m²),
+        # so we must sum every consecutive m² colsums to match.
+        colsums = colsums.view(colsums.shape[0], -1, ratio * ratio)
+        colsums = colsums.sum(dim=2)
+        return colsums
+    
+    def _prune_tokens(self, colsums: torch.Tensor, sparsity_ratio: float) -> torch.Tensor:
+        """Select top-k tokens per image based on colsum importance scores.
+
+        Args:
+            colsums: [num_images, tokens_per_image] importance scores.
+            sparsity_ratio: Fraction of tokens to remove (0.5 = keep 50%).
+
+        Returns:
+            Sorted indices of kept tokens, shape [num_images, K].
+        """
+        num_tokens = colsums.shape[-1]
+        num_keep = int(num_tokens * (1 - sparsity_ratio))
+        _, indices = torch.topk(colsums, num_keep, dim=-1)
+        return indices.sort(dim=-1).values
+
+    def _get_pruned_rope_index(
+        self,
+        input_ids: torch.LongTensor,
+        image_grid_thw: torch.LongTensor,
+        token_indices: torch.LongTensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reconstruct mRoPE position_ids after token pruning.
+
+        Mirrors Qwen3VLModel.get_rope_index but replaces the full T×H×W grid
+        with only the kept tokens, remapping h and w independently to contiguous
+        0..N-1 values.
+
+        Args:
+            input_ids: [B, seq_len] original (unpruned) input IDs.
+            image_grid_thw: [num_images, 3] with (T, H, W) per image.
+            token_indices: [num_images, K] sorted kept token indices per image.
+
+        Returns:
+            position_ids: [3, B, new_seq_len] with remapped mRoPE positions.
+            rope_deltas: [B, 1] position delta for decode phase.
+            keep_mask: [B, seq_len] bool mask (True = keep this position).
+        """
+        spatial_merge_size = self.vlm.config.vision_config.spatial_merge_size
+        image_token_id = self.vlm.config.image_token_id
+        vision_start_token_id = self.vlm.config.vision_start_token_id
+
+        total_input_ids = input_ids
+        batch_size, seq_len = total_input_ids.shape
+        keep_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=input_ids.device)
+        K = token_indices.shape[1]
+
+        mrope_position_deltas = []
+        all_new_position_ids = []
+        image_index = 0
+
+        for i in range(batch_size):
+            ids = total_input_ids[i]
+            input_tokens = ids.tolist()
+
+            vision_start_indices = torch.argwhere(ids == vision_start_token_id).squeeze(1)
+            vision_tokens = ids[vision_start_indices + 1]
+            image_nums = (vision_tokens == image_token_id).sum().item()
+
+            llm_pos_ids_list: list = []
+            st = 0
+
+            for _ in range(image_nums):
+                ed = input_tokens.index(image_token_id, st)
+
+                t, h, w = (
+                    image_grid_thw[image_index][0],
+                    image_grid_thw[image_index][1],
+                    image_grid_thw[image_index][2],
+                )
+                llm_grid_h = h.item() // spatial_merge_size
+                llm_grid_w = w.item() // spatial_merge_size
+                original_num_tokens = t.item() * llm_grid_h * llm_grid_w
+
+                # --- Text segment before this image (includes <|vision_start|>) ---
+                text_len = ed - st
+                if text_len > 0:
+                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                    llm_pos_ids_list.append(
+                        torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx
+                    )
+
+                # --- Pruned image tokens ---
+                kept = token_indices[image_index]  # [K], sorted indices within this image
+                h_orig = kept // llm_grid_w
+                w_orig = kept % llm_grid_w
+
+                # Remap each dimension to contiguous 0..N-1
+                h_unique = torch.unique(h_orig, sorted=True)
+                w_unique = torch.unique(w_orig, sorted=True)
+                h_new = torch.searchsorted(h_unique, h_orig)
+                w_new = torch.searchsorted(w_unique, w_orig)
+                t_new = torch.zeros_like(h_new)
+
+                st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                llm_pos_ids_list.append(
+                    torch.stack([t_new, h_new, w_new]) + st_idx
+                )
+
+                # --- Update keep_mask: keep first K of the image placeholders ---
+                keep_mask[i, ed + K : ed + original_num_tokens] = False
+
+                # Advance past all original image tokens in input_ids
+                st = ed + original_num_tokens
+                image_index += 1
+
+            # --- Trailing text segment ---
+            if st < len(input_tokens):
+                st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(
+                    torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx
+                )
+
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            all_new_position_ids.append(llm_positions)
+
+            new_seq_len = keep_mask[i].sum().item()
+            mrope_position_deltas.append(llm_positions.max() + 1 - new_seq_len)
+
+        # Stack across batch
+        position_ids = torch.stack(all_new_position_ids, dim=1).to(input_ids.device)  # [3, B, new_seq_len]
+        rope_deltas = torch.tensor(
+            mrope_position_deltas, device=input_ids.device
+        ).unsqueeze(1)  # [B, 1]
+
+        return position_ids, rope_deltas, keep_mask
+
+    def _prune_embeddings(
+        self,
+        image_embeds: torch.Tensor,
+        deepstack_image_embeds: list[torch.Tensor],
+        image_grid_thw: torch.LongTensor,
+        token_indices: torch.LongTensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Prune image embeddings to keep only selected tokens per image.
+
+        Args:
+            image_embeds: [total_img_tokens, hidden_dim] all images concatenated.
+            deepstack_image_embeds: list of [total_img_tokens, hidden_dim] tensors.
+            image_grid_thw: [num_images, 3] with (T, H, W) per image.
+            token_indices: [num_images, K] sorted kept indices per image.
+
+        Returns:
+            Pruned image_embeds and deepstack_image_embeds with same structure.
+        """
+        spatial_merge_size = self.vlm.config.vision_config.spatial_merge_size
+        tokens_per_image = (
+            image_grid_thw[:, 0]
+            * (image_grid_thw[:, 1] // spatial_merge_size)
+            * (image_grid_thw[:, 2] // spatial_merge_size)
+        )  # [num_images]
+
+        # Split by image, select kept tokens, concatenate back
+        per_image = image_embeds.split(tokens_per_image.tolist(), dim=0)
+        pruned = torch.cat([emb[idx] for emb, idx in zip(per_image, token_indices)], dim=0)
+
+        pruned_deepstack = []
+        for ds_embeds in deepstack_image_embeds:
+            per_image_ds = ds_embeds.split(tokens_per_image.tolist(), dim=0)
+            pruned_deepstack.append(
+                torch.cat([emb[idx] for emb, idx in zip(per_image_ds, token_indices)], dim=0)
+            )
+
+        return pruned, pruned_deepstack
+    
+    def _get_keep_mask(self, 
+        input_ids: torch.Tensor, 
+        image_grid_thw: torch.Tensor, 
+        token_indices: torch.Tensor,
+        image_token_id: int,
+    ) -> torch.Tensor:
+        """Get keep mask for input_ids based on token_indices."""
+        batch_size, seq_len = input_ids.shape
+        keep_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=input_ids.device)
+        original_num_tokens = self.num_image_tokens_per_frame
+        K = token_indices.shape[1]
+        image_index = 0
+
+        for i in range(batch_size):
+            ids = input_ids[i]
+            input_tokens = ids.tolist()
+
+            # Count images
+            vision_start_indices = torch.argwhere(ids == self.vlm.config.vision_start_token_id).squeeze(1)
+            vision_tokens = ids[vision_start_indices + 1]
+            image_nums = (vision_tokens == image_token_id).sum().item()
+            st = 0
+
+            for _ in range(image_nums):
+                ed = input_tokens.index(image_token_id, st)
+
+                keep_mask[i, ed + K : ed + original_num_tokens] = False
+
+                # Advance past all original image tokens in input_ids
+                st = ed + original_num_tokens
+                image_index += 1
+
+        return keep_mask
 
     # ==================== Main Inference Methods ====================
 
@@ -554,36 +766,57 @@ class AlpamayoR1(ReasoningVLA):
         attention_mask: torch.Tensor,
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
+        batch_size: int,
+        sparsity_ratio: float,
         device: torch.device,
     ):
-        """Run first prefill for streaming mode (caches KV and metadata)."""
-        # Cache all streaming related inputs
-        (
-            vision_start_end_ids_ranges,
-            traj_and_text_ids_range,
-        ) = self._retrieve_streaming_related_inputs(input_ids)
 
-        cache_position = self._create_cache_position().to(device)
+        # Launch the first non-streaming prefill
+        # inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
+        image_embeds, deepstack_image_embeds, colsums = self.vlm.model.visual(pixel_values, grid_thw=image_grid_thw)
+        
+        if sparsity_ratio > 0:
+            colsums = self._merge_colsum(colsums, image_grid_thw)
+            token_indices = self._prune_tokens(colsums, sparsity_ratio=sparsity_ratio)
 
-        position_ids, rope_deltas = self.vlm.model.get_rope_index(input_ids, image_grid_thw)
-        # Pad position_ids to max_cache_len
-        padding_length = self.max_cache_len - self.prefill_seq_length
+            # Prune image embeddings
+            image_embeds, deepstack_image_embeds = self._prune_embeddings(
+                image_embeds, deepstack_image_embeds, image_grid_thw, token_indices
+            )
+            # Reconstruct position IDs with contiguous h/w remapping
+            position_ids, rope_deltas, keep_mask = self._get_pruned_rope_index(
+                input_ids, image_grid_thw, token_indices
+            )
+            input_ids = input_ids[keep_mask].view(batch_size, -1)
+        else:
+            position_ids, rope_deltas = self.vlm.model.get_rope_index(
+                input_ids, image_grid_thw, None, None
+            )
+
+        inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
+        image_mask = (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        padding_length = self.max_cache_len - input_ids.shape[1]
         if padding_length > 0:
             last_pos = position_ids[:, :, -1:]
             padding_pos = last_pos + torch.arange(1, padding_length + 1, device=device)
             position_ids = torch.cat([position_ids, padding_pos], dim=-1)
+        
+        # Cache all streaming related inputs
+        (
+            vision_start_end_ids_ranges, 
+            image_token_ids_ranges, 
+            traj_and_text_ids_range
+        ) = self._retrieve_streaming_related_inputs(input_ids[:1])
+        cache_position = self._create_cache_position().to(device)
 
         self._cached_position_ids = position_ids
         self._cached_rope_deltas = rope_deltas
         self._cached_attention_mask = attention_mask
         self.vision_start_end_ids_ranges = vision_start_end_ids_ranges
+        self.image_token_ids_ranges = image_token_ids_ranges
         self.traj_and_text_ids_range = traj_and_text_ids_range
-
-        # Launch the first non-streaming prefill
-        inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
-        image_embeds, deepstack_image_embeds = self.vlm.model.visual(pixel_values, grid_thw=image_grid_thw)
-        image_mask = (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         _ = self.vlm.model.language_model(
             inputs_embeds=inputs_embeds,
@@ -597,16 +830,19 @@ class AlpamayoR1(ReasoningVLA):
             use_cache=True,
         ).last_hidden_state[:, -1]
 
-        # Delete cached embeddings for next calls
+        # Delete the cached_pos_embeds in QwenVLVisionModel
         if hasattr(self.vlm.model.visual, "_cached_pos_embeds"):
             delattr(self.vlm.model.visual, "_cached_pos_embeds")
+        logger.info("Deleted _cached_pos_embeds in Qwen3VLVisionModel")
         
         for block in self.vlm.model.visual.blocks:
             if hasattr(block.attn, "_num_chunks"):
                 delattr(block.attn, "_num_chunks")
-
+        logger.info("Deleted _num_chunks in Qwen3VLVisionModel")
+        
         if hasattr(self.vlm.model.language_model, "_cached_deepstack_indices"):
             delattr(self.vlm.model.language_model, "_cached_deepstack_indices")
+        logger.info("Deleted _cached_deepstack_indices in Qwen3VLTextModel")
 
     @torch.inference_mode()
     def _streaming_rollout(
@@ -621,6 +857,7 @@ class AlpamayoR1(ReasoningVLA):
         diffusion_kwargs: dict[str, Any] | None,
         fuse_qkv: bool = False,
         fuse_gate_up: bool = False,
+        sparsity_ratio: float = 0.5,
         **kwargs: Any,
     ):
         """Streaming mode: reuses KV cache, first call is prefill only."""
@@ -652,21 +889,34 @@ class AlpamayoR1(ReasoningVLA):
         max_new_tokens = kwargs.get("max_generation_length", self.config.tokens_per_future_traj)
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
 
-        cache_len = self.prefill_seq_length + max_new_tokens + self.num_action_tokens
-        self.max_cache_len = cache_len
+        if self.is_first_prefill:
+            num_image_tokens = (input_ids == self.vlm.config.image_token_id).sum().item()
+            pruned_image_tokens = int(num_image_tokens * sparsity_ratio)
+            original_seq_len = input_ids.shape[1]
+            new_seq_len = original_seq_len - pruned_image_tokens
+            self.prefill_seq_length = new_seq_len
+            self.max_cache_len = new_seq_len + max_new_tokens + self.num_action_tokens
 
         # Initialize KV cache on first call
         if self._past_key_values is None:
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
-                max_cache_len=cache_len,
-                max_batch_size=num_samples,
+                max_cache_len=self.max_cache_len,
+                max_batch_size=num_samples * batch_size,
                 offloading=False,
             )
 
         if self.is_first_prefill:
             logger.info("Streaming: First prefill - caching KV, position_ids, and attention_mask.")
-            self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, device)
+            self._first_prefill(
+                input_ids, 
+                attention_mask, 
+                pixel_values, 
+                image_grid_thw, 
+                batch_size, 
+                sparsity_ratio, 
+                device,
+            )
             self._update_past_key_values()
             self.is_first_prefill = False
             if kwargs.get("return_extra", False):
@@ -686,7 +936,30 @@ class AlpamayoR1(ReasoningVLA):
         inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
 
         # ===== Encode =====
-        image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)
+        image_embeds, deepstack_image_embeds, colsums = self._encode(pixel_values, image_grid_thw)
+
+        if sparsity_ratio > 0:
+            colsums = self._merge_colsum(colsums, image_grid_thw)
+            token_indices = self._prune_tokens(colsums, sparsity_ratio=sparsity_ratio)
+            
+            # Prune image embeddings
+            image_embeds, deepstack_image_embeds = self._prune_embeddings(
+                image_embeds, deepstack_image_embeds, image_grid_thw, token_indices
+            )
+            if self._cached_keep_mask is None:
+                self._cached_keep_mask = self._get_keep_mask(input_ids, image_grid_thw, token_indices, self.vlm.config.image_token_id)
+
+            input_ids = input_ids[self._cached_keep_mask].view(batch_size, -1)
+        
+        inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
+
+        # Create cache position and position IDs
+        cache_position = self._create_cache_position().to(device)
+        seq_len = input_ids.shape[1]
+        self._cached_prompt_length = seq_len
+
+        # Get embeddings
+        # inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
         image_mask = (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
@@ -812,6 +1085,7 @@ class AlpamayoR1(ReasoningVLA):
         diffusion_kwargs: dict[str, Any] | None,
         fuse_qkv: bool = False,
         fuse_gate_up: bool = False,
+        sparsity_ratio: float = 0.5,
         **kwargs: Any,
     ):
         """Non-streaming mode: resets KV cache each call, processes all frames."""
@@ -843,27 +1117,48 @@ class AlpamayoR1(ReasoningVLA):
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
         seq_len = input_ids.shape[1]
 
-        # Initialize or reset KV cache
-        cache_len = seq_len + max_new_tokens + self.num_action_tokens
-        self.max_cache_len = cache_len
-        if self._past_key_values is None:
+        # Initialize KV cache (includes space for action tokens)
+        if not hasattr(self, "_past_key_values"):
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
-                max_cache_len=cache_len,
-                max_batch_size=num_samples,
-                offloading=False,
+                max_cache_len=seq_len + max_new_tokens + self.num_action_tokens,
+                max_batch_size=num_samples * batch_size,
             )
         self._past_key_values.reset()
 
-        # Compute position_ids
-        position_ids, rope_deltas = self.vlm.model.get_rope_index(input_ids, image_grid_thw)
-
-        # Get embeddings
-        inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
-
         # ===== Encode =====
-        image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)
-        image_mask = (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        image_embeds, deepstack_image_embeds, colsums = self._encode(pixel_values, image_grid_thw)
+
+        if sparsity_ratio > 0:
+            # ===== Prune =====
+            colsums = self._merge_colsum(colsums, image_grid_thw)
+            token_indices = self._prune_tokens(colsums, sparsity_ratio=sparsity_ratio)
+
+            # Prune image embeddings
+            image_embeds, deepstack_image_embeds = self._prune_embeddings(
+                image_embeds, deepstack_image_embeds, image_grid_thw, token_indices
+            )
+
+            # Reconstruct position IDs with contiguous h/w remapping
+            position_ids, rope_deltas, keep_mask = self._get_pruned_rope_index(
+                input_ids, image_grid_thw, token_indices
+            )
+
+            # Prune input_ids using keep_mask and recompute embeddings
+            input_ids = input_ids[keep_mask].view(batch_size, -1)
+        else:
+            # No pruning: use standard rope index
+            position_ids, rope_deltas = self.vlm.model.get_rope_index(
+                input_ids, image_grid_thw, None, None,
+            )
+
+        inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
+        seq_len = input_ids.shape[1]
+
+        # Scatter image embeds into inputs_embeds
+        image_mask = (
+            (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        )
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         # ===== Prefill (no streaming attention mask) =====
@@ -983,6 +1278,7 @@ class AlpamayoR1(ReasoningVLA):
         diffusion_kwargs: dict[str, Any] | None = None,
         fuse_qkv: bool = False,
         fuse_gate_up: bool = False,
+        sparsity_ratio: float = 0.5,
         **kwargs: Any,
     ):
         """
@@ -1001,6 +1297,7 @@ class AlpamayoR1(ReasoningVLA):
             diffusion_kwargs=diffusion_kwargs,
             fuse_qkv=fuse_qkv,
             fuse_gate_up=fuse_gate_up,
+            sparsity_ratio=sparsity_ratio,
             **kwargs,
         )
 
@@ -1016,6 +1313,7 @@ class AlpamayoR1(ReasoningVLA):
         diffusion_kwargs: dict[str, Any] | None = None,
         fuse_qkv: bool = False,
         fuse_gate_up: bool = False,
+        sparsity_ratio: float = 0.5,
         **kwargs: Any,
     ):
         """
@@ -1032,6 +1330,7 @@ class AlpamayoR1(ReasoningVLA):
             diffusion_kwargs=diffusion_kwargs,
             fuse_qkv=fuse_qkv,
             fuse_gate_up=fuse_gate_up,
+            sparsity_ratio=sparsity_ratio,
             **kwargs,
         )
 
