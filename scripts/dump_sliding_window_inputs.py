@@ -2,14 +2,15 @@
 """Dump sliding_window_inputs for each clip to disk. dump_data.py can then use --dumped_inputs_dir to read from disk.
 
 Each clip is saved to <output_dir>/<clip_id>/sliding_window_inputs.pt (list of model_inputs dicts).
-Run this once (e.g. with distributed or many workers) to populate the dir; then run dump_data.py with
+Run this once (single process or distributed) to populate the dir; then run dump_data.py with
 --dumped_inputs_dir <output_dir> to skip load_physical_aiavdataset and tokenization.
 
 Usage:
   # Single process (from repo root, PYTHONPATH=src)
   python scripts/dump_sliding_window_inputs.py --clip_ids_file clips_for_train.json --output_dir ./dumped_inputs
 
-  # Distributed (e.g. 8 GPUs): each rank dumps its subset of clips (no GPU needed for this script)
+  # Distributed (e.g. 8 processes): each rank processes clip_ids[rank], clip_ids[rank+8], ...
+  # Each process loads the model on CPU once; 8 processes = 8x CPU RAM for the model.
   torchrun --nproc_per_node=8 scripts/dump_sliding_window_inputs.py --clip_ids_file clips_for_train.json --output_dir ./dumped_inputs
 """
 
@@ -38,9 +39,11 @@ def _to_cpu(obj):
 
 
 def setup_distributed():
+    """Initialize torch.distributed when launched with torchrun. Returns (rank, world_size)."""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
+        # Use gloo (CPU); no GPU needed for dumping inputs
         dist.init_process_group(backend="gloo")
         return rank, world_size
     return 0, 1
@@ -74,6 +77,9 @@ def main():
     _model, processor = load_model(args, device=torch.device("cpu"))
     del _model  # free memory; we only need processor for create_sliding_window_inputs
 
+    if dist.is_initialized():
+        dist.barrier()  # sync all ranks after model load before starting work
+
     for i, clip_id in enumerate(my_clip_ids):
         out_subdir = os.path.join(args.output_dir, clip_id)
         out_file = os.path.join(out_subdir, "sliding_window_inputs.pt")
@@ -97,6 +103,7 @@ def main():
             logger.warning("Rank %s: failed %s: %s", rank, clip_id, e)
 
     if dist.is_initialized():
+        dist.barrier()  # wait for all ranks to finish before tearing down
         dist.destroy_process_group()
     logger.info("Rank %s: done.", rank)
 
