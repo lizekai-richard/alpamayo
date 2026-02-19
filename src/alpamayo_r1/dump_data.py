@@ -154,20 +154,35 @@ def run_inference(args, model, sliding_window_inputs, device=None):
     logger.info("Results saved to %s", out_path)
 
 
+def load_sliding_window_inputs_from_dump(dumped_inputs_dir: str, clip_id: str):
+    """Load pre-dumped sliding_window_inputs from dumped_inputs_dir/<clip_id>/sliding_window_inputs.pt."""
+    path = os.path.join(dumped_inputs_dir, clip_id, "sliding_window_inputs.pt")
+    if not os.path.isfile(path):
+        return None
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
 def dump_data(args, model, processor, device=None):
     if device is None:
         device = torch.device("cuda")
-    logger.info("Creating sliding window inputs for clip_id: %s", args.clip_id)
-    sliding_window_inputs = create_sliding_window_inputs(
-        processor=processor,
-        num_windows=args.num_steps,
-        clip_id=args.clip_id,
-        t0_us=args.t0_us,
-        time_step_us=args.time_step_us,
-    )
-    logger.info("Created %s windows", len(sliding_window_inputs))
-    run_inference(args, model, processor, sliding_window_inputs, device=device)
-    logger.info("Completed compile inference for %s", args.clip_id)
+    clip_id = args.clip_id
+    sliding_window_inputs = None
+    if getattr(args, "dumped_inputs_dir", None):
+        sliding_window_inputs = load_sliding_window_inputs_from_dump(args.dumped_inputs_dir, clip_id)
+        if sliding_window_inputs is not None:
+            logger.info("Loaded %s windows from dump for clip_id: %s", len(sliding_window_inputs), clip_id)
+    if sliding_window_inputs is None:
+        logger.info("Creating sliding window inputs for clip_id: %s", clip_id)
+        sliding_window_inputs = create_sliding_window_inputs(
+            processor=processor,
+            num_windows=args.num_steps,
+            clip_id=clip_id,
+            t0_us=args.t0_us,
+            time_step_us=args.time_step_us,
+        )
+        logger.info("Created %s windows", len(sliding_window_inputs))
+    run_inference(args, model, sliding_window_inputs, device=device)
+    logger.info("Completed compile inference for %s", clip_id)
 
 
 def setup_distributed():
@@ -195,6 +210,12 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="JSON file with list of clip IDs; use with torchrun for distributed (each rank runs a subset).",
+    )
+    parser.add_argument(
+        "--dumped_inputs_dir",
+        type=str,
+        default=None,
+        help="If set, load sliding_window_inputs from this dir (output of dump_sliding_window_inputs.py) instead of creating from dataset.",
     )
     args = parser.parse_args()
 
