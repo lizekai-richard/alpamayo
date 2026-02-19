@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
 import copy
 import logging
 from typing import Any
@@ -705,9 +705,14 @@ class AlpamayoR1(ReasoningVLA):
 
         # Merge attention weights to post-merger resolution and save
         # merged_attn = self._merge_attn_weights(attn_weights)
-        # attn_weights_path = kwargs.get("attn_weights_path", "attn_weights.pt")
-        # torch.save({"attn_weights": merged_attn, "image_grid_thw": image_grid_thw}, attn_weights_path)
-        # logger.info(f"Saved merged attention weights to {attn_weights_path}")
+        attn_weights_path = kwargs.get("attn_weights_path", None)
+        colsums_path = kwargs.get("colsums_path", None)
+        if attn_weights_path is not None:
+            torch.save(attn_weights, attn_weights_path)
+            logger.info(f"Saved merged attention weights to {attn_weights_path}")
+        if colsums_path is not None:
+            torch.save(colsums, colsums_path)
+            logger.info(f"Saved column sums to {colsums_path}")
 
         if sparsity_ratio > 0:
             # ===== Prune =====

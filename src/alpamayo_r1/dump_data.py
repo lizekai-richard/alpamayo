@@ -16,17 +16,24 @@
 # End-to-end example script for the inference pipeline:
 # This script loads a dataset, runs inference, and computes the minADE.
 # It can be used to test the inference pipeline.
+#
+# Distributed (8 GPUs): clip list is split across ranks (rank 0 gets 0,8,16,..., rank 1 gets 1,9,17,...).
+#   From repo root: torchrun --nproc_per_node=8 src/alpamayo_r1/dump_data.py --clip_ids_file clips_for_train.json --output_dir ./out
+# Single clip:
+#   python src/alpamayo_r1/dump_data.py --clip_id <uuid> --output_dir ./out
 
 import argparse
 import json
 import logging
 import os
+import random
 import time
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
-from alpamayo_r1.models.alpamayo_r1_compile import AlpamayoR1
+from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
@@ -36,11 +43,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-torch.set_float32_matmul_precision("high")
 
-
-def load_model(args):
-    model = AlpamayoR1.from_pretrained(args.model_path, dtype=torch.bfloat16).to("cuda")
+def load_model(args, device=None):
+    if device is None:
+        device = torch.device("cuda")
+    model = AlpamayoR1.from_pretrained(args.model_path, dtype=torch.bfloat16).to(device)
     processor = helper.get_processor(model.tokenizer)
     return model, processor
 
@@ -107,106 +114,49 @@ def create_sliding_window_inputs(
             "ego_future_xyz": data["ego_future_xyz"],
             "ego_future_rot": data["ego_future_rot"],
             "is_prefill": is_prefill,
+            "timestamp": current_t0,
         }
-        # model_inputs = helper.to_device(model_inputs, "cuda")
         streaming_inputs.append(model_inputs)
 
     return streaming_inputs
 
 
 @torch.inference_mode()
-def run_inference(args, model, processor, sliding_window_inputs):
-    warmup_steps = args.warmup_steps
-    logger.info("Warming up model...")
-    min_ade_list = []
-    time_list = []
-    cot_list = []
+def run_inference(args, model, sliding_window_inputs, device=None):
+    if device is None:
+        device = torch.device("cuda")
+    clip_data_list = []
 
-    for i in range(warmup_steps):
+    for i in range(len(sliding_window_inputs)):
         model_inputs = sliding_window_inputs[i]
-        start_time = time.perf_counter()
-        attn_weights_path = os.path.join(args.save_path, args.clip_id, f"step{i}", "attn_weights.pt")
-        colsums_path = os.path.join(args.save_path, args.clip_id, f"step{i}", "colsums.pt")
-        os.makedirs(os.path.dirname(attn_weights_path), exist_ok=True)
-        os.makedirs(os.path.dirname(colsums_path), exist_ok=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(device.type, dtype=torch.bfloat16):
             pred_xyz, _, extra = model.sample_trajectories_from_data_with_vlm_rollout(
-                data=helper.to_device(model_inputs, "cuda"),
+                data=helper.to_device(model_inputs, device),
                 top_p=0.98,
                 temperature=0.6,
-                num_traj_samples=args.num_traj_samples,
+                num_traj_samples=6,
                 max_generation_length=256,
-                return_extra=True,
-                torch_compile="max-autotune",
-                fuse_qkv=True,
-                fuse_gate_up=True,
-                sparsity_ratio=args.sparsity_ratio,
-                rope_mode=args.rope_mode,
-                attn_weights_path=attn_weights_path,
-                colsums_path=colsums_path,
+                return_extra=True
             )
-        end_time = time.perf_counter()
+        all_cots = extra["cot"][0][0].tolist()
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
-        cot = extra["cot"][0][0][min_ade_idx]
-        min_ade_list.append(float(min_ade))
-        time_list.append(end_time - start_time)
-        cot_list.append(cot)
-    logger.info("Warmup completed")
-
-    for i in range(warmup_steps, len(sliding_window_inputs)):
-        model_inputs = sliding_window_inputs[i]
-        start_time = time.perf_counter()
-        attn_weights_path = os.path.join(args.save_path, args.clip_id, f"step{i}", "attn_weights.pt")
-        colsums_path = os.path.join(args.save_path, args.clip_id, f"step{i}", "colsums.pt")
-        os.makedirs(os.path.dirname(attn_weights_path), exist_ok=True)
-        os.makedirs(os.path.dirname(colsums_path), exist_ok=True)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
-                data=helper.to_device(model_inputs, "cuda"),
-                top_p=0.98,
-                temperature=0.6,
-                num_traj_samples=args.num_traj_samples,
-                max_generation_length=256,
-                torch_compile="max-autotune",
-                return_extra=True,
-                fuse_qkv=True,
-                fuse_gate_up=True,
-                sparsity_ratio=args.sparsity_ratio,
-                rope_mode=args.rope_mode,
-                attn_weights_path=attn_weights_path,
-                colsums_path=colsums_path,
-            )
-        end_time = time.perf_counter()
-        min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
-        cot = extra["cot"][0][0][min_ade_idx]
-        time_list.append(end_time - start_time)
-        min_ade_list.append(float(min_ade))
-        cot_list.append(cot)
-        logger.info("Step %s: latency=%.3fs, MinADE=%.4f", i, end_time - start_time, min_ade)
-        logger.info("Chain-of-Causation:\n%s", cot)
-
-    logger.info(
-        "Total time: %.2fs, avg latency: %.3fs, avg MinADE: %.4f",
-        sum(time_list[warmup_steps:]),
-        sum(time_list[warmup_steps:]) / len(time_list[warmup_steps:]),
-        sum(min_ade_list) / len(min_ade_list),
-    )
+        clip_data_list.append({
+            "timestamp": model_inputs["timestamp"],
+            "all_cots": all_cots,
+            "min_ade": float(min_ade),
+            "best_cot": all_cots[min_ade_idx],
+        })
 
     os.makedirs(args.output_dir, exist_ok=True)
-    results = {}
-    for j in range(len(min_ade_list)):
-        results[j] = {
-            "latency": time_list[j],
-            "min_ade": min_ade_list[j],
-            "cot": cot_list[j],
-        }
-    out_path = os.path.join(args.output_dir, f"compile_{args.clip_id}.json")
+    out_path = os.path.join(args.output_dir, f"{args.clip_id}.json")
     with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(clip_data_list, f, indent=2)
     logger.info("Results saved to %s", out_path)
 
 
-def test_inference(args, model, processor):
+def dump_data(args, model, processor, device=None):
+    if device is None:
+        device = torch.device("cuda")
     logger.info("Creating sliding window inputs for clip_id: %s", args.clip_id)
     sliding_window_inputs = create_sliding_window_inputs(
         processor=processor,
@@ -216,25 +166,62 @@ def test_inference(args, model, processor):
         time_step_us=args.time_step_us,
     )
     logger.info("Created %s windows", len(sliding_window_inputs))
-    run_inference(args, model, processor, sliding_window_inputs)
-    logger.info("Completed compile inference")
+    run_inference(args, model, processor, sliding_window_inputs, device=device)
+    logger.info("Completed compile inference for %s", args.clip_id)
+
+
+def setup_distributed():
+    """Initialize torch.distributed. Returns (rank, world_size, local_rank, device) or (0, 1, 0, cuda:0)."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        dist.init_process_group(backend="nccl")
+        device = torch.device(f"cuda:{local_rank}")
+        return rank, world_size, local_rank, device
+    return 0, 1, 0, torch.device("cuda")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run compile-model inference on a clip.")
+    parser = argparse.ArgumentParser(description="Run compile-model inference on a clip or distributed over clips.")
     parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
-    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="b80a15fc-d540-4c8f-81d1-5db83216b2e0")
-    parser.add_argument("--warmup_steps", type=int, default=3)
     parser.add_argument("--num_steps", type=int, default=120)
     parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
     parser.add_argument("--output_dir", type=str, default="./test_results/sys_pruning_logs")
-    parser.add_argument("--num_traj_samples", type=int, default=6)
-    parser.add_argument("--sparsity_ratio", type=float, default=0.5)
-    parser.add_argument("--rope_mode", type=str, default="direct")
-    parser.add_argument("--save_path", type=str, default="./saved_tensors")
+    parser.add_argument("--clip_id", type=str, default=None, help="Single clip ID (for non-distributed run).")
+    parser.add_argument(
+        "--clip_ids_file",
+        type=str,
+        default=None,
+        help="JSON file with list of clip IDs; use with torchrun for distributed (each rank runs a subset).",
+    )
     args = parser.parse_args()
 
-    model, processor = load_model(args)
+    rank, world_size, local_rank, device = setup_distributed()
 
-    test_inference(args, model, processor)
+    if args.clip_ids_file:
+        # Distributed: each rank processes clip_ids[rank], clip_ids[rank+world_size], ...
+        with open(args.clip_ids_file) as f:
+            all_clip_ids = json.load(f)
+        my_clip_ids = all_clip_ids[rank::world_size]
+        logger.info(
+            "Rank %s/%s: processing %s clips (total %s)",
+            rank,
+            world_size,
+            len(my_clip_ids),
+            len(all_clip_ids),
+        )
+        model, processor = load_model(args, device=device)
+        for i, clip_id in enumerate(my_clip_ids):
+            args.clip_id = clip_id
+            logger.info("Rank %s: clip %s/%s %s", rank, i + 1, len(my_clip_ids), clip_id)
+            dump_data(args, model, processor, device=device)
+        if dist.is_initialized():
+            dist.destroy_process_group()
+    elif args.clip_id:
+        # Single-clip run
+        model, processor = load_model(args, device=device)
+        dump_data(args, model, processor, device=device)
+    else:
+        raise SystemExit("Provide either --clip_id (single) or --clip_ids_file (distributed with torchrun).")
