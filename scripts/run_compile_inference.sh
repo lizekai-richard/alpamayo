@@ -27,7 +27,7 @@ if [[ -f "$CLIP_IDS_FILE" ]]; then
   fi
 else
   echo "Clip IDs file not found: $CLIP_IDS_FILE (using default clip)" >&2
-  CLIP_IDS=("b80a15fc-d540-4c8f-81d1-5db83216b2e0")
+  CLIP_IDS=("87147a1b-3eef-4c25-94d2-ec7718a49a7a")
 fi
 
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"

@@ -333,17 +333,26 @@ class AlpamayoR1(ReasoningVLA):
     
     # ==================== Token Pruning ====================
     
-    def _merge_colsum(self, colsums, image_grid_thw):
+    def _merge_colsum(self, colsums: list[torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor]]:
         # colsums is a list of tensors, each tensor is of shape [B, H, L].
-        colsums = torch.stack(colsums, dim=0)  # [num_layers, B, H, L]
-        colsums = colsums.mean(dim=(0, 2))  # [B, L]
+        deepstack_colsums = []
+        vision_colsums = None
+        for i in range(len(colsums)):
+            colsum = colsums[i]  # [B, H, L]
+            colsum = colsum.mean(dim=1)  # [B, L]
 
-        ratio = self.vlm.config.vision_config.spatial_merge_size
-        # PatchMerger groups every consecutive m² tokens via x.view(-1, hidden_size * m²),
-        # so we must sum every consecutive m² colsums to match.
-        colsums = colsums.view(colsums.shape[0], -1, ratio * ratio)
-        colsums = colsums.sum(dim=2)
-        return colsums
+            ratio = self.vlm.config.vision_config.spatial_merge_size
+            # PatchMerger groups every consecutive m² tokens via x.view(-1, hidden_size * m²),
+            # so we must sum every consecutive m² colsums to match.
+            colsum = colsum.view(colsum.shape[0], -1, ratio * ratio)
+            colsum = colsum.sum(dim=2)
+
+            if i == len(colsums) - 1:
+                vision_colsums = colsum
+            else:
+                deepstack_colsums.append(colsum)
+
+        return vision_colsums, deepstack_colsums
 
     def _merge_attn_weights(self, attn_weights):
         """Merge pre-merger attention weights to post-merger resolution.
@@ -582,7 +591,8 @@ class AlpamayoR1(ReasoningVLA):
         image_embeds: torch.Tensor,
         deepstack_image_embeds: list[torch.Tensor],
         image_grid_thw: torch.LongTensor,
-        token_indices: torch.LongTensor,
+        vision_token_indices: torch.LongTensor,
+        deepstack_token_indices: list[torch.LongTensor],
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Prune image embeddings to keep only selected tokens per image.
 
@@ -590,11 +600,13 @@ class AlpamayoR1(ReasoningVLA):
             image_embeds: [total_img_tokens, hidden_dim] all images concatenated.
             deepstack_image_embeds: list of [total_img_tokens, hidden_dim] tensors.
             image_grid_thw: [num_images, 3] with (T, H, W) per image.
-            token_indices: [num_images, K] sorted kept indices per image.
+            vision_token_indices: [num_images, K] sorted kept indices per image.
+            deepstack_token_indices: [num_images, K] sorted kept indices per image.
 
         Returns:
             Pruned image_embeds and deepstack_image_embeds with same structure.
         """
+        # ===== Prune vision embeddings =====
         spatial_merge_size = self.vlm.config.vision_config.spatial_merge_size
         tokens_per_image = (
             image_grid_thw[:, 0]
@@ -604,16 +616,17 @@ class AlpamayoR1(ReasoningVLA):
 
         # Split by image, select kept tokens, concatenate back
         per_image = image_embeds.split(tokens_per_image.tolist(), dim=0)
-        pruned = torch.cat([emb[idx] for emb, idx in zip(per_image, token_indices)], dim=0)
+        pruned_image_embeds = torch.cat([emb[idx] for emb, idx in zip(per_image, vision_token_indices)], dim=0)
 
-        pruned_deepstack = []
-        for ds_embeds in deepstack_image_embeds:
+        # ===== Prune deepstack embeddings =====
+        pruned_deepstack_embeds = []
+        for i, ds_embeds in enumerate(deepstack_image_embeds):
             per_image_ds = ds_embeds.split(tokens_per_image.tolist(), dim=0)
-            pruned_deepstack.append(
-                torch.cat([emb[idx] for emb, idx in zip(per_image_ds, token_indices)], dim=0)
+            pruned_deepstack_embeds.append(
+                torch.cat([emb[idx] for emb, idx in zip(per_image_ds, deepstack_token_indices[i])], dim=0)
             )
 
-        return pruned, pruned_deepstack
+        return pruned_image_embeds, pruned_deepstack_embeds
 
     @property
     def traj_start_token_id(self) -> int:
@@ -701,34 +714,36 @@ class AlpamayoR1(ReasoningVLA):
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
 
         # ===== Encode =====
-        image_embeds, deepstack_image_embeds, colsums, attn_weights = self._encode(pixel_values, image_grid_thw)
+        image_embeds, deepstack_image_embeds, colsums = self._encode(pixel_values, image_grid_thw)
 
         # Merge attention weights to post-merger resolution and save
         # merged_attn = self._merge_attn_weights(attn_weights)
-        attn_weights_path = kwargs.get("attn_weights_path", None)
-        colsums_path = kwargs.get("colsums_path", None)
-        if attn_weights_path is not None:
-            torch.save(attn_weights, attn_weights_path)
-            logger.info(f"Saved merged attention weights to {attn_weights_path}")
-        if colsums_path is not None:
-            torch.save(colsums, colsums_path)
-            logger.info(f"Saved column sums to {colsums_path}")
+        # attn_weights_path = kwargs.get("attn_weights_path", None)
+        # colsums_path = kwargs.get("colsums_path", None)
+        # if attn_weights_path is not None:
+        #     torch.save(attn_weights, attn_weights_path)
+        #     logger.info(f"Saved merged attention weights to {attn_weights_path}")
+        # if colsums_path is not None:
+        #     torch.save(colsums, colsums_path)
+        #     logger.info(f"Saved column sums to {colsums_path}")
 
         if sparsity_ratio > 0:
             # ===== Prune =====
-            colsums = self._merge_colsum(colsums, image_grid_thw)
-            token_indices = self._prune_tokens(colsums, sparsity_ratio=sparsity_ratio)
+            deepstack_colsums, vision_colsums = self._merge_colsum(colsums)
+            vision_token_indices = self._prune_tokens(vision_colsums, sparsity_ratio=sparsity_ratio)
+            deepstack_token_indices = []
+            for i in range(len(deepstack_colsums)):
+                deepstack_token_indices.append(self._prune_tokens(deepstack_colsums[i], sparsity_ratio=sparsity_ratio))
 
             # Prune image embeddings
             image_embeds, deepstack_image_embeds = self._prune_embeddings(
-                image_embeds, deepstack_image_embeds, image_grid_thw, token_indices
+                image_embeds, deepstack_image_embeds, image_grid_thw, vision_token_indices, deepstack_token_indices
             )
 
             # Reconstruct position IDs for pruned image tokens
             position_ids, rope_deltas, keep_mask = self._get_pruned_rope_index(
-                input_ids, image_grid_thw, token_indices, rope_mode=rope_mode
+                input_ids, image_grid_thw, vision_token_indices, rope_mode=rope_mode
             )
-            # position_ids = position_ids[:, :, token_indices]
 
             # Prune input_ids using keep_mask and recompute embeddings
             input_ids = input_ids[keep_mask].view(batch_size, -1)
