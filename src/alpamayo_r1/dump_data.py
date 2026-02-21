@@ -27,11 +27,13 @@ import json
 import logging
 import os
 import random
+import shutil
 import time
 
 import numpy as np
 import torch
 import torch.distributed as dist
+from tqdm import tqdm
 
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
@@ -42,6 +44,11 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _is_rank0():
+    """True only on rank 0 (or when not in distributed)."""
+    return int(os.environ.get("RANK", 0)) == 0
 
 
 def load_model(args, device=None):
@@ -122,10 +129,9 @@ def create_sliding_window_inputs(
 
 
 @torch.inference_mode()
-def run_inference(args, model, sliding_window_inputs, device=None):
+def run_inference(args, model, tokenizer, sliding_window_inputs, device=None, save_path=None):
     if device is None:
         device = torch.device("cuda")
-    clip_data_list = []
 
     for i in range(len(sliding_window_inputs)):
         model_inputs = sliding_window_inputs[i]
@@ -140,39 +146,112 @@ def run_inference(args, model, sliding_window_inputs, device=None):
             )
         all_cots = extra["cot"][0][0].tolist()
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
-        clip_data_list.append({
-            "timestamp": model_inputs["timestamp"],
-            "all_cots": all_cots,
-            "min_ade": float(min_ade),
-            "best_cot": all_cots[min_ade_idx],
-        })
+        best_cot = all_cots[min_ade_idx]
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    out_path = os.path.join(args.output_dir, f"{args.clip_id}.json")
-    with open(out_path, "w") as f:
-        json.dump(clip_data_list, f, indent=2)
-    logger.info("Results saved to %s", out_path)
+        if _is_rank0():
+            logger.info(f"MinADE: {min_ade}, Best cot: {best_cot}")
+
+        # Tokenize best_cot and store separately (concatenation deferred to dataset/forward)
+        cot_token_ids = tokenizer.encode(best_cot, add_special_tokens=False)
+        cot_end_id = tokenizer.encode("<|cot_end|>", add_special_tokens=False)
+        eos_id = tokenizer.encode("<|endoftext|>", add_special_tokens=False)
+        cot_tokens = torch.tensor(cot_token_ids + cot_end_id + eos_id, dtype=torch.long)
+        sliding_window_inputs[i]["output_token_ids"] = cot_tokens
+
+    # Save sliding_window_inputs (with output_token_ids/cot) to save_path or output_dir/clip_id
+    if save_path is not None:
+        out_path = save_path
+    else:
+        out_dir = os.path.join(args.output_dir, args.clip_id)
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "sliding_window_inputs.pt")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    torch.save(sliding_window_inputs, out_path)
+    if _is_rank0():
+        logger.info("Saved sliding_window_inputs (with cot) to %s", out_path)
 
 
 def load_sliding_window_inputs_from_dump(dumped_inputs_dir: str, clip_id: str):
-    """Load pre-dumped sliding_window_inputs from dumped_inputs_dir/<clip_id>/sliding_window_inputs.pt."""
+    """Load pre-dumped sliding_window_inputs from dumped_inputs_dir/<clip_id>/sliding_window_inputs.pt.
+    Returns None if file missing or load fails (e.g. corrupt/truncated on MooseFS).
+    """
     path = os.path.join(dumped_inputs_dir, clip_id, "sliding_window_inputs.pt")
     if not os.path.isfile(path):
         return None
-    return torch.load(path, map_location="cpu", weights_only=True)
+    try:
+        # weights_only=False: dump contains BatchFeature (tokenized_data), trusted source
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as e:
+        rank = int(os.environ.get("RANK", 0))
+        logger.warning("Rank %s: Failed to load %s: %s (skip clip, deleting)", rank, path, e)
+        clip_dir = os.path.join(dumped_inputs_dir, clip_id)
+        # Safety: only delete if clip_dir is strictly inside dumped_inputs_dir (never the root)
+        try:
+            real_dump = os.path.realpath(dumped_inputs_dir)
+            real_clip = os.path.realpath(clip_dir)
+            if real_clip != real_dump and real_clip.startswith(real_dump + os.sep) and os.path.isdir(clip_dir):
+                shutil.rmtree(clip_dir)
+        except OSError as err:
+            logger.warning("Rank %s: Failed to delete %s: %s", rank, clip_dir, err)
+        return None
+
+
+def discover_clip_ids_from_dump(dumped_inputs_dir: str):
+    """Discover clip IDs by listing subdirs that contain sliding_window_inputs.pt."""
+    if not os.path.isdir(dumped_inputs_dir):
+        return []
+    out = []
+    for name in os.listdir(dumped_inputs_dir):
+        subdir = os.path.join(dumped_inputs_dir, name)
+        if os.path.isdir(subdir) and os.path.isfile(os.path.join(subdir, "sliding_window_inputs.pt")):
+            out.append(name)
+    return sorted(out)
+
+
+def has_complete_output_token_ids(sliding_window_inputs):
+    """Check if all windows have non-empty output_token_ids.
+    
+    Returns True if all windows have 'output_token_ids' key and each tensor has length > 0.
+    Returns False otherwise.
+    """
+    if not sliding_window_inputs:
+        return False
+    for window_input in sliding_window_inputs:
+        if "output_token_ids" not in window_input:
+            return False
+        output_tokens = window_input["output_token_ids"]
+        # Check if it's a tensor and has non-zero length
+        if not isinstance(output_tokens, torch.Tensor):
+            return False
+        if output_tokens.numel() == 0:
+            return False
+    return True
 
 
 def dump_data(args, model, processor, device=None):
+    """Process and dump data for a clip. Returns True if successfully dumped, False otherwise."""
     if device is None:
         device = torch.device("cuda")
     clip_id = args.clip_id
     sliding_window_inputs = None
+    loaded_from_dump = False
     if getattr(args, "dumped_inputs_dir", None):
         sliding_window_inputs = load_sliding_window_inputs_from_dump(args.dumped_inputs_dir, clip_id)
         if sliding_window_inputs is not None:
-            logger.info("Loaded %s windows from dump for clip_id: %s", len(sliding_window_inputs), clip_id)
+            if _is_rank0():
+                logger.info("Loaded %s windows from dump for clip_id: %s", len(sliding_window_inputs), clip_id)
+            loaded_from_dump = True
+            # Check if already has complete output_token_ids
+            if has_complete_output_token_ids(sliding_window_inputs):
+                if _is_rank0():
+                    logger.info("Clip %s already has complete output_token_ids, skipping inference", clip_id)
+                return True  # Already complete, count as successful
+        elif sliding_window_inputs is None:
+            # Load failed (missing or corrupt): already logged in load_sliding_window_inputs_from_dump
+            return False
     if sliding_window_inputs is None:
-        logger.info("Creating sliding window inputs for clip_id: %s", clip_id)
+        if _is_rank0():
+            logger.info("Creating sliding window inputs for clip_id: %s", clip_id)
         sliding_window_inputs = create_sliding_window_inputs(
             processor=processor,
             num_windows=args.num_steps,
@@ -180,9 +259,23 @@ def dump_data(args, model, processor, device=None):
             t0_us=args.t0_us,
             time_step_us=args.time_step_us,
         )
-        logger.info("Created %s windows", len(sliding_window_inputs))
-    run_inference(args, model, sliding_window_inputs, device=device)
-    logger.info("Completed compile inference for %s", clip_id)
+        if _is_rank0():
+            logger.info("Created %s windows", len(sliding_window_inputs))
+    # Default: when loaded from dump, save back to same path (overwrite with cot added)
+    save_path = (
+        os.path.join(args.dumped_inputs_dir, clip_id, "sliding_window_inputs.pt")
+        if loaded_from_dump
+        else None
+    )
+    try:
+        run_inference(args, model, model.tokenizer, sliding_window_inputs, device=device, save_path=save_path)
+        if _is_rank0():
+            logger.info("Completed compile inference for %s", clip_id)
+        return True
+    except Exception as e:
+        if _is_rank0():
+            logger.error("Failed to dump clip %s: %s", clip_id, e)
+        return False
 
 
 def setup_distributed():
@@ -209,40 +302,62 @@ if __name__ == "__main__":
         "--clip_ids_file",
         type=str,
         default=None,
-        help="JSON file with list of clip IDs; use with torchrun for distributed (each rank runs a subset).",
+        help="JSON file with list of clip IDs (optional). If omitted, clip IDs are discovered from --dumped_inputs_dir.",
     )
     parser.add_argument(
         "--dumped_inputs_dir",
         type=str,
-        default=None,
-        help="If set, load sliding_window_inputs from this dir (output of dump_sliding_window_inputs.py) instead of creating from dataset.",
+        default="/mnt/moosefs-1/users/zekail/dumped_inputs",
+        help="Dir to load sliding_window_inputs from (output of dump_sliding_window_inputs.py). Default: MooseFS path.",
     )
     args = parser.parse_args()
 
     rank, world_size, local_rank, device = setup_distributed()
 
-    if args.clip_ids_file:
-        # Distributed: each rank processes clip_ids[rank], clip_ids[rank+world_size], ...
-        with open(args.clip_ids_file) as f:
-            all_clip_ids = json.load(f)
-        my_clip_ids = all_clip_ids[rank::world_size]
-        logger.info(
-            "Rank %s/%s: processing %s clips (total %s)",
-            rank,
-            world_size,
-            len(my_clip_ids),
-            len(all_clip_ids),
-        )
-        model, processor = load_model(args, device=device)
-        for i, clip_id in enumerate(my_clip_ids):
-            args.clip_id = clip_id
-            logger.info("Rank %s: clip %s/%s %s", rank, i + 1, len(my_clip_ids), clip_id)
-            dump_data(args, model, processor, device=device)
-        if dist.is_initialized():
-            dist.destroy_process_group()
-    elif args.clip_id:
+    if args.clip_id:
         # Single-clip run
         model, processor = load_model(args, device=device)
-        dump_data(args, model, processor, device=device)
+        success = dump_data(args, model, processor, device=device)
+        if _is_rank0():
+            if success:
+                logger.info("Successfully dumped 1 clip")
+            else:
+                logger.info("Failed to dump clip")
     else:
-        raise SystemExit("Provide either --clip_id (single) or --clip_ids_file (distributed with torchrun).")
+        # Distributed: need list of clip IDs from file or from dumped_inputs_dir
+        if args.clip_ids_file:
+            with open(args.clip_ids_file) as f:
+                all_clip_ids = json.load(f)
+        else:
+            all_clip_ids = discover_clip_ids_from_dump(args.dumped_inputs_dir)
+            if not all_clip_ids:
+                raise SystemExit(
+                    f"No clips found in {args.dumped_inputs_dir} "
+                    "(expected subdirs with sliding_window_inputs.pt). "
+                    "Or provide --clip_ids_file or --clip_id."
+                )
+            logger.info("Discovered %s clips from %s", len(all_clip_ids), args.dumped_inputs_dir)
+        my_clip_ids = all_clip_ids[rank::world_size]
+        if _is_rank0():
+            logger.info(
+                "Rank %s/%s: processing %s clips (total %s)",
+                rank,
+                world_size,
+                len(my_clip_ids),
+                len(all_clip_ids),
+            )
+        model, processor = load_model(args, device=device)
+        successful_dumps = 0
+        for clip_id in tqdm(my_clip_ids, desc="Clips", disable=not _is_rank0()):
+            args.clip_id = clip_id
+            if dump_data(args, model, processor, device=device):
+                successful_dumps += 1
+        if _is_rank0():
+            logger.info("Rank %s: Successfully dumped %s/%s clips", rank, successful_dumps, len(my_clip_ids))
+        if dist.is_initialized():
+            # Aggregate counts across all ranks
+            count_tensor = torch.tensor(successful_dumps, dtype=torch.int32, device=device)
+            dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+            if _is_rank0():
+                logger.info("Total successfully dumped across all ranks: %s/%s clips", count_tensor.item(), len(all_clip_ids))
+            dist.destroy_process_group()

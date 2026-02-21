@@ -4,17 +4,18 @@ from typing import Callable
 # =============================================================================
 # Streaming Attention Mask Utilities
 # =============================================================================
-
 def create_streaming_attention_mask_sdpa(
     batch_size: int,
     cache_position: torch.Tensor,
     kv_length: int,
     vision_start_end_ids_ranges: list[list[tuple[int, int]]],
     traj_and_text_ids_range: tuple[int, int],
+    valid_length: int,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
+
     Create 4D attention mask for streaming VLM using SDPA.
 
     Query structure: [V0_F3] + [V1_F3] + [V2_F3] + [V3_F3] + [Traj+Text]
@@ -35,115 +36,6 @@ def create_streaming_attention_mask_sdpa(
     V2_F3            |  ■  |  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■ ◣ |  □  □  □  □|     □     |
     V3_F3            |  ■  |  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■ ◣ |     □     |
     Traj+Text        |  ■  |  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■  ■|     ◣     |
-
-    Args:
-        batch_size: Batch size
-        cache_position: Query positions in the full sequence [query_length]
-        kv_length: Total KV cache length
-        vision_start_end_ids_ranges: Ranges for each view's frames, shape [num_views][num_frames_per_view]
-            Each element is (start, end) tuple covering vision_start to vision_end tokens
-        traj_and_text_ids_range: (start, end) range for trajectory and text tokens
-        device: Device to create mask on
-        dtype: Data type for the mask (typically float32 or bfloat16)
-
-    Returns:
-        attention_mask: [batch_size, 1, query_length, kv_length]
-            Values are 0 for attend, -inf for masked
-    """
-    num_views = len(vision_start_end_ids_ranges)
-    query_length = cache_position.shape[0]
-
-    # Initialize with -inf (all masked)
-    min_val = torch.finfo(dtype).min
-    attention_mask = torch.full(
-        (batch_size, 1, query_length, kv_length),
-        min_val,
-        dtype=dtype,
-        device=device,
-    )
-
-    # Compute view KV ranges (covering all frames for each view)
-    view_kv_ranges = []
-    for view_idx in range(num_views):
-        view_start = vision_start_end_ids_ranges[view_idx][0][0]   # First frame start
-        view_end = vision_start_end_ids_ranges[view_idx][-1][1]    # Last frame end
-        view_kv_ranges.append((view_start, view_end))
-
-    # System tokens: from position 0 to first view start
-    system_end = view_kv_ranges[0][0]
-
-    # Track query offset as we iterate through views
-    q_offset = 0
-
-    # Process each view's F3 (last frame) tokens in query
-    for view_idx in range(num_views):
-        last_frame_start, last_frame_end = vision_start_end_ids_ranges[view_idx][-1]
-        frame_length = last_frame_end - last_frame_start
-
-        # Query indices for this view's F3
-        q_start = q_offset
-        q_end = q_offset + frame_length
-
-        # 1. Can attend to System tokens
-        attention_mask[:, :, q_start:q_end, :system_end] = 0
-
-        # 2. Can attend to all frames of View_0 to View_{view_idx-1}
-        for prev_view_idx in range(view_idx):
-            prev_start, prev_end = view_kv_ranges[prev_view_idx]
-            attention_mask[:, :, q_start:q_end, prev_start:prev_end] = 0
-
-        # 3. Can attend to own view's F0, F1, F2 fully
-        num_frames = len(vision_start_end_ids_ranges[view_idx])
-        for frame_idx in range(num_frames - 1):  # All frames except last (F3)
-            f_start, f_end = vision_start_end_ids_ranges[view_idx][frame_idx]
-            attention_mask[:, :, q_start:q_end, f_start:f_end] = 0
-
-        # 4. Causal attention within F3 (own last frame)
-        # Each token in F3 can only see itself and previous tokens within F3
-        for q_local_idx in range(frame_length):
-            q_idx = q_start + q_local_idx
-            kv_causal_end = last_frame_start + q_local_idx + 1
-            attention_mask[:, :, q_idx, last_frame_start:kv_causal_end] = 0
-
-        q_offset = q_end
-
-    # Process Traj+Text tokens in query
-    traj_start_kv, traj_end_kv = traj_and_text_ids_range
-    traj_length = traj_end_kv - traj_start_kv
-
-    q_start = q_offset
-    q_end = q_offset + traj_length
-
-    # 1. Can attend to System tokens
-    attention_mask[:, :, q_start:q_end, :system_end] = 0
-
-    # 2. Can attend to all views (all frames)
-    for view_idx in range(num_views):
-        view_start, view_end = view_kv_ranges[view_idx]
-        attention_mask[:, :, q_start:q_end, view_start:view_end] = 0
-
-    # 3. Causal attention within Traj+Text
-    for q_local_idx in range(traj_length):
-        q_idx = q_start + q_local_idx
-        kv_causal_end = traj_start_kv + q_local_idx + 1
-        attention_mask[:, :, q_idx, traj_start_kv:kv_causal_end] = 0
-
-    return attention_mask
-
-
-def create_streaming_attention_mask_sdpa_optimized(
-    batch_size: int,
-    cache_position: torch.Tensor,
-    kv_length: int,
-    vision_start_end_ids_ranges: list[list[tuple[int, int]]],
-    traj_and_text_ids_range: tuple[int, int],
-    valid_length: int,
-    device: torch.device,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """
-    Optimized version using vectorized operations instead of loops.
-    Same functionality as create_streaming_attention_mask_sdpa but faster for large sequences.
 
     Args:
         batch_size: Batch size
@@ -246,6 +138,101 @@ def create_streaming_attention_mask_sdpa_optimized(
     # Mask padding positions: all KV positions >= valid_length should be masked
     if valid_length < kv_length:
         attention_mask[:, :, :, valid_length:] = min_val
+
+    return attention_mask
+
+
+def create_streaming_attention_mask_sdpa_training(
+    batch_size: int,
+    cache_position: torch.Tensor,
+    kv_length: int,
+    vision_start_end_ids_ranges: list[list[tuple[int, int]]],
+    traj_and_text_ids_range: tuple[int, int],
+    output_ids_range: tuple[int, int],
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    Create streaming attention mask for training with output tokens appended to input.
+
+    Compared to `create_streaming_attention_mask_sdpa`, this function additionally
+    handles output tokens in query by using `cache_position` directly:
+    - query positions inside `output_ids_range` can attend all non-output KV tokens
+    - output-token attention is causal in absolute KV positions
+
+    Visual representation (■ = attend, □ = masked, ◣ = causal):
+
+                  KV: | Sys | V0_Frames | V1_Frames | V2_Frames | V3_Frames | Traj+Text | Output |
+    Query:           |     | F0 F1 F2 F3| F0 F1 F2 F3| F0 F1 F2 F3| F0 F1 F2 F3|           |        |
+    -----------------|-----|-----------|-----------|-----------|-----------|-----------|--------|
+    V0_F3            |  ■  |  ■  ■  ■ ◣ |  □  □  □  □|  □  □  □  □|  □  □  □  □|     □     |   □    |
+    V1_F3            |  ■  |  ■  ■  ■  ■|  ■  ■  ■ ◣ |  □  □  □  □|  □  □  □  □|     □     |   □    |
+    V2_F3            |  ■  |  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■ ◣ |  □  □  □  □|     □     |   □    |
+    V3_F3            |  ■  |  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■ ◣ |     □     |   □    |
+    Traj+Text        |  ■  |  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■  ■|     ◣     |   □    |
+    Output           |  ■  |  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■  ■|  ■  ■  ■  ■|     ■     |   ◣    |
+
+    The Output row can attend to ALL non-output KV tokens (Sys, Views, Traj+Text)
+    fully, and is causal within its own Output segment.
+    """
+    output_start_kv, output_end_kv = output_ids_range
+
+    attention_mask = create_streaming_attention_mask_sdpa(
+        batch_size=batch_size,
+        cache_position=cache_position,
+        kv_length=kv_length,
+        vision_start_end_ids_ranges=vision_start_end_ids_ranges,
+        traj_and_text_ids_range=traj_and_text_ids_range,
+        valid_length=output_start_kv,
+        device=device,
+        dtype=dtype,
+    )
+    if output_start_kv < 0 or output_end_kv > kv_length or output_start_kv > output_end_kv:
+        raise ValueError(
+            f"Invalid output_ids_range={output_ids_range} for kv_length={kv_length}."
+        )
+
+    output_length = output_end_kv - output_start_kv
+    if output_length == 0:
+        return attention_mask
+
+    min_val = torch.finfo(dtype).min
+    zero = torch.tensor(0.0, dtype=dtype, device=device)
+    neg_inf = torch.tensor(min_val, dtype=dtype, device=device)
+
+    # Locate output queries by absolute positions from cache_position.
+    output_query_mask = (cache_position >= output_start_kv) & (cache_position < output_end_kv)
+    if not output_query_mask.any():
+        # No output query token in this call; base streaming mask is sufficient.
+        return attention_mask
+
+    output_query_indices = torch.where(output_query_mask)[0]
+    output_query_positions = cache_position[output_query_indices]
+
+    # Reset output query rows first.
+    attention_mask[:, :, output_query_indices, :] = min_val
+
+    kv_positions = torch.arange(kv_length, device=device)
+    # All non-output KV tokens are visible.
+    non_output_kv_indices = torch.where(
+        (kv_positions < output_start_kv) | (kv_positions >= output_end_kv)
+    )[0]
+    attention_mask[
+        :, :, output_query_indices.unsqueeze(-1), non_output_kv_indices.unsqueeze(0)
+    ] = 0
+
+    # Causal within output segment in absolute KV positions.
+    output_kv_positions = torch.arange(output_start_kv, output_end_kv, device=device)
+    causal_mask = output_kv_positions.unsqueeze(0) <= output_query_positions.unsqueeze(1)
+    attention_mask[:, :, output_query_indices, output_start_kv:output_end_kv] = torch.where(
+        causal_mask.unsqueeze(0).unsqueeze(0),
+        zero,
+        neg_inf,
+    )
+
+    # Keep padding masked.
+    if output_end_kv < kv_length:
+        attention_mask[:, :, :, output_end_kv:] = min_val
 
     return attention_mask
 

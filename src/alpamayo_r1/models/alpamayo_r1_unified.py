@@ -60,9 +60,7 @@ from alpamayo_r1.models.token_utils import (
     replace_padding_after_eos,
     to_special_token,
 )
-from alpamayo_r1.models.streaming_masking_utils import (
-    create_streaming_attention_mask_sdpa_optimized,
-)
+from alpamayo_r1.models.streaming_masking_utils import create_streaming_attention_mask_sdpa
 
 logger = logging.getLogger(__name__)
 if not logging.getLogger().handlers:
@@ -251,7 +249,7 @@ class AlpamayoR1(ReasoningVLA):
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         """Create streaming attention mask for non-first prefill."""
-        return create_streaming_attention_mask_sdpa_optimized(
+        return create_streaming_attention_mask_sdpa(
             batch_size=1,
             cache_position=cache_position,
             kv_length=self.max_cache_len,

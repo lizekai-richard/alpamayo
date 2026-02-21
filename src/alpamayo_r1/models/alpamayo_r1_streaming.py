@@ -24,7 +24,7 @@ import torch
 from transformers import AutoConfig, AutoModel, StoppingCriteriaList
 from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 from alpamayo_r1.action_space import ActionSpace
-from alpamayo_r1.models.streaming_model import ReasoningVLA
+from alpamayo_r1.models.base_model import ReasoningVLA
 from alpamayo_r1.config import AlpamayoR1Config
 from alpamayo_r1.diffusion.base import BaseDiffusion
 from alpamayo_r1.models.token_utils import (
@@ -33,10 +33,8 @@ from alpamayo_r1.models.token_utils import (
     replace_padding_after_eos,
     to_special_token,
 )
-from transformers import StaticCache
-from alpamayo_r1.models.streaming_masking_utils import (
-    create_streaming_attention_mask_sdpa_optimized,
-)
+from alpamayo_r1.models.patches import StaticCache
+from alpamayo_r1.models.streaming_masking_utils import create_streaming_attention_mask_sdpa
 
 # Check Flex Attention availability
 FLEX_ATTENTION_AVAILABLE = False
@@ -131,13 +129,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         self.post_init()
 
-        self.max_cache_len = 3006 + 256
-        self.past_key_values = StaticCache(
-            config=self.vlm.config,
-            max_cache_len=self.max_cache_len,
-            offloading=False
-        )
-
         self._cached_position_ids = None
         self._cached_attention_mask = None
         self._cached_streaming_attention_mask = None
@@ -145,17 +136,9 @@ class StreamingAlpamayoR1(ReasoningVLA):
         self.vision_start_end_ids_ranges = None
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
-        self.num_image_tokens_per_frame = 180
-        self.num_image_tokens_per_view = 180 * 4
         self.num_views = 4
         self.num_frames_per_view = 4
-        self.prefill_seq_length = 3006
         self.is_first_prefill = True
-
-        self._use_flex_attention = False  # Set to True to use Flex Attention
-    
-    def _set_processor(self, processor):
-        self.processor = processor
     
     def _retrieve_streaming_related_inputs(self, input_ids):
         """
@@ -199,7 +182,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         return vision_start_end_ids_ranges, image_token_ids_ranges, traj_and_text_ids_range
     
-    def _update_past_key_values(self, vision_start_end_ids_ranges, image_token_ids_ranges, traj_and_text_ids_range):
+    def _update_past_key_values(self):
         """Update the past key values.
             For each view, shift the the last three frames to the left and keep one dummy frame buffer
             Discard all trajectory and text tokens
@@ -210,11 +193,11 @@ class StreamingAlpamayoR1(ReasoningVLA):
             value_cache = layers.values
 
             for i in range(self.num_views):
-                new_kv_start = vision_start_end_ids_ranges[i][0][0]  # first frame vision start
-                new_kv_end = vision_start_end_ids_ranges[i][-2][1]  # third frame vision end
+                new_kv_start = self.vision_start_end_ids_ranges[i][0][0]  # first frame vision start
+                new_kv_end = self.vision_start_end_ids_ranges[i][-2][1]  # third frame vision end
 
-                old_kv_start = vision_start_end_ids_ranges[i][1][0]  # second frame vision start
-                old_kv_end = vision_start_end_ids_ranges[i][-1][1]  # fourth frame vision end
+                old_kv_start = self.vision_start_end_ids_ranges[i][1][0]  # second frame vision start
+                old_kv_end = self.vision_start_end_ids_ranges[i][-1][1]  # fourth frame vision end
 
                 key_cache[:, :, new_kv_start:new_kv_end, :].copy_(key_cache[:, :, old_kv_start:old_kv_end, :].clone())
                 value_cache[:, :, new_kv_start:new_kv_end, :].copy_(value_cache[:, :, old_kv_start:old_kv_end, :].clone())
@@ -235,20 +218,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
             cache_position.append(torch.arange(traj_and_text_ids_range[0], traj_and_text_ids_range[1]))
             cache_position = torch.cat(cache_position, dim=0)
         return cache_position
-
-    def _get_streaming_mask_config_key(
-        self,
-        kv_length: int,
-        vision_start_end_ids_ranges: list[list[tuple[int, int]]],
-        traj_and_text_ids_range: tuple[int, int],
-    ) -> tuple:
-        """Generate a unique key for the streaming mask configuration."""
-        # Convert vision_start_end_ids_ranges to a hashable format
-        vision_ranges_tuple = tuple(
-            tuple(frame_range for frame_range in view_ranges)
-            for view_ranges in vision_start_end_ids_ranges
-        )
-        return (kv_length, vision_ranges_tuple, traj_and_text_ids_range)
 
     def _get_streaming_attention_mask(
         self,
@@ -287,7 +256,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # Create SDPA mask with kv_length=max_cache_len
         # valid_length controls which positions are actual content vs padding
-        streaming_attention_mask = create_streaming_attention_mask_sdpa_optimized(
+        streaming_attention_mask = create_streaming_attention_mask_sdpa(
             batch_size=1,
             cache_position=cache_position,
             kv_length=self.max_cache_len,
@@ -298,19 +267,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
             dtype=dtype,
         )
 
-        # Optionally create Flex Attention BlockMask
-        if use_flex and FLEX_ATTENTION_AVAILABLE:
-            # TODO: Add valid_length support to Flex mask creation
-            streaming_attention_mask = create_streaming_attention_mask_flex(
-                batch_size=1,
-                cache_position=cache_position,
-                kv_length=self.max_cache_len,
-                vision_start_end_ids_ranges=vision_start_end_ids_ranges,
-                traj_and_text_ids_range=traj_and_text_ids_range,
-                device=device,
-            )
-        
-        self._cached_streaming_attention_mask = streaming_attention_mask
         return streaming_attention_mask
 
     def crop_static_cache(self, valid_length: int):
@@ -329,7 +285,18 @@ class StreamingAlpamayoR1(ReasoningVLA):
                 layer.keys[:, :, valid_length:, :].zero_()
                 layer.values[:, :, valid_length:, :].zero_()
     
-    def _prefill_prefill_inputs(self, input_ids, attention_mask, image_grid_thw, device):
+    def _prepare_inputs_for_prefill(self, input_ids, attention_mask, image_grid_thw, max_generation_length, device):
+        if self.is_first_prefill:
+            max_cache_len = input_ids.shape[1] + max_generation_length + self.num_action_tokens
+            self.max_cache_len = max_cache_len
+            self.prefill_seq_length = input_ids.shape[1]
+            if not hasattr(self, "past_key_values"):
+                self.past_key_values = StaticCache(
+                    config=self.vlm.config,
+                    max_cache_len=max_cache_len,
+                    offloading=False
+                )
+
         if not self.is_first_prefill:
             vision_start_token_ids = self.processor.tokenizer.encode("<|vision_start|>")[0]
             first_vision_start_token_id = torch.where(input_ids == vision_start_token_ids)[1][0].item()
@@ -342,7 +309,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         )
         cache_position = cache_position.to(input_ids.device)
 
-        if self._cached_position_ids is None:
+        if not hasattr(self, "_cached_position_ids"):
             position_ids, rope_deltas = self.vlm.model.get_rope_index(input_ids=input_ids, image_grid_thw=image_grid_thw)
             padding_length = self.max_cache_len - self.prefill_seq_length
             if padding_length > 0:
@@ -353,18 +320,14 @@ class StreamingAlpamayoR1(ReasoningVLA):
             self._cached_position_ids = position_ids
             self._cached_rope_deltas = rope_deltas
         
-        if self._cached_attention_mask is None:
+        if not hasattr(self, "_cached_attention_mask"):
             self._cached_attention_mask = attention_mask
         
-        if not self.is_first_prefill:
-            streaming_attention_mask = self._get_streaming_attention_mask(
+        if not self.is_first_prefill and hasattr(self, "_cached_streaming_attention_mask"):
+            self._cached_streaming_attention_mask = self._get_streaming_attention_mask(
                 cache_position=cache_position,
-                vision_start_end_ids_ranges=self.vision_start_end_ids_ranges,
-                traj_and_text_ids_range=self.traj_and_text_ids_range,
                 device=device,
-                use_flex=self._use_flex_attention,
             )
-            self._cached_streaming_attention_mask = streaming_attention_mask
 
         return {
             'input_ids': input_ids,
@@ -374,7 +337,6 @@ class StreamingAlpamayoR1(ReasoningVLA):
             'streaming_attention_mask': self._cached_streaming_attention_mask,
         }
         
-    
     @torch.inference_mode()
     def sample_trajectories_from_data_with_streaming_vlm_rollout(
         self,
@@ -450,7 +412,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             ]
         )
 
-        prefill_inputs = self._prefill_prefill_inputs(input_ids, attention_mask, image_grid_thw, device)
+        prefill_inputs = self._prepare_inputs_for_prefill(input_ids, attention_mask, image_grid_thw, device)
 
         vlm_outputs = self.vlm.generate(
             input_ids=prefill_inputs['input_ids'],

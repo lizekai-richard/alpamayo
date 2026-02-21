@@ -43,7 +43,7 @@ from alpamayo_r1.models.token_utils import (
     to_special_token,
 )
 from alpamayo_r1.models.streaming_masking_utils import (
-    create_streaming_attention_mask_sdpa_optimized,
+    create_streaming_attention_mask_sdpa,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,7 +227,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         """Create streaming attention mask for non-first prefill."""
-        return create_streaming_attention_mask_sdpa_optimized(
+        return create_streaming_attention_mask_sdpa(
             batch_size=1,
             cache_position=cache_position,
             kv_length=self.max_cache_len,
