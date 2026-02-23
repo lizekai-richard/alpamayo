@@ -6,25 +6,26 @@ model_path: ./Alpamayo-R1-10B
 data_dir: data
 clip_list: clips_for_train.json
 shuffle: true
-min_rollout_steps: 1
-max_rollout_steps: 10
-samples_per_clip: 5
+min_rollout_steps: 4
+max_rollout_steps: 8
+samples_per_clip: 200
+num_workers: 4
 
 # Eval data
-eval_data_dir: null
+eval_data_dir: /mnt/moosefs-1/users/zekail/dumped_inputs
 eval_clip_list: clips_for_eval.json
 
 # Optimization
-lr: 1.0e-4
-weight_decay: 0.01
+lr: 5.0e-5
+weight_decay: 0.0001
 adam_beta1: 0.9
 adam_beta2: 0.999
 adam_epsilon: 1.0e-8
 max_grad_norm: 1.0
 
 # Schedule
-num_epochs: 1
-warmup_steps: 100
+num_epochs: 5
+warmup_steps: 200
 lr_scheduler_type: cosine
 
 # Batching
@@ -32,18 +33,18 @@ gradient_accumulation_steps: 1
 
 # Eval
 eval_every_n_steps: 500
-eval_steps: null
+eval_steps: 1
 
 # Checkpointing
 output_dir: checkpoints
-save_every_n_steps: 500
+save_every_n_steps: 1000
 save_total_limit: 3
-resume_from_checkpoint: null
+resume_from_checkpoint: checkpoints/checkpoint-3000
 
 # Logging
 log_every_n_steps: 10
-wandb_project: null
-wandb_run_name: null
+wandb_project: alpamayo-r1
+wandb_run_name: streaming_train_vlm
 wandb_entity: null
 
 # Rollout
@@ -51,9 +52,3 @@ rollout_top_p: 0.98
 rollout_temperature: 0.6
 rollout_num_traj_samples: 1
 rollout_max_generation_length: 256
-
-# FSDP
-use_fsdp: false
-fsdp_sharding_strategy: FULL_SHARD
-fsdp_auto_wrap_min_params: 1000000
-fsdp_cpu_offload: false

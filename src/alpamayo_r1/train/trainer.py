@@ -3,22 +3,15 @@ import math
 import os
 import shutil
 from dataclasses import dataclass
-from functools import partial
 from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import (
-    FullStateDictConfig,
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    ShardingStrategy,
-    StateDictType,
-)
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from alpamayo_r1 import helper
+from alpamayo_r1.train.patches import patch_for_training
 
 logger = logging.getLogger(__name__)
 
@@ -66,13 +59,8 @@ class TrainerConfig:
     rollout_num_traj_samples: int = 1
     rollout_max_generation_length: int = 256
 
-    # FSDP
-    use_fsdp: bool = False
-    fsdp_sharding_strategy: str = "FULL_SHARD"  # FULL_SHARD / SHARD_GRAD_OP / NO_SHARD
-    fsdp_auto_wrap_min_params: int = 1_000_000
-    fsdp_cpu_offload: bool = False
-    fsdp_backward_prefetch: str = "BACKWARD_PRE"  # BACKWARD_PRE / BACKWARD_POST
-    fsdp_sync_module_states: bool = True
+    # Distributed
+    distributed: bool = False
 
 
 # Parameter names that should not receive weight decay
@@ -144,20 +132,28 @@ class Trainer:
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
 
-        # Distributed / FSDP setup
-        self.is_fsdp = config.use_fsdp
-        if self.is_fsdp:
+        # Patch model classes for streaming training
+        patch_for_training(model)
+
+        # Distributed setup
+        self.is_distributed = config.distributed
+        if self.is_distributed:
             self.rank = dist.get_rank()
             self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self.world_size = dist.get_world_size()
             self.device = torch.device("cuda", self.local_rank)
-            self.model = self._setup_fsdp(model)
+            model = model.to(self.device)
+            self.model = DDP(model, device_ids=[self.local_rank])
+            logger.info(f"DDP initialized: rank={self.rank}, local_rank={self.local_rank}, world_size={self.world_size}")
         else:
             self.rank = 0
             self.local_rank = 0
+            self.world_size = 1
             self.device = torch.device("cuda")
+            model = model.to(self.device)
             self.model = model
 
-        # Optimizer (must be created after FSDP wrapping)
+        # Optimizer
         param_groups = _get_parameter_groups(self.model, config.weight_decay)
         self.optimizer = torch.optim.AdamW(
             param_groups,
@@ -186,47 +182,10 @@ class Trainer:
     def _is_main_process(self) -> bool:
         return self.rank == 0
 
-    def _setup_fsdp(self, model: torch.nn.Module) -> FSDP:
-        sharding_map = {
-            "FULL_SHARD": ShardingStrategy.FULL_SHARD,
-            "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
-            "NO_SHARD": ShardingStrategy.NO_SHARD,
-        }
-        sharding_strategy = sharding_map[self.config.fsdp_sharding_strategy]
-
-        from torch.distributed.fsdp import BackwardPrefetch, CPUOffload
-        prefetch_map = {
-            "BACKWARD_PRE": BackwardPrefetch.BACKWARD_PRE,
-            "BACKWARD_POST": BackwardPrefetch.BACKWARD_POST,
-        }
-        backward_prefetch = prefetch_map[self.config.fsdp_backward_prefetch]
-
-        mp_policy = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        )
-
-        auto_wrap_policy = partial(
-            size_based_auto_wrap_policy,
-            min_num_params=self.config.fsdp_auto_wrap_min_params,
-        )
-
-        wrapped = FSDP(
-            model,
-            sharding_strategy=sharding_strategy,
-            cpu_offload=CPUOffload(offload_params=self.config.fsdp_cpu_offload),
-            auto_wrap_policy=auto_wrap_policy,
-            backward_prefetch=backward_prefetch,
-            mixed_precision=mp_policy,
-            device_id=self.local_rank,
-            sync_module_states=self.config.fsdp_sync_module_states,
-        )
-        logger.info(
-            f"FSDP initialized: sharding={self.config.fsdp_sharding_strategy}, "
-            f"rank={self.rank}, local_rank={self.local_rank}"
-        )
-        return wrapped
+    @property
+    def _unwrapped_model(self):
+        """Get the underlying model (unwrap DDP if needed)."""
+        return self.model.module if self.is_distributed else self.model
 
     # ------------------------------------------------------------------
     # Training
@@ -243,9 +202,9 @@ class Trainer:
         for epoch in range(start_epoch, self.config.num_epochs):
             self.epoch = epoch
             logger.info(f"Starting epoch {epoch}")
-            # Update sampler epoch for proper shuffling across ranks
-            if self.is_fsdp and hasattr(self.train_dataloader.sampler, "set_epoch"):
-                self.train_dataloader.sampler.set_epoch(epoch)
+            # Reshuffle clip order for the new epoch
+            if hasattr(self.train_dataloader.dataset, "set_epoch"):
+                self.train_dataloader.dataset.set_epoch(epoch)
             self.model.train()
 
             accum_loss = 0.0
@@ -273,6 +232,7 @@ class Trainer:
                             "train/loss": avg_loss,
                             "train/learning_rate": self.scheduler.get_last_lr()[0],
                             "train/epoch": epoch,
+                            "train/rollout_steps": getattr(self, "_last_rollout_steps", 0),
                         }
                         self._log(metrics, self.global_step)
                         accum_loss = 0.0
@@ -284,11 +244,6 @@ class Trainer:
                     ):
                         eval_metrics = self._evaluate()
                         self._log(eval_metrics, self.global_step)
-                        eval_score = eval_metrics.get("eval/min_ade", float("inf"))
-                        is_best = eval_score < self.best_eval_loss
-                        if is_best:
-                            self.best_eval_loss = eval_score
-                        self._save_checkpoint(is_best=is_best)
                         self.model.train()
 
                     if self.global_step % self.config.save_every_n_steps == 0:
@@ -305,78 +260,29 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _training_step(self, batch: list[dict[str, Any]]) -> float:
-        device = self.device
-
-        # Reset streaming state before each batch
-        self.model.reset_streaming_state()
-
-        # Rollout: populate streaming kv cache (no grad)
-        with torch.no_grad():
-            for window in batch[:-1]:
-                self.model.sample_trajectories_from_data_with_streaming_vlm_rollout(
-                    data=helper.to_device(
-                        {
-                            "tokenized_data": {
-                                "input_ids": window["input_ids"],
-                                "attention_mask": window["attention_mask"],
-                                "pixel_values": window["pixel_values"],
-                                "image_grid_thw": window["image_grid_thw"],
-                            },
-                            "ego_history_xyz": window["ego_history_xyz"],
-                            "ego_history_rot": window["ego_history_rot"],
-                            "is_prefill": window["is_prefill"],
-                        },
-                        device,
-                    ),
-                    top_p=self.config.rollout_top_p,
-                    temperature=self.config.rollout_temperature,
-                    num_traj_samples=self.config.rollout_num_traj_samples,
-                    max_generation_length=self.config.rollout_max_generation_length,
-                )
-
-        # Forward on the last window with autocast bf16
-        last = batch[-1]
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            if self.config.training_stage == "vlm":
-                output = self.model._forward_vlm_training(
-                    input_ids=last["input_ids"].to(device),
-                    attention_mask=last["attention_mask"].to(device),
-                    pixel_values=last["pixel_values"].to(device),
-                    image_grid_thw=last["image_grid_thw"].to(device),
-                    ego_history_xyz=last["ego_history_xyz"].to(device),
-                    ego_history_rot=last["ego_history_rot"].to(device),
-                    output_ids_range=last["output_ids_range"],
-                    labels=last["labels"].to(device),
-                )
-                loss = output.loss
-            else:  # expert
-                loss = self.model._forward_expert_training(
-                    input_ids=last["input_ids"].to(device),
-                    attention_mask=last["attention_mask"].to(device),
-                    pixel_values=last["pixel_values"].to(device),
-                    image_grid_thw=last["image_grid_thw"].to(device),
-                    max_new_tokens=self.config.rollout_max_generation_length,
-                    temperature=self.config.rollout_temperature,
-                    top_k=None,
-                    top_p=self.config.rollout_top_p,
-                    ego_history_xyz=last["ego_history_xyz"].to(device),
-                    ego_history_rot=last["ego_history_rot"].to(device),
-                    ego_future_xyz=last["ego_future_xyz"].to(device),
-                    ego_future_rot=last["ego_future_rot"].to(device),
-                )
+            output = self.model(
+                batch=batch,
+                device=self.device,
+                training_stage=self.config.training_stage,
+                max_generation_length=self.config.rollout_max_generation_length,
+                temperature=self.config.rollout_temperature,
+                top_p=self.config.rollout_top_p,
+            )
+            loss = output["loss"]
+
         scaled_loss = loss / self.config.gradient_accumulation_steps
         scaled_loss.backward()
+        # DDP handles gradient allreduce automatically via forward() hooks.
 
+        self._last_rollout_steps = output.get("rollout_steps", 0)
         return loss.detach().item()
 
     def _optimization_step(self):
         if self.config.max_grad_norm > 0:
-            if self.is_fsdp:
-                self.model.clip_grad_norm_(self.config.max_grad_norm)
-            else:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.max_grad_norm
-                )
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.config.max_grad_norm
+            )
         self.optimizer.step()
         self.scheduler.step()
         self.optimizer.zero_grad()
@@ -391,15 +297,9 @@ class Trainer:
         metrics: dict[str, float] = {}
 
         if self._is_main_process:
-            # Under FSDP, consolidate parameters to rank 0 for eval
-            if self.is_fsdp:
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                with FSDP.summon_full_params(self.model):
-                    metrics = self._run_eval_loop()
-            else:
-                metrics = self._run_eval_loop()
+            metrics = self._run_eval_loop()
 
-        if self.is_fsdp:
+        if self.is_distributed:
             dist.barrier()
 
         return metrics
@@ -409,7 +309,7 @@ class Trainer:
         device = self.device
         total_min_ade = 0.0
         n_min_ade = 0
-        all_cot_texts: list[str] = []
+        clip_cot_texts: dict[str, list[str]] = {}  # clip_id -> list of cot texts
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.eval_dataloader):
@@ -419,12 +319,12 @@ class Trainer:
                 ):
                     break
 
-                # Reset streaming state before each eval batch
-                self.model.reset_streaming_state()
+                # Reset streaming state before each clip
+                self._unwrapped_model.reset_streaming_state()
 
-                # Rollout all windows, compute minADE per window
-                for window in batch:
-                    pred_xyz, pred_rot, extra = self.model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+                # Run through the entire clip
+                for i, window in enumerate(batch):
+                    results = self._unwrapped_model.sample_trajectories_from_data_with_streaming_vlm_rollout(
                         data=helper.to_device(
                             {
                                 "tokenized_data": {
@@ -445,13 +345,16 @@ class Trainer:
                         max_generation_length=self.config.rollout_max_generation_length,
                         return_extra=True,
                     )
-                    min_ade, min_ade_idx = _calc_min_ade(
-                        window["ego_future_xyz"].to(device), pred_xyz,
-                    )
-                    best_cot = extra["cot"][0][0][min_ade_idx]
-                    total_min_ade += min_ade
-                    n_min_ade += 1
-                    all_cot_texts.append(best_cot)
+                    if i > 0:
+                        pred_xyz, pred_rot, extra = results
+                        min_ade, min_ade_idx = _calc_min_ade(
+                            window["ego_future_xyz"].to(device), pred_xyz,
+                        )
+                        best_cot = extra["cot"][0][0][min_ade_idx]
+                        total_min_ade += min_ade
+                        n_min_ade += 1
+                        clip_id = window["clip_id"]
+                        clip_cot_texts.setdefault(clip_id, []).append(best_cot)
 
         metrics: dict[str, float] = {}
         if n_min_ade > 0:
@@ -460,8 +363,8 @@ class Trainer:
         parts = [f"{k}: {v:.4f}" for k, v in metrics.items()]
         logger.info(f"Eval: {', '.join(parts)}")
 
-        if all_cot_texts:
-            self._log_cot_table(all_cot_texts, self.global_step)
+        if clip_cot_texts:
+            self._save_cot_texts(clip_cot_texts, self.global_step)
 
         return metrics
     # ------------------------------------------------------------------
@@ -473,54 +376,31 @@ class Trainer:
             self.config.output_dir, f"checkpoint-{self.global_step}"
         )
 
-        if self.is_fsdp:
-            # Gather full state dict to rank 0
-            full_sd_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, full_sd_cfg):
-                model_state = self.model.state_dict()
-                optim_state = FSDP.optim_state_dict(self.model, self.optimizer)
-
-            if self._is_main_process:
-                os.makedirs(ckpt_dir, exist_ok=True)
-                # Save model weights
-                torch.save(model_state, os.path.join(ckpt_dir, "model_state_dict.pt"))
-                # Save optimizer / scheduler / training state
-                state = {
-                    "optimizer": optim_state,
-                    "scheduler": self.scheduler.state_dict(),
-                    "global_step": self.global_step,
-                    "epoch": self.epoch,
-                    "best_eval_loss": self.best_eval_loss,
-                }
-                torch.save(state, os.path.join(ckpt_dir, "training_state.pt"))
-                logger.info(f"Saved FSDP checkpoint to {ckpt_dir}")
-                self._rotate_checkpoints()
-                if is_best:
-                    best_dir = os.path.join(self.config.output_dir, "best_model")
-                    if os.path.exists(best_dir):
-                        shutil.rmtree(best_dir)
-                    shutil.copytree(ckpt_dir, best_dir)
-                    logger.info(f"Saved best model to {best_dir}")
+        if not self._is_main_process:
             dist.barrier()
-        else:
-            os.makedirs(ckpt_dir, exist_ok=True)
-            self.model.save_pretrained(ckpt_dir)
-            state = {
-                "optimizer": self.optimizer.state_dict(),
-                "scheduler": self.scheduler.state_dict(),
-                "global_step": self.global_step,
-                "epoch": self.epoch,
-                "best_eval_loss": self.best_eval_loss,
-            }
-            torch.save(state, os.path.join(ckpt_dir, "training_state.pt"))
-            logger.info(f"Saved checkpoint to {ckpt_dir}")
-            self._rotate_checkpoints()
-            if is_best:
-                best_dir = os.path.join(self.config.output_dir, "best_model")
-                if os.path.exists(best_dir):
-                    shutil.rmtree(best_dir)
-                shutil.copytree(ckpt_dir, best_dir)
-                logger.info(f"Saved best model to {best_dir}")
+            return
+
+        os.makedirs(ckpt_dir, exist_ok=True)
+        self._unwrapped_model.save_pretrained(ckpt_dir)
+        state = {
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+            "global_step": self.global_step,
+            "epoch": self.epoch,
+            "best_eval_loss": self.best_eval_loss,
+        }
+        torch.save(state, os.path.join(ckpt_dir, "training_state.pt"))
+        logger.info(f"Saved checkpoint to {ckpt_dir}")
+        self._rotate_checkpoints()
+        if is_best:
+            best_dir = os.path.join(self.config.output_dir, "best_model")
+            if os.path.exists(best_dir):
+                shutil.rmtree(best_dir)
+            shutil.copytree(ckpt_dir, best_dir)
+            logger.info(f"Saved best model to {best_dir}")
+
+        if self.is_distributed:
+            dist.barrier()
 
     def _rotate_checkpoints(self):
         if self.config.save_total_limit is None or self.config.save_total_limit <= 0:
@@ -555,21 +435,7 @@ class Trainer:
 
         state = torch.load(state_path, map_location="cpu", weights_only=False)
 
-        if self.is_fsdp:
-            # Load model weights
-            model_sd_path = os.path.join(path, "model_state_dict.pt")
-            if os.path.isfile(model_sd_path):
-                full_sd = torch.load(model_sd_path, map_location="cpu", weights_only=False)
-                full_sd_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, full_sd_cfg):
-                    self.model.load_state_dict(full_sd)
-            # Load optimizer state
-            optim_state = FSDP.optim_state_dict_to_load(
-                self.model, self.optimizer, state["optimizer"]
-            )
-            self.optimizer.load_state_dict(optim_state)
-        else:
-            self.optimizer.load_state_dict(state["optimizer"])
+        self.optimizer.load_state_dict(state["optimizer"])
 
         self.scheduler.load_state_dict(state["scheduler"])
         self.global_step = state["global_step"]
@@ -611,13 +477,15 @@ class Trainer:
         if self._wandb is not None:
             self._wandb.log(metrics, step=step)
 
-    def _log_cot_table(self, cot_texts: list[str], step: int):
-        """Log generated Chain-of-Thought texts to wandb as a table."""
-        for i, cot in enumerate(cot_texts):
-            logger.info(f"[step {step}] eval sample {i} CoT: {cot[:200]}...")
-        if self._wandb is not None:
-            table = self._wandb.Table(
-                columns=["sample_idx", "cot"],
-                data=[[i, cot] for i, cot in enumerate(cot_texts)],
-            )
-            self._wandb.log({"eval/cot": table}, step=step)
+    def _save_cot_texts(self, clip_cot_texts: dict[str, list[str]], step: int):
+        """Save generated CoT texts to local files, organized by clip_id."""
+        total = 0
+        for clip_id, cot_texts in clip_cot_texts.items():
+            clip_dir = os.path.join(self.config.output_dir, "eval_cot", clip_id)
+            os.makedirs(clip_dir, exist_ok=True)
+            path = os.path.join(clip_dir, f"step_{step}.txt")
+            with open(path, "w") as f:
+                for i, cot in enumerate(cot_texts):
+                    f.write(f"[window {i}] {cot}\n")
+            total += len(cot_texts)
+        logger.info(f"[step {step}] Saved {total} CoT texts across {len(clip_cot_texts)} clips")

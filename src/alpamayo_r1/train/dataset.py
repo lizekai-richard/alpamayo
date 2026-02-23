@@ -1,14 +1,110 @@
+import math
+import time
+import threading
 import torch
 import json
 import os
 import random
+import logging
+from collections import defaultdict, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger(__name__)
+
+
+class ClipPrefetcher:
+    """Asynchronous clip loader with LRU cache.
+
+    A background thread pool loads clips ahead of time so that I/O overlaps
+    with GPU computation.  An LRU cache avoids reloading clips that are
+    accessed repeatedly (common with clip-grouped ordering).
+
+    Lazy-initialises threading primitives so the object survives pickling
+    by DataLoader workers (fork).
+    """
+
+    def __init__(self, max_cache_size: int = 4, num_threads: int = 2):
+        self._max_size = max_cache_size
+        self._num_threads = num_threads
+        # Lazy-init after fork
+        self._cache: OrderedDict | None = None
+        self._lock: threading.Lock | None = None
+        self._futures: dict | None = None
+        self._executor: ThreadPoolExecutor | None = None
+
+    def _ensure_init(self):
+        if self._cache is None:
+            self._cache = OrderedDict()
+            self._lock = threading.Lock()
+            self._futures = {}
+            self._executor = ThreadPoolExecutor(max_workers=self._num_threads)
+
+    @staticmethod
+    def _load_from_disk(path: str):
+        last_err = None
+        for attempt in range(3):
+            try:
+                return torch.load(path, map_location="cpu", weights_only=False)
+            except OSError as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+        raise last_err
+
+    def prefetch(self, clip_id: str, path: str):
+        """Schedule background loading (no-op if already cached or loading)."""
+        self._ensure_init()
+        with self._lock:
+            if clip_id in self._cache or clip_id in self._futures:
+                return
+            self._futures[clip_id] = self._executor.submit(
+                self._load_from_disk, path
+            )
+
+    def get(self, clip_id: str, path: str):
+        """Return clip data, blocking until available."""
+        self._ensure_init()
+        with self._lock:
+            if clip_id in self._cache:
+                self._cache.move_to_end(clip_id)
+                return self._cache[clip_id]
+            future = self._futures.pop(clip_id, None)
+
+        data = future.result() if future is not None else self._load_from_disk(path)
+
+        with self._lock:
+            self._cache[clip_id] = data
+            self._cache.move_to_end(clip_id)
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+        return data
+
+    def __getstate__(self):
+        return {"_max_size": self._max_size, "_num_threads": self._num_threads}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._cache = None
+        self._lock = None
+        self._futures = None
+        self._executor = None
+
+
+_NO_BATCH_DIM_KEYS = {"pixel_values", "image_grid_thw"}
 
 
 def collate_fn(batch):
-    """Collate for batch_size=1. Adds a batch dim to each tensor in each window."""
+    """Collate for batch_size=1. Adds a batch dim to each tensor in each window.
+
+    pixel_values and image_grid_thw are excluded because their first dimension
+    is num_patches / num_images, not batch.
+    """
     windows = batch[0]
     return [
-        {k: v.unsqueeze(0) if isinstance(v, torch.Tensor) else v for k, v in w.items()}
+        {
+            k: v.unsqueeze(0) if isinstance(v, torch.Tensor) and k not in _NO_BATCH_DIM_KEYS else v
+            for k, v in w.items()
+        }
         for w in windows
     ]
 
@@ -66,38 +162,49 @@ class StreamingDataset(torch.utils.data.Dataset):
             )
         self._vision_start_id = tokenizer.encode("<|vision_start|>")[0]
         self._vision_end_id = tokenizer.encode("<|vision_end|>")[0]
+        self._endoftext_id = tokenizer.encode("<|endoftext|>")[0]
+        self._traj_future_start_id = tokenizer.encode("<|traj_future_start|>")[0]
 
         with open(args.clip_list, "r") as f:
             self.clip_ids = json.load(f)
 
+        self._rank = int(os.environ.get("RANK", 0))
+        self._world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+        # Prefetcher: background threads load the next clip while GPU is busy
+        prefetch_cache_size = getattr(args, "prefetch_cache_size", 4)
+        prefetch_threads = getattr(args, "prefetch_threads", 2)
+        self._clip_prefetcher = ClipPrefetcher(
+            max_cache_size=prefetch_cache_size,
+            num_threads=prefetch_threads,
+        )
+
         self.load_data()
+        self._organize_by_clip()
+
+    # Default number of sliding windows per clip (avoids loading data at index time)
+    DEFAULT_CLIP_LENGTH = 120
+
+    def _get_clip_path(self, clip_id):
+        return os.path.join(self.data_dir, clip_id, "sliding_window_inputs.pt")
 
     def _load_clip(self, clip_id):
-        """Load pre-dumped sliding window inputs (with best_cot) for a clip."""
-        path = os.path.join(self.data_dir, clip_id, "sliding_window_inputs.pt")
-        if not os.path.isfile(path):
-            return None
-        return torch.load(path, map_location="cpu", weights_only=False)
+        """Load clip via the prefetch cache (background I/O + LRU)."""
+        return self._clip_prefetcher.get(clip_id, self._get_clip_path(clip_id))
 
     def load_data(self):
-        """Load all clips and sample contiguous subsequences.
+        """Build index of (clip_id, start, seq_len) without loading tensor data.
 
-        For each clip, samples up to ``samples_per_clip`` unique subsequences.
-        Each subsequence has a randomly chosen rollout length in
-        [min_rollout_steps, max_rollout_steps], so different items may have
-        different numbers of windows.  Duplicates (same start, same
-        rollout_steps) are skipped.
+        Uses DEFAULT_CLIP_LENGTH as the assumed number of windows per clip
+        to avoid loading every .pt file at startup. Out-of-bounds indices are
+        clamped in __getitem__.
         """
-        self.data = []
+        self.data: list[tuple[str, int, int]] = []  # (clip_id, start, seq_len)
         min_seq_len = self.min_rollout_steps + 1
+        total = self.DEFAULT_CLIP_LENGTH
 
         for clip_id in self.clip_ids:
-            windows = self._load_clip(clip_id)
-            if windows is None:
-                continue
-
-            total = len(windows)
-            if total < min_seq_len:
+            if not os.path.isfile(self._get_clip_path(clip_id)):
                 continue
 
             seen: set[tuple[int, int]] = set()
@@ -119,8 +226,64 @@ class StreamingDataset(torch.utils.data.Dataset):
                     continue
 
                 seen.add((start, rollout_steps))
-                self.data.append(windows[start : start + seq_len])
+                self.data.append((clip_id, start, seq_len))
                 collected += 1
+
+    def _organize_by_clip(self):
+        """Group samples by clip_id and build clip-grouped index ordering.
+
+        Within each clip, samples are sorted by start position.
+        Clip order is shuffled (deterministic per epoch).
+        For distributed training, clips are split across ranks.
+        """
+        groups = defaultdict(list)
+        for i, (clip_id, start, seq_len) in enumerate(self.data):
+            groups[clip_id].append(i)
+        # Sort within each clip by start position
+        for clip_id in groups:
+            groups[clip_id].sort(key=lambda i: self.data[i][1])
+        self._clip_groups = groups  # clip_id -> [indices into self.data]
+        self._clip_ids = list(groups.keys())
+        self._epoch = 0
+        self._rebuild_order()
+
+    def _rebuild_order(self):
+        """Rebuild ordered index list based on current epoch and rank."""
+        clip_ids = list(self._clip_ids)
+        random.Random(self._epoch).shuffle(clip_ids)
+
+        # Distribute clips across ranks (round-robin)
+        if self._world_size > 1:
+            clip_ids = clip_ids[self._rank::self._world_size]
+
+        self._ordered_indices = []
+        for clip_id in clip_ids:
+            self._ordered_indices.extend(self._clip_groups[clip_id])
+
+        # Pad for DDP so each rank has the same number of samples
+        if self._world_size > 1:
+            target = math.ceil(len(self.data) / self._world_size)
+            while len(self._ordered_indices) < target:
+                wrap_idx = len(self._ordered_indices) % max(1, len(self._ordered_indices))
+                self._ordered_indices.append(self._ordered_indices[wrap_idx])
+            self._ordered_indices = self._ordered_indices[:target]
+
+        # Precompute next-clip mapping for prefetching
+        ordered_clips: list[str] = []
+        prev = None
+        for real_idx in self._ordered_indices:
+            cid = self.data[real_idx][0]
+            if cid != prev:
+                ordered_clips.append(cid)
+                prev = cid
+        self._next_clip_for: dict[str, str] = {}
+        for i in range(len(ordered_clips) - 1):
+            self._next_clip_for[ordered_clips[i]] = ordered_clips[i + 1]
+
+    def set_epoch(self, epoch):
+        """Reshuffle clip order for a new epoch."""
+        self._epoch = epoch
+        self._rebuild_order()
 
     def _process_streaming_inputs(self, input_ids, attention_mask,
                                   pixel_values, image_grid_thw):
@@ -168,7 +331,7 @@ class StreamingDataset(torch.utils.data.Dataset):
         return input_ids, attention_mask, pixel_values, image_grid_thw
 
     def __len__(self):
-        return len(self.data)
+        return len(self._ordered_indices)
 
     def _build_window_item(self, w, is_streaming, with_output=False):
         """Build a single window item.
@@ -202,8 +365,8 @@ class StreamingDataset(torch.utils.data.Dataset):
             "attention_mask": attention_mask,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
-            "ego_history_xyz": w["ego_history_xyz"],
-            "ego_history_rot": w["ego_history_rot"],
+            "ego_history_xyz": w["ego_history_xyz"].squeeze(0),
+            "ego_history_rot": w["ego_history_rot"].squeeze(0),
             "is_prefill": not is_streaming,
         }
 
@@ -211,6 +374,15 @@ class StreamingDataset(torch.utils.data.Dataset):
             input_len = input_ids.shape[0]
             output_token_ids = w.get("output_token_ids", None)
             if output_token_ids is not None and output_token_ids.numel() > 0:
+                # Ensure output ends with <|traj_future_start|>
+                if output_token_ids[-1].item() == self._endoftext_id:
+                    output_token_ids = output_token_ids.clone()
+                    output_token_ids[-1] = self._traj_future_start_id
+                elif output_token_ids[-1].item() != self._traj_future_start_id:
+                    output_token_ids = torch.cat([
+                        output_token_ids,
+                        torch.tensor([self._traj_future_start_id], dtype=output_token_ids.dtype),
+                    ])
                 output_len = output_token_ids.shape[0]
                 item["input_ids"] = torch.cat([input_ids, output_token_ids])
                 item["attention_mask"] = torch.cat([
@@ -228,8 +400,39 @@ class StreamingDataset(torch.utils.data.Dataset):
 
         return item
 
-    def __getitem__(self, idx):
-        windows = self.data[idx]
+    def __getitem__(self, idx, _skip_attempts=10):
+        try:
+            return self._getitem_impl(idx)
+        except (OSError, Exception) as e:
+            if _skip_attempts <= 0:
+                raise
+            real_idx = self._ordered_indices[idx]
+            clip_id = self.data[real_idx][0]
+            logger.warning(
+                "Skip bad sample idx=%s clip_id=%s (%s), retrying with another sample: %s",
+                idx, clip_id, type(e).__name__, e,
+            )
+            others = [i for i in range(len(self)) if i != idx]
+            if not others:
+                raise
+            return self.__getitem__(random.choice(others), _skip_attempts=_skip_attempts - 1)
+
+    def _getitem_impl(self, idx):
+        real_idx = self._ordered_indices[idx]
+        clip_id, start, seq_len = self.data[real_idx]
+
+        # Trigger prefetch of the next clip on first access to a new clip
+        next_clip = self._next_clip_for.get(clip_id)
+        if next_clip is not None:
+            self._clip_prefetcher.prefetch(next_clip, self._get_clip_path(next_clip))
+
+        all_windows = self._load_clip(clip_id)
+        # Clamp to actual clip length in case DEFAULT_CLIP_LENGTH was too large
+        actual_len = len(all_windows)
+        if start + seq_len > actual_len:
+            start = max(0, actual_len - seq_len)
+        windows = all_windows[start : start + seq_len]
+
         last = len(windows) - 1
         items = []
         for i, w in enumerate(windows):
@@ -238,50 +441,39 @@ class StreamingDataset(torch.utils.data.Dataset):
             else:  # expert
                 item = self._build_window_item(w, is_streaming=(i > 0), with_output=False)
                 if i == last:
-                    item["ego_future_xyz"] = w["ego_future_xyz"]
-                    item["ego_future_rot"] = w["ego_future_rot"]
+                    item["ego_future_xyz"] = w["ego_future_xyz"].squeeze(0)
+                    item["ego_future_rot"] = w["ego_future_rot"].squeeze(0)
             items.append(item)
         return items
 
 
 class EvalStreamingDataset(StreamingDataset):
-    """Like StreamingDataset but also returns trajectory ground truth for minADE evaluation.
+    """Eval dataset that returns entire clips for full-clip evaluation.
 
-    The last window in each item additionally contains:
-    - ego_future_xyz, ego_future_rot: ground-truth future trajectory for minADE
-
-    Unlike StreamingDataset, rollout length is always fixed at max_rollout_steps
-    (no randomization during evaluation).
+    Each item is a complete clip (all windows from start to end).
+    - Window 0: prefill (no metrics)
+    - Windows 1+: streaming windows with trajectory ground truth for minADE
     """
 
     def load_data(self):
-        """Load all clips with fixed rollout length (no randomization)."""
-        self.data = []
-        seq_len = self.max_rollout_steps + 1
-
+        """One entry per clip — eval runs the entire clip."""
+        self.data: list[tuple[str, int, int]] = []
         for clip_id in self.clip_ids:
-            windows = self._load_clip(clip_id)
-            if windows is None:
+            if not os.path.isfile(self._get_clip_path(clip_id)):
                 continue
-
-            total = len(windows)
-            if total < seq_len:
-                continue
-
-            max_start = total - seq_len
-            n = min(self.samples_per_clip, max_start + 1)
-            starts = sorted(random.sample(range(max_start + 1), n))
-
-            for start in starts:
-                self.data.append(windows[start : start + seq_len])
+            self.data.append((clip_id, 0, 0))  # start=0, seq_len=0 (ignored, load full clip)
 
     def __getitem__(self, idx):
-        windows = self.data[idx]
+        real_idx = self._ordered_indices[idx]
+        clip_id, _, _ = self.data[real_idx]
+        all_windows = self._load_clip(clip_id)
+
         result = []
-        for i, w in enumerate(windows):
+        for i, w in enumerate(all_windows):
             item = self._build_window_item(w, is_streaming=(i > 0), with_output=False)
-            item["ego_future_xyz"] = w["ego_future_xyz"]
-            item["ego_future_rot"] = w["ego_future_rot"]
+            item["ego_future_xyz"] = w["ego_future_xyz"].squeeze(0)
+            item["ego_future_rot"] = w["ego_future_rot"].squeeze(0)
+            item["clip_id"] = clip_id
             result.append(item)
         return result
 
@@ -349,7 +541,11 @@ if __name__ == "__main__":
     assert len(dataset) == 1
 
     item = dataset[0]
-    raw_subseq = dataset.data[0]
+    # Reconstruct raw subsequence from the index for verification
+    _clip_id, _start, _seq_len = dataset.data[0]
+    _all_windows = torch.load(os.path.join(data_dir, _clip_id, "sliding_window_inputs.pt"),
+                              map_location="cpu", weights_only=False)
+    raw_subseq = _all_windows[_start : _start + _seq_len]
     num_windows = len(item)
     rollout_steps = num_windows - 1
     assert 3 <= num_windows <= MAX_ROLLOUT_STEPS + 1, \
@@ -404,10 +600,10 @@ if __name__ == "__main__":
           "pixel_values matches raw")
     check(torch.equal(w0["image_grid_thw"], td0["image_grid_thw"]),
           "image_grid_thw matches raw")
-    check(torch.equal(w0["ego_history_xyz"], raw_subseq[0]["ego_history_xyz"]),
-          "ego_history_xyz matches raw")
-    check(torch.equal(w0["ego_history_rot"], raw_subseq[0]["ego_history_rot"]),
-          "ego_history_rot matches raw")
+    check(torch.equal(w0["ego_history_xyz"], raw_subseq[0]["ego_history_xyz"].squeeze(0)),
+          "ego_history_xyz matches raw (squeezed)")
+    check(torch.equal(w0["ego_history_rot"], raw_subseq[0]["ego_history_rot"].squeeze(0)),
+          "ego_history_rot matches raw (squeezed)")
     check("labels" not in w0, "no labels on rollout window")
     check("output_ids_range" not in w0, "no output_ids_range on rollout window")
 
@@ -463,8 +659,8 @@ if __name__ == "__main__":
           "attention_mask matches keep_mask applied to raw")
 
     # 2g. Trajectory data
-    check(torch.equal(w1["ego_history_xyz"], raw_subseq[1]["ego_history_xyz"]),
-          "ego_history_xyz matches raw")
+    check(torch.equal(w1["ego_history_xyz"], raw_subseq[1]["ego_history_xyz"].squeeze(0)),
+          "ego_history_xyz matches raw (squeezed)")
 
     # ==================================================================
     # 3. Last window (loss) — output_token_ids + labels
@@ -519,8 +715,8 @@ if __name__ == "__main__":
     print("=" * 60)
 
     for i in range(len(item)):
-        check(torch.equal(item[i]["ego_history_xyz"], raw_subseq[i]["ego_history_xyz"]),
-              f"window {i} ego_history_xyz matches raw")
+        check(torch.equal(item[i]["ego_history_xyz"], raw_subseq[i]["ego_history_xyz"].squeeze(0)),
+              f"window {i} ego_history_xyz matches raw (squeezed)")
 
     timestamps = [raw_subseq[i]["timestamp"] for i in range(len(raw_subseq))]
     diffs = [timestamps[i + 1] - timestamps[i] for i in range(len(timestamps) - 1)]
@@ -547,7 +743,10 @@ if __name__ == "__main__":
               "expert rollout window has NO ego_future_xyz")
 
     # Expert last window input_ids should NOT include output_token_ids
-    raw_last_e = dataset_expert.data[0][-1]
+    _cid_e, _st_e, _sl_e = dataset_expert.data[0]
+    _raw_e = torch.load(os.path.join(data_dir, _cid_e, "sliding_window_inputs.pt"),
+                        map_location="cpu", weights_only=False)
+    raw_last_e = _raw_e[_st_e + _sl_e - 1]
     raw_ids_e = raw_last_e["tokenized_data"]["input_ids"].squeeze(0)
     if len(item_expert) > 1:
         keep_e = _compute_streaming_keep_mask(raw_ids_e)
@@ -565,6 +764,10 @@ if __name__ == "__main__":
     check(len(batch) == len(item), "collated batch has same number of windows")
     check(batch[0]["input_ids"].shape == (1, item[0]["input_ids"].shape[0]),
           "collate adds batch dim to input_ids")
+    check(batch[0]["pixel_values"].shape == item[0]["pixel_values"].shape,
+          "collate does NOT add batch dim to pixel_values")
+    check(batch[0]["image_grid_thw"].shape == item[0]["image_grid_thw"].shape,
+          "collate does NOT add batch dim to image_grid_thw")
     check(batch[0]["is_prefill"] is True,
           "collate preserves non-tensor fields")
 
@@ -592,15 +795,12 @@ if __name__ == "__main__":
     check(len(unique_lengths) > 1,
           f"multiple distinct lengths observed: {sorted(unique_lengths)}")
 
-    # Verify no duplicate (start, rollout_steps) — check raw data identity
+    # Verify no duplicate (clip_id, start, seq_len)
     seen_ids = set()
-    for subseq in dataset_multi.data:
-        key = (id(subseq[0]), len(subseq))
-        # Use timestamp of first window + length as proxy for (start, rollout_steps)
-        key = (subseq[0]["timestamp"], len(subseq))
-        check(key not in seen_ids,
-              f"unique subsequence: timestamp={key[0]}, len={key[1]}")
-        seen_ids.add(key)
+    for entry in dataset_multi.data:
+        check(entry not in seen_ids,
+              f"unique subsequence: clip={entry[0][:8]}..., start={entry[1]}, len={entry[2]}")
+        seen_ids.add(entry)
 
     # ==================================================================
     # 8. EvalStreamingDataset uses fixed rollout length

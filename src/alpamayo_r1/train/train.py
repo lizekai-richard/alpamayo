@@ -2,51 +2,62 @@ import logging
 import os
 import sys
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from torch.utils.data.distributed import DistributedSampler
 
 from alpamayo_r1.train.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1 import helper
 from alpamayo_r1.train.dataset import StreamingDataset, EvalStreamingDataset, collate_fn, eval_collate_fn
 from alpamayo_r1.train.trainer import Trainer, TrainerConfig
 
+_rank = int(os.environ.get("RANK", 0))
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO if _rank == 0 else logging.WARNING,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
-def load_model(model_path: str, resume_from_checkpoint: str | None = None, use_fsdp: bool = False):
-    path = resume_from_checkpoint if resume_from_checkpoint else model_path
-    model = AlpamayoR1.from_pretrained(path, dtype=torch.bfloat16)
-    if not use_fsdp:
-        model = model.to("cuda")
-    return model
+def _is_torchrun() -> bool:
+    """Auto-detect distributed launch (torchrun sets WORLD_SIZE)."""
+    return int(os.environ.get("WORLD_SIZE", 1)) > 1
 
 
 def train(cfg):
+    distributed = _is_torchrun()
+
     # Distributed setup
-    if cfg.use_fsdp:
-        dist.init_process_group(backend="nccl")
+    if distributed:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", device_id=torch.device("cuda", local_rank))
+    logger.info("Distributed setup done" if distributed else "Single-GPU mode")
 
-    model = load_model(cfg.model_path, cfg.resume_from_checkpoint, cfg.use_fsdp)
+    # Load model to CPU; the Trainer moves to the correct device per rank.
+    logger.info("Loading model...")
+    path = cfg.resume_from_checkpoint if cfg.resume_from_checkpoint else cfg.model_path
+    model = AlpamayoR1.from_pretrained(path, dtype=torch.bfloat16)
     model.set_training_stage(cfg.training_stage)
+    logger.info(f"Model loaded, training_stage={cfg.training_stage}")
+
     processor = helper.get_processor(model.tokenizer)
 
     # Train dataset / dataloader
+    logger.info("Building train dataset...")
     train_dataset = StreamingDataset(cfg, processor=processor, training_stage=cfg.training_stage)
-    train_sampler = DistributedSampler(train_dataset, shuffle=cfg.shuffle) if cfg.use_fsdp else None
+    logger.info(f"Train dataset: {len(train_dataset)} samples")
+    num_workers = getattr(cfg, "num_workers", 0)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=1,
-        shuffle=(cfg.shuffle and train_sampler is None),
-        sampler=train_sampler,
+        shuffle=False,  # dataset handles clip-grouped ordering internally
         collate_fn=collate_fn,
+        num_workers=num_workers,
+        prefetch_factor=2 if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
     )
 
     # Eval dataset / dataloader (optional)
@@ -54,6 +65,7 @@ def train(cfg):
     if cfg.eval_data_dir is not None:
         eval_cfg = OmegaConf.merge(cfg, {"data_dir": cfg.eval_data_dir, "clip_list": cfg.eval_clip_list})
         eval_dataset = EvalStreamingDataset(eval_cfg, processor=processor)
+        logger.info(f"Eval dataset: {len(eval_dataset)} samples")
         eval_dataloader = torch.utils.data.DataLoader(
             eval_dataset,
             batch_size=1,
@@ -62,6 +74,7 @@ def train(cfg):
         )
 
     # Build trainer config from merged cfg
+    logger.info("Building trainer...")
     trainer_config = TrainerConfig(
         training_stage=cfg.training_stage,
         learning_rate=cfg.lr,
@@ -88,10 +101,7 @@ def train(cfg):
         rollout_temperature=cfg.rollout_temperature,
         rollout_num_traj_samples=cfg.rollout_num_traj_samples,
         rollout_max_generation_length=cfg.rollout_max_generation_length,
-        use_fsdp=cfg.use_fsdp,
-        fsdp_sharding_strategy=cfg.fsdp_sharding_strategy,
-        fsdp_auto_wrap_min_params=cfg.fsdp_auto_wrap_min_params,
-        fsdp_cpu_offload=cfg.fsdp_cpu_offload,
+        distributed=distributed,
     )
 
     trainer = Trainer(
@@ -100,9 +110,10 @@ def train(cfg):
         train_dataloader=train_dataloader,
         eval_dataloader=eval_dataloader,
     )
+    logger.info("Trainer ready, starting training...")
     trainer.train()
 
-    if cfg.use_fsdp:
+    if distributed:
         dist.destroy_process_group()
 
 
