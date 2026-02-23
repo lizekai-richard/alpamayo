@@ -317,13 +317,14 @@ class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
         else:
             colsum = None
         
-        if return_attn_weight:
-            with torch.no_grad():
-                attn_weight = query @ key.transpose(-2, -1) * self.scaling
-                attn_weight = torch.softmax(attn_weight, dim=-1)
-            return output, colsum, attn_weight
-        else:
-            return output, colsum, None
+        # if return_attn_weight:
+        #     with torch.no_grad():
+        #         attn_weight = query @ key.transpose(-2, -1) * self.scaling
+        #         attn_weight = torch.softmax(attn_weight, dim=-1)
+        #     return output, colsum, attn_weight
+        # else:
+        #     return output, colsum, None
+        return output, colsum, None
 
 
 class Qwen3VLVisionBlock(qwen3vl.Qwen3VLVisionBlock):
@@ -375,23 +376,27 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
 
         deepstack_features = []
         colsums = []
-        attn_weights = []
+        deepstack_colsums = []
+        # attn_weights = []
+        return_colsum_layer_indices = self.deepstack_visual_indexes + [len(self.blocks) - 1]
         for layer_idx, block in enumerate(self.blocks):
-            hidden_states, colsum, attn_weight = block(
+            hidden_states, colsum, _ = block(
                 hidden_states,
                 cu_seqlens=self._cached_cu_seqlens,
                 position_embeddings=self._cached_position_embeddings,
-                return_colsum=layer_idx == len(self.blocks) - 1,
-                return_attn_weight=layer_idx == len(self.blocks) - 1,
+                return_colsum=layer_idx in return_colsum_layer_indices,
+                # return_attn_weight=layer_idx == len(self.blocks) - 1,
             )
-            if colsum is not None:
+            if colsum is not None and layer_idx == len(self.blocks) - 1:
                 colsums.append(colsum)
             if layer_idx in self.deepstack_visual_indexes:
                 merger_idx = self.deepstack_visual_indexes.index(layer_idx)
                 deepstack_features.append(self.deepstack_merger_list[merger_idx](hidden_states))
-            if attn_weight is not None:
-                attn_weights.append(attn_weight)
-        return self.merger(hidden_states), deepstack_features, colsums, attn_weights
+                if colsum is not None:
+                    deepstack_colsums.append(colsum)
+            # if attn_weight is not None:
+                # attn_weights.append(attn_weight)
+        return self.merger(hidden_states), deepstack_features, colsums, deepstack_colsums
 
 
 def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):

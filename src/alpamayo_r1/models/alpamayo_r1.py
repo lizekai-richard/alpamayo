@@ -130,7 +130,7 @@ class AlpamayoR1(ReasoningVLA):
         diffusion_kwargs: dict[str, Any] | None = None,
         *args: Any,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
         """Sample trajectories from the data with VLM rollout.
 
         Args:
@@ -206,6 +206,8 @@ class AlpamayoR1(ReasoningVLA):
         )
         prompt_cache = vlm_outputs.past_key_values
         prefill_seq_len = prompt_cache.get_seq_length()
+        
+        decoded_batch = self.tokenizer.batch_decode(vlm_outputs.sequences[:, input_ids.shape[1]:], skip_special_tokens=True)
 
         # find <traj_future_start> token position for each sequence, use last token if not found
         b_star = vlm_outputs.sequences.shape[0]
@@ -329,7 +331,7 @@ class AlpamayoR1(ReasoningVLA):
                 extra[text_tokens] = np.array(extra[text_tokens]).reshape(
                     [input_ids.shape[0], num_traj_sets, num_traj_samples]
                 )
-            return pred_xyz, pred_rot, extra
+            return pred_xyz, pred_rot, extra, decoded_batch
         return pred_xyz, pred_rot
 
 
