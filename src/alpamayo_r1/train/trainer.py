@@ -143,7 +143,7 @@ class Trainer:
             self.world_size = dist.get_world_size()
             self.device = torch.device("cuda", self.local_rank)
             model = model.to(self.device)
-            self.model = DDP(model, device_ids=[self.local_rank])
+            self.model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=True if config.training_stage == "expert" else False)
             logger.info(f"DDP initialized: rank={self.rank}, local_rank={self.local_rank}, world_size={self.world_size}")
         else:
             self.rank = 0
@@ -211,14 +211,6 @@ class Trainer:
             accum_count = 0
 
             for batch_idx, batch in enumerate(self.train_dataloader):
-                # When resuming, skip already-processed batches
-                if self.config.resume_from_checkpoint and epoch == start_epoch:
-                    completed_batches = (
-                        self.global_step * self.config.gradient_accumulation_steps
-                    )
-                    if batch_idx < completed_batches:
-                        continue
-
                 loss = self._training_step(batch)
                 accum_loss += loss
                 accum_count += 1
