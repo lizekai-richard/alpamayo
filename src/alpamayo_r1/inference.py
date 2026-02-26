@@ -124,7 +124,7 @@ def run_inference(args, model, processor, sliding_window_inputs):
         model_inputs = sliding_window_inputs[i]
         start_time = time.perf_counter()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_xyz, pred_rot, extra, decoded_batch = model.sample_trajectories_from_data_with_vlm_rollout(
+            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
@@ -132,12 +132,13 @@ def run_inference(args, model, processor, sliding_window_inputs):
                 max_generation_length=256,
                 return_extra=True
             )
-        print(decoded_batch)
         end_time = time.perf_counter()
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
         time_list.append(end_time - start_time)
         min_ade_list.append(float(min_ade))
         logger.info("Step %s: latency=%.3fs, MinADE=%.4f", i, end_time - start_time, min_ade)
+    logger.info("Average latency: %.3fs", np.mean(time_list))
+    logger.info("Average MinADE: %.4f", np.mean(min_ade_list))
 
 
 def test_inference(args, model, processor):
@@ -157,7 +158,7 @@ def test_inference(args, model, processor):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run compile-model inference on a clip.")
     parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
-    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="b80a15fc-d540-4c8f-81d1-5db83216b2e0")
+    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="87147a1b-3eef-4c25-94d2-ec7718a49a7a")
     parser.add_argument("--num_steps", type=int, default=120)
     parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)

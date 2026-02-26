@@ -550,17 +550,30 @@ class StreamingAlpamayoR1(ReasoningVLA):
     
     # ==================== Token Pruning ====================
     
-    def _merge_colsum(self, colsums, image_grid_thw):
+    def _merge_colsum(self, colsums: list[torch.Tensor], deepstack_colsums: list[torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor]]:
         # colsums is a list of tensors, each tensor is of shape [B, H, L].
-        colsums = torch.stack(colsums, dim=0)  # [num_layers, B, H, L]
-        colsums = colsums.mean(dim=(0, 2))  # [B, L]
+        merged_colsums = None
+        colsums = colsums[0]
+        colsums = colsums.mean(dim=1)  # [B, L]
 
         ratio = self.vlm.config.vision_config.spatial_merge_size
         # PatchMerger groups every consecutive m² tokens via x.view(-1, hidden_size * m²),
         # so we must sum every consecutive m² colsums to match.
         colsums = colsums.view(colsums.shape[0], -1, ratio * ratio)
         colsums = colsums.sum(dim=2)
-        return colsums
+        merged_colsums = colsums
+        
+        merged_deepstack_colsums = []
+        for i in range(len(deepstack_colsums)):
+            deepstack_colsum = deepstack_colsums[i]  # [B, H, L]
+            deepstack_colsum = deepstack_colsum.mean(dim=1)  # [B, L]
+
+            ratio = self.vlm.config.vision_config.spatial_merge_size
+            deepstack_colsum = deepstack_colsum.view(deepstack_colsum.shape[0], -1, ratio * ratio)
+            deepstack_colsum = deepstack_colsum.sum(dim=2)
+            merged_deepstack_colsums.append(deepstack_colsum)
+
+        return merged_colsums, merged_deepstack_colsums
     
     def _prune_tokens(self, colsums: torch.Tensor, sparsity_ratio: float) -> torch.Tensor:
         """Select top-k tokens per image based on colsum importance scores.
@@ -730,7 +743,8 @@ class StreamingAlpamayoR1(ReasoningVLA):
         image_embeds: torch.Tensor,
         deepstack_image_embeds: list[torch.Tensor],
         image_grid_thw: torch.LongTensor,
-        token_indices: torch.LongTensor,
+        vision_token_indices: torch.LongTensor,
+        deepstack_token_indices: list[torch.LongTensor],
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Prune image embeddings to keep only selected tokens per image.
 
@@ -738,11 +752,13 @@ class StreamingAlpamayoR1(ReasoningVLA):
             image_embeds: [total_img_tokens, hidden_dim] all images concatenated.
             deepstack_image_embeds: list of [total_img_tokens, hidden_dim] tensors.
             image_grid_thw: [num_images, 3] with (T, H, W) per image.
-            token_indices: [num_images, K] sorted kept indices per image.
+            vision_token_indices: [num_images, K] sorted kept indices per image.
+            deepstack_token_indices: [num_images, K] sorted kept indices per image.
 
         Returns:
             Pruned image_embeds and deepstack_image_embeds with same structure.
         """
+        # ===== Prune vision embeddings =====
         spatial_merge_size = self.vlm.config.vision_config.spatial_merge_size
         tokens_per_image = (
             image_grid_thw[:, 0]
@@ -752,16 +768,17 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # Split by image, select kept tokens, concatenate back
         per_image = image_embeds.split(tokens_per_image.tolist(), dim=0)
-        pruned = torch.cat([emb[idx] for emb, idx in zip(per_image, token_indices)], dim=0)
+        pruned_image_embeds = torch.cat([emb[idx] for emb, idx in zip(per_image, vision_token_indices)], dim=0)
 
-        pruned_deepstack = []
-        for ds_embeds in deepstack_image_embeds:
+        # ===== Prune deepstack embeddings =====
+        pruned_deepstack_embeds = []
+        for i, ds_embeds in enumerate(deepstack_image_embeds):
             per_image_ds = ds_embeds.split(tokens_per_image.tolist(), dim=0)
-            pruned_deepstack.append(
-                torch.cat([emb[idx] for emb, idx in zip(per_image_ds, token_indices)], dim=0)
+            pruned_deepstack_embeds.append(
+                torch.cat([emb[idx] for emb, idx in zip(per_image_ds, deepstack_token_indices[i])], dim=0)
             )
 
-        return pruned, pruned_deepstack
+        return pruned_image_embeds, pruned_deepstack_embeds
     
     def _get_keep_mask(
         self,
@@ -822,15 +839,18 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # Launch the first non-streaming prefill
         # inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
-        image_embeds, deepstack_image_embeds, colsums = self.vlm.model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds, deepstack_image_embeds, colsums, deepstack_colsums = self.vlm.model.visual(pixel_values, grid_thw=image_grid_thw)
         
         if sparsity_ratio > 0:
-            colsums = self._merge_colsum(colsums, image_grid_thw)
-            token_indices = self._prune_tokens(colsums, sparsity_ratio=sparsity_ratio)
+            vision_colsums, deepstack_colsums = self._merge_colsum(colsums, deepstack_colsums)
+            vision_token_indices = self._prune_tokens(vision_colsums, sparsity_ratio=sparsity_ratio)
+            deepstack_token_indices = []
+            for i in range(len(deepstack_colsums)):
+                deepstack_token_indices.append(self._prune_tokens(deepstack_colsums[i], sparsity_ratio=sparsity_ratio))
 
             # Prune image embeddings
             image_embeds, deepstack_image_embeds = self._prune_embeddings(
-                image_embeds, deepstack_image_embeds, image_grid_thw, token_indices
+                image_embeds, deepstack_image_embeds, image_grid_thw, vision_token_indices, deepstack_token_indices
             )
             # Reconstruct position IDs for pruned image tokens
             position_ids, rope_deltas, keep_mask = self._get_pruned_rope_index(
@@ -980,7 +1000,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, batch_size, sparsity_ratio, rope_mode, device)
             self._update_past_key_values()
             self.is_first_prefill = False
-            return
+            return None, None, None
 
         # Prepare input_ids for streaming (slice off system prompt for non-first prefill)
         vision_start_token_id = self.tokenizer.encode("<|vision_start|>")[0]
@@ -988,18 +1008,21 @@ class StreamingAlpamayoR1(ReasoningVLA):
         input_ids = input_ids[:, first_vision_start:]
 
         # ===== Encode =====
-        image_embeds, deepstack_image_embeds, colsums = self._encode(pixel_values, image_grid_thw)
+        image_embeds, deepstack_image_embeds, colsums, deepstack_colsums = self._encode(pixel_values, image_grid_thw)
 
         if sparsity_ratio > 0:
-            colsums = self._merge_colsum(colsums, image_grid_thw)
-            token_indices = self._prune_tokens(colsums, sparsity_ratio=sparsity_ratio)
+            colsums = self._merge_colsum(colsums, deepstack_colsums)
+            vision_token_indices = self._prune_tokens(colsums, sparsity_ratio=sparsity_ratio)
+            deepstack_token_indices = []
+            for i in range(len(deepstack_colsums)):
+                deepstack_token_indices.append(self._prune_tokens(deepstack_colsums[i], sparsity_ratio=sparsity_ratio))
             
             # Prune image embeddings
             image_embeds, deepstack_image_embeds = self._prune_embeddings(
-                image_embeds, deepstack_image_embeds, image_grid_thw, token_indices
+                image_embeds, deepstack_image_embeds, image_grid_thw, vision_token_indices, deepstack_token_indices
             )
             if self._cached_keep_mask is None:
-                self._cached_keep_mask = self._get_keep_mask(input_ids, image_grid_thw, token_indices)
+                self._cached_keep_mask = self._get_keep_mask(input_ids, image_grid_thw, vision_token_indices)
 
             input_ids = input_ids[self._cached_keep_mask].view(batch_size, -1)
         
@@ -1069,18 +1092,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         # Find <traj_future_start> position
         traj_start_pos = self._find_traj_start_positions(output_ids)
-        # truncation_pos = self._find_first_truncation_positions(output_ids, prompt_length=seq_len)
-        # if truncation_pos != -1:
-        #     traj_start_pos = torch.min(traj_start_pos, truncation_pos)
-        #     logger.info(f"traj_start_pos: {traj_start_pos.item()}, truncation_pos: {truncation_pos.item()}")
         streaming_input_len = seq_len
-        # # Clamp prompt conditioning to the first sentence in decoded text.
-        # first_period_pos = self._find_first_period_positions(
-        #     output_ids=output_ids,
-        #     start_pos=torch.full_like(traj_start_pos, streaming_input_len),
-        #     end_pos=traj_start_pos,
-        # )
-        # traj_start_pos = first_period_pos
 
         # ===== Action (Diffusion) =====
         # Note: Action only attends to prompt tokens, NOT reasoning tokens (they are masked out).

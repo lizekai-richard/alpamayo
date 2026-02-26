@@ -114,6 +114,14 @@ def create_sliding_window_inputs(
     return streaming_inputs
 
 
+def save_kv_cache(kv_cache, save_path):
+    for layer_idx, layer in enumerate(kv_cache.layers):
+        key_cache = layer.keys.clone().detach().cpu()
+        value_cache = layer.values.clone().detach().cpu()
+        torch.save(key_cache, os.path.join(save_path, f"key_cache_{layer_idx}.pt"))
+        torch.save(value_cache, os.path.join(save_path, f"value_cache_{layer_idx}.pt"))
+
+
 @torch.inference_mode()
 def run_inference(args, model, processor, sliding_window_inputs):
     warmup_steps = args.warmup_steps
@@ -125,12 +133,8 @@ def run_inference(args, model, processor, sliding_window_inputs):
     for i in range(warmup_steps):
         model_inputs = sliding_window_inputs[i]
         start_time = time.perf_counter()
-        attn_weights_path = os.path.join(args.save_path, args.clip_id, f"step{i}", "attn_weights.pt")
-        colsums_path = os.path.join(args.save_path, args.clip_id, f"step{i}", "colsums.pt")
-        os.makedirs(os.path.dirname(attn_weights_path), exist_ok=True)
-        os.makedirs(os.path.dirname(colsums_path), exist_ok=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_xyz, _, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+            pred_xyz, _, extra, kv_cache_return = model.sample_trajectories_from_data_with_vlm_rollout(
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
@@ -142,9 +146,12 @@ def run_inference(args, model, processor, sliding_window_inputs):
                 fuse_gate_up=True,
                 sparsity_ratio=args.sparsity_ratio,
                 rope_mode=args.rope_mode,
-                attn_weights_path=attn_weights_path,
-                colsums_path=colsums_path,
             )
+        
+        kv_cache_path = os.path.join(args.save_kv_cache_dir, f"clip_{args.clip_id}", f"step_{i}")
+        os.makedirs(kv_cache_path, exist_ok=True)
+        save_kv_cache(kv_cache_return, kv_cache_path)
+
         end_time = time.perf_counter()
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
         cot = extra["cot"][0][0][min_ade_idx]
@@ -156,12 +163,8 @@ def run_inference(args, model, processor, sliding_window_inputs):
     for i in range(warmup_steps, len(sliding_window_inputs)):
         model_inputs = sliding_window_inputs[i]
         start_time = time.perf_counter()
-        attn_weights_path = os.path.join(args.save_path, args.clip_id, f"step{i}", "attn_weights.pt")
-        colsums_path = os.path.join(args.save_path, args.clip_id, f"step{i}", "colsums.pt")
-        os.makedirs(os.path.dirname(attn_weights_path), exist_ok=True)
-        os.makedirs(os.path.dirname(colsums_path), exist_ok=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+            pred_xyz, pred_rot, extra, kv_cache_return = model.sample_trajectories_from_data_with_vlm_rollout(
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
@@ -173,9 +176,12 @@ def run_inference(args, model, processor, sliding_window_inputs):
                 fuse_gate_up=True,
                 sparsity_ratio=args.sparsity_ratio,
                 rope_mode=args.rope_mode,
-                attn_weights_path=attn_weights_path,
-                colsums_path=colsums_path,
             )
+        
+        kv_cache_path = os.path.join(args.save_kv_cache_dir, f"clip_{args.clip_id}", f"step_{i}")
+        os.makedirs(kv_cache_path, exist_ok=True)
+        save_kv_cache(kv_cache_return, kv_cache_path)
+
         end_time = time.perf_counter()
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
         cot = extra["cot"][0][0][min_ade_idx]
@@ -223,18 +229,18 @@ def test_inference(args, model, processor):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run compile-model inference on a clip.")
     parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
-    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="b80a15fc-d540-4c8f-81d1-5db83216b2e0")
+    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="e88802d8-cf67-4cd4-8578-a825a1bd1c71")
     parser.add_argument("--warmup_steps", type=int, default=3)
     parser.add_argument("--num_steps", type=int, default=120)
     parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
-    parser.add_argument("--output_dir", type=str, default="./test_results/sys_pruning_logs")
+    parser.add_argument("--output_dir", type=str, default="./test_results/low_loss_clips/non-streaming")
     parser.add_argument("--num_traj_samples", type=int, default=6)
-    parser.add_argument("--sparsity_ratio", type=float, default=0.5)
-    parser.add_argument("--rope_mode", type=str, default="direct")
-    parser.add_argument("--save_path", type=str, default="./saved_tensors")
+    parser.add_argument("--sparsity_ratio", type=float, default=0)
+    parser.add_argument("--rope_mode", type=str, default="reshape")
+    parser.add_argument("--save_kv_cache", action="store_true")
+    parser.add_argument("--save_kv_cache_dir", type=str, default="./saved_kv_cache/low_loss/non-streaming")
     args = parser.parse_args()
 
     model, processor = load_model(args)
-
     test_inference(args, model, processor)

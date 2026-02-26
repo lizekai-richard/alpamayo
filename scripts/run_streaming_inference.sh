@@ -11,7 +11,10 @@ CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clip_ids.json}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/Alpamayo-R1-10B}"
-OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/6samples_pruning}"
+SPARSITY_RATIO="${SPARSITY_RATIO:-0}"
+NUM_TRAJ_SAMPLES="${NUM_TRAJ_SAMPLES:-6}"
+ROPE_MODE="${ROPE_MODE:-contiguous}"
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/${NUM_TRAJ_SAMPLES}samples}"
 
 # -----------------------------------------------------------------------------
 # Load clip IDs from clip_ids.json, or fall back to default list
@@ -45,13 +48,21 @@ echo "=============================================="
 echo ""
 
 for clip_id in "${CLIP_IDS[@]}"; do
+  RESULT_FILE="$OUTPUT_DIR/streaming_${clip_id}.json"
+  if [[ -f "$RESULT_FILE" ]]; then
+    echo ">>> Skipping $clip_id (result exists: $RESULT_FILE)"
+    continue
+  fi
   echo "=============================================="
   echo ">>> Clip: $clip_id"
   echo "=============================================="
   "$PYTHON_BIN" "$INFERENCE_SCRIPT" \
     --clip-id "$clip_id" \
     --model_path "$MODEL_PATH" \
-    --output_dir "$OUTPUT_DIR"
+    --output_dir "$OUTPUT_DIR" \
+    --sparsity_ratio "$SPARSITY_RATIO" \
+    --num_traj_samples "$NUM_TRAJ_SAMPLES" \
+    --rope_mode "$ROPE_MODE"
   echo ""
 done
 

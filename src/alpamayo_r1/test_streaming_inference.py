@@ -211,6 +211,14 @@ def reset_streaming_state(model):
         delattr(language_model, "_cached_deepstack_indices")
 
 
+def save_kv_cache(kv_cache, save_path):
+    for layer_idx, layer in enumerate(kv_cache.layers):
+        key_cache = layer.keys.clone().detach().cpu()
+        value_cache = layer.values.clone().detach().cpu()
+        torch.save(key_cache, os.path.join(save_path, f"key_cache_{layer_idx}.pt"))
+        torch.save(value_cache, os.path.join(save_path, f"value_cache_{layer_idx}.pt"))
+
+
 @torch.inference_mode()
 def run_streaming_inference(model, streaming_inputs):
     """
@@ -273,11 +281,14 @@ def test_streaming_inference_compiled(args, model, processor):
         time_step_us=args.time_step_us,
     )
 
+    min_ade_list = []
+    cot_list = []
+
     logger.info("Warming up model...")
     for i in range(warmup_steps):
         streaming_input = streaming_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
                 data=helper.to_device(streaming_input, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
@@ -287,13 +298,20 @@ def test_streaming_inference_compiled(args, model, processor):
                 fuse_qkv=True,
                 fuse_gate_up=True,
                 sparsity_ratio=args.sparsity_ratio,
+                rope_mode=args.rope_mode
             )
+        if i > 0:
+            min_ade, min_ade_idx = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
+            cot = extra["cot"][0][0][min_ade_idx]
+            min_ade_list.append(float(min_ade))
+            cot_list.append(cot)
+            logger.info("Step %s: MinADE=%.4f", i, min_ade)
+            logger.info("Chain-of-Causation:\n%s", cot)
     logger.info("Warmup completed")
 
     logger.info("Running streaming inference for %s windows...", len(streaming_inputs) - warmup_steps)
     time_list = []
-    min_ade_list = []
-    cot_list = []
+    
     for i in range(warmup_steps, len(streaming_inputs)):
         streaming_input = streaming_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -309,8 +327,14 @@ def test_streaming_inference_compiled(args, model, processor):
                 fuse_qkv=True,
                 fuse_gate_up=True,
                 sparsity_ratio=args.sparsity_ratio,
+                rope_mode=args.rope_mode
             )
             end_time = time.perf_counter()
+        
+        # kv_cache_path = os.path.join(args.save_kv_cache_dir, f"clip_{args.clip_id}", f"step_{i}")
+        # os.makedirs(kv_cache_path, exist_ok=True)
+        # save_kv_cache(model._past_key_values, kv_cache_path)
+
         min_ade, min_ade_idx = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
         cot = extra["cot"][0][0][min_ade_idx]
         time_list.append(end_time - start_time)
@@ -339,14 +363,16 @@ def test_streaming_inference_compiled(args, model, processor):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run streaming inference on a clip.")
     parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
-    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="b80a15fc-d540-4c8f-81d1-5db83216b2e0")
+    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="e88802d8-cf67-4cd4-8578-a825a1bd1c71")
     parser.add_argument("--warmup_steps", type=int, default=3)
-    parser.add_argument("--num_steps", type=int, default=103)
+    parser.add_argument("--num_steps", type=int, default=120)
     parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
-    parser.add_argument("--output_dir", type=str, default="./test_results/sys_streaming_pruning_logs")
+    parser.add_argument("--output_dir", type=str, default="./test_results/low_loss_clips/streaming")
     parser.add_argument("--num_traj_samples", type=int, default=6)
-    parser.add_argument("--sparsity_ratio", type=float, default=0.5)
+    parser.add_argument("--sparsity_ratio", type=float, default=0)
+    parser.add_argument("--rope_mode", type=str, default="contiguous")
+    parser.add_argument("--save_kv_cache_dir", type=str, default="./saved_kv_cache/low_loss/streaming/")
     args = parser.parse_args()
 
     model, processor = load_model(args)
