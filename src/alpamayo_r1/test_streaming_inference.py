@@ -283,11 +283,13 @@ def test_streaming_inference_compiled(args, model, processor):
 
     min_ade_list = []
     cot_list = []
+    time_list = []
 
     logger.info("Warming up model...")
     for i in range(warmup_steps):
         streaming_input = streaming_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
+            start_time = time.perf_counter()
             pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
                 data=helper.to_device(streaming_input, "cuda"),
                 top_p=0.98,
@@ -301,18 +303,19 @@ def test_streaming_inference_compiled(args, model, processor):
                 sparsity_ratio=args.sparsity_ratio,
                 rope_mode=args.rope_mode
             )
+            end_time = time.perf_counter()
+            
         if i > 0:
             min_ade, min_ade_idx = calc_minADE(streaming_input["ego_future_xyz"], pred_xyz)
             cot = extra["cot"][0][0][min_ade_idx]
             min_ade_list.append(float(min_ade))
             cot_list.append(cot)
-            logger.info("Step %s: MinADE=%.4f", i, min_ade)
+            logger.info("Step %s: latency=%.3fs, MinADE=%.4f", i, end_time - start_time, min_ade)
             logger.info("Chain-of-Causation:\n%s", cot)
+            time_list.append(end_time - start_time)
     logger.info("Warmup completed")
 
     logger.info("Running streaming inference for %s windows...", len(streaming_inputs) - warmup_steps)
-    time_list = []
-    
     for i in range(warmup_steps, len(streaming_inputs)):
         streaming_input = streaming_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -349,7 +352,7 @@ def test_streaming_inference_compiled(args, model, processor):
 
     os.makedirs(args.output_dir, exist_ok=True)
     results = {}
-    for j in range(len(min_ade_list)):
+    for j in range(warmup_steps, len(min_ade_list)):
         results[j] = {
             "latency": time_list[j],
             "min_ade": min_ade_list[j],

@@ -854,7 +854,7 @@ class StreamingAlpamayoR1(ReasoningVLA):
             )
             # Reconstruct position IDs for pruned image tokens
             position_ids, rope_deltas, keep_mask = self._get_pruned_rope_index(
-                input_ids, image_grid_thw, token_indices, rope_mode=rope_mode
+                input_ids, image_grid_thw, vision_token_indices, rope_mode=rope_mode
             )
             input_ids = input_ids[keep_mask].view(batch_size, -1)
         else:
