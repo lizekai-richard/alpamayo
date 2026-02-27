@@ -297,6 +297,7 @@ def test_streaming_inference_compiled(args, model, processor):
                 torch_compile="max-autotune",
                 fuse_qkv=True,
                 fuse_gate_up=True,
+                return_extra=True,
                 sparsity_ratio=args.sparsity_ratio,
                 rope_mode=args.rope_mode
             )
