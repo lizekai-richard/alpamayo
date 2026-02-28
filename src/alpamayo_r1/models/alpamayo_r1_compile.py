@@ -333,26 +333,30 @@ class AlpamayoR1(ReasoningVLA):
     
     # ==================== Token Pruning ====================
     
-    def _merge_colsum(self, colsums: list[torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    def _merge_colsum(self, colsums: list[torch.Tensor], deepstack_colsums: list[torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor]]:
         # colsums is a list of tensors, each tensor is of shape [B, H, L].
-        deepstack_colsums = []
-        vision_colsums = None
-        for i in range(len(colsums)):
-            colsum = colsums[i]  # [B, H, L]
-            colsum = colsum.mean(dim=1)  # [B, L]
+        merged_colsums = None
+        colsums = colsums[0]
+        colsums = colsums.mean(dim=1)  # [B, L]
+
+        ratio = self.vlm.config.vision_config.spatial_merge_size
+        # PatchMerger groups every consecutive m² tokens via x.view(-1, hidden_size * m²),
+        # so we must sum every consecutive m² colsums to match.
+        colsums = colsums.view(colsums.shape[0], -1, ratio * ratio)
+        colsums = colsums.sum(dim=2)
+        merged_colsums = colsums
+        
+        merged_deepstack_colsums = []
+        for i in range(len(deepstack_colsums)):
+            deepstack_colsum = deepstack_colsums[i]  # [B, H, L]
+            deepstack_colsum = deepstack_colsum.mean(dim=1)  # [B, L]
 
             ratio = self.vlm.config.vision_config.spatial_merge_size
-            # PatchMerger groups every consecutive m² tokens via x.view(-1, hidden_size * m²),
-            # so we must sum every consecutive m² colsums to match.
-            colsum = colsum.view(colsum.shape[0], -1, ratio * ratio)
-            colsum = colsum.sum(dim=2)
+            deepstack_colsum = deepstack_colsum.view(deepstack_colsum.shape[0], -1, ratio * ratio)
+            deepstack_colsum = deepstack_colsum.sum(dim=2)
+            merged_deepstack_colsums.append(deepstack_colsum)
 
-            if i == len(colsums) - 1:
-                vision_colsums = colsum
-            else:
-                deepstack_colsums.append(colsum)
-
-        return vision_colsums, deepstack_colsums
+        return merged_colsums, merged_deepstack_colsums
 
     def _merge_attn_weights(self, attn_weights):
         """Merge pre-merger attention weights to post-merger resolution.
@@ -689,7 +693,6 @@ class AlpamayoR1(ReasoningVLA):
         if self._torch_compile and not hasattr(self, "_patched_for_compile"):
             patch_for_torch_compile(self, mode="non_streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
             self._patched_for_compile = True
-            del self.expert.embed_tokens
 
         # Extract inputs
         tokenized = data["tokenized_data"]
@@ -714,7 +717,7 @@ class AlpamayoR1(ReasoningVLA):
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
 
         # ===== Encode =====
-        image_embeds, deepstack_image_embeds, colsums = self._encode(pixel_values, image_grid_thw)
+        image_embeds, deepstack_image_embeds, colsums, deepstack_colsums = self._encode(pixel_values, image_grid_thw)
 
         # Merge attention weights to post-merger resolution and save
         # merged_attn = self._merge_attn_weights(attn_weights)
@@ -729,7 +732,7 @@ class AlpamayoR1(ReasoningVLA):
 
         if sparsity_ratio > 0:
             # ===== Prune =====
-            deepstack_colsums, vision_colsums = self._merge_colsum(colsums)
+            vision_colsums, deepstack_colsums = self._merge_colsum(colsums, deepstack_colsums)
             vision_token_indices = self._prune_tokens(vision_colsums, sparsity_ratio=sparsity_ratio)
             deepstack_token_indices = []
             for i in range(len(deepstack_colsums)):
