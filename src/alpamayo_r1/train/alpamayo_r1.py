@@ -140,7 +140,6 @@ class AlpamayoR1(ReasoningVLA):
         self._cached_attention_mask = None
         self._cached_streaming_attention_mask = None
         self._cached_rope_deltas = None
-        self._cached_keep_mask = None
         self.vision_start_end_ids_ranges = None
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
@@ -153,7 +152,6 @@ class AlpamayoR1(ReasoningVLA):
         self._cached_attention_mask = None
         self._cached_streaming_attention_mask = None
         self._cached_rope_deltas = None
-        self._cached_keep_mask = None
         self.vision_start_end_ids_ranges = None
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
@@ -568,6 +566,8 @@ class AlpamayoR1(ReasoningVLA):
         ego_history_xyz = window["ego_history_xyz"].to(device)
         ego_history_rot = window["ego_history_rot"].to(device)
 
+        batch_size = input_ids.shape[0]
+
         input_ids = self.fuse_traj_tokens(
             input_ids, {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot}
         )
@@ -581,7 +581,7 @@ class AlpamayoR1(ReasoningVLA):
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
                 max_cache_len=self.max_cache_len,
-                max_batch_size=1,
+                max_batch_size=batch_size,
                 offloading=False,
             )
 
@@ -613,30 +613,31 @@ class AlpamayoR1(ReasoningVLA):
             streaming_attention_mask=self._cached_streaming_attention_mask,
         )
 
-        # ===== Decode: generate CoT to populate KV cache =====
-        logits_processor = self._build_logits_processor(temperature, None, top_p)
-        output_ids = input_ids.clone()
-        unfinished = torch.ones(1, dtype=torch.bool, device=device)
-        cur_pos = cache_position[-1].item() + 1
-
-        for _ in range(max_generation_length):
-            logits = logits_processor(output_ids, logits)
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-            next_token = torch.where(unfinished, next_token, self.tokenizer.pad_token_id)
-            output_ids = torch.cat([output_ids, next_token.unsqueeze(-1)], dim=-1)
-            unfinished = unfinished & (next_token != self.traj_start_token_id)
-            if not unfinished.any():
-                break
-            logits = self._decode(
-                input_ids=next_token.unsqueeze(-1),
-                position_ids=self._cached_position_ids,
-                cache_position=torch.tensor([cur_pos], device=device),
-            )
-            cur_pos += 1
-
         # Update streaming state (shift KV cache frames)
         self._update_past_key_values()
+
+        # # ===== Decode: generate CoT to populate KV cache =====
+        # logits_processor = self._build_logits_processor(temperature, None, top_p)
+        # output_ids = input_ids.clone()
+        # unfinished = torch.ones(1, dtype=torch.bool, device=device)
+        # cur_pos = cache_position[-1].item() + 1
+
+        # for _ in range(max_generation_length):
+        #     logits = logits_processor(output_ids, logits)
+        #     probs = torch.softmax(logits, dim=-1)
+        #     next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        #     next_token = torch.where(unfinished, next_token, self.tokenizer.pad_token_id)
+        #     output_ids = torch.cat([output_ids, next_token.unsqueeze(-1)], dim=-1)
+        #     unfinished = unfinished & (next_token != self.traj_start_token_id)
+        #     if not unfinished.any():
+        #         break
+        #     logits = self._decode(
+        #         input_ids=next_token.unsqueeze(-1),
+        #         position_ids=self._cached_position_ids,
+        #         cache_position=torch.tensor([cur_pos], device=device),
+        #     )
+        #     cur_pos += 1
+
 
     def _forward_training_window(
         self,
@@ -701,6 +702,8 @@ class AlpamayoR1(ReasoningVLA):
         ego_future_xyz = window["ego_future_xyz"].to(device)
         ego_future_rot = window["ego_future_rot"].to(device)
 
+        batch_size = input_ids.shape[0]
+
         input_ids = self.fuse_traj_tokens(
             input_ids, {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot}
         )
@@ -732,7 +735,6 @@ class AlpamayoR1(ReasoningVLA):
             # Decode CoT
             logits_processor = self._build_logits_processor(temperature, None, top_p)
             output_ids = input_ids.clone()
-            batch_size = input_ids.shape[0]
             unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
             cur_pos = cache_position[-1].item() + 1
 

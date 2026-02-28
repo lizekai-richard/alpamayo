@@ -10,7 +10,7 @@ from omegaconf import OmegaConf
 
 from alpamayo_r1.train.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1 import helper
-from alpamayo_r1.train.dataset import StreamingDataset, EvalStreamingDataset, collate_fn, eval_collate_fn
+from alpamayo_r1.train.dataset import StreamingDataset, EvalStreamingDataset, collate_fn, batched_collate_fn, eval_collate_fn
 from alpamayo_r1.train.trainer import Trainer, TrainerConfig
 
 _rank = int(os.environ.get("RANK", 0))
@@ -50,11 +50,12 @@ def train(cfg):
     train_dataset = StreamingDataset(cfg, processor=processor, training_stage=cfg.training_stage)
     logger.info(f"Train dataset: {len(train_dataset)} samples")
     num_workers = getattr(cfg, "num_workers", 0)
+    batch_size = getattr(cfg, "batch_size", 1)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=1,
+        batch_size=batch_size,
         shuffle=False,  # dataset handles clip-grouped ordering internally
-        collate_fn=collate_fn,
+        collate_fn=batched_collate_fn,
         num_workers=num_workers,
         prefetch_factor=2 if num_workers > 0 else None,
         persistent_workers=num_workers > 0,
@@ -77,6 +78,8 @@ def train(cfg):
     logger.info("Building trainer...")
     trainer_config = TrainerConfig(
         training_stage=cfg.training_stage,
+        min_rollout_steps=cfg.min_rollout_steps,
+        max_rollout_steps=cfg.max_rollout_steps,
         learning_rate=cfg.lr,
         weight_decay=cfg.weight_decay,
         adam_beta1=cfg.adam_beta1,
@@ -102,6 +105,8 @@ def train(cfg):
         rollout_num_traj_samples=cfg.rollout_num_traj_samples,
         rollout_max_generation_length=cfg.rollout_max_generation_length,
         distributed=distributed,
+        use_deepspeed=getattr(cfg, "use_deepspeed", False),
+        deepspeed=OmegaConf.to_container(cfg.deepspeed, resolve=True) if getattr(cfg, "deepspeed", None) else None,
     )
 
     trainer = Trainer(

@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import random
 import shutil
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from transformers import get_scheduler
 
 from alpamayo_r1 import helper
 from alpamayo_r1.train.patches import patch_for_training
@@ -54,6 +56,8 @@ class TrainerConfig:
     training_stage: str = "vlm"  # "vlm" or "expert"
 
     # Rollout
+    min_rollout_steps: int = 1
+    max_rollout_steps: int = 8
     rollout_top_p: float = 0.98
     rollout_temperature: float = 0.6
     rollout_num_traj_samples: int = 1
@@ -61,6 +65,10 @@ class TrainerConfig:
 
     # Distributed
     distributed: bool = False
+
+    # DeepSpeed
+    use_deepspeed: bool = False
+    deepspeed: dict | None = None
 
 
 # Parameter names that should not receive weight decay
@@ -83,21 +91,22 @@ def _get_parameter_groups(model: torch.nn.Module, weight_decay: float) -> list[d
     ]
 
 
-def _build_lr_lambda(
-    warmup_steps: int,
-    total_steps: int,
-    scheduler_type: str,
-):
-    def lr_lambda(current_step: int) -> float:
-        if current_step < warmup_steps:
-            return current_step / max(1, warmup_steps)
-        progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
-        if scheduler_type == "cosine":
-            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-        # linear
-        return max(0.0, 1.0 - progress)
-
-    return lr_lambda
+def _build_ds_config(config: TrainerConfig, world_size: int) -> dict:
+    """Build the full DeepSpeed config dict from TrainerConfig fields."""
+    ds_config = {
+        "bf16": {"enabled": True},
+        "torch_autocast": {"enabled": True, "dtype": "bfloat16"},
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "gradient_clipping": config.max_grad_norm,
+        "train_micro_batch_size_per_gpu": 1,
+        "train_batch_size": config.gradient_accumulation_steps * world_size,
+        "steps_per_print": 2000,
+        "wall_clock_breakdown": False,
+    }
+    # Merge user-provided deepspeed section (zero_optimization, etc.)
+    if config.deepspeed:
+        ds_config.update(config.deepspeed)
+    return ds_config
 
 
 def _calc_min_ade(
@@ -131,6 +140,7 @@ class Trainer:
         self.config = config
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
+        self.use_deepspeed = config.use_deepspeed
 
         # Patch model classes for streaming training
         patch_for_training(model)
@@ -142,19 +152,16 @@ class Trainer:
             self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
             self.world_size = dist.get_world_size()
             self.device = torch.device("cuda", self.local_rank)
-            model = model.to(self.device)
-            self.model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=True if config.training_stage == "expert" else False)
-            logger.info(f"DDP initialized: rank={self.rank}, local_rank={self.local_rank}, world_size={self.world_size}")
         else:
             self.rank = 0
             self.local_rank = 0
             self.world_size = 1
             self.device = torch.device("cuda")
-            model = model.to(self.device)
-            self.model = model
 
-        # Optimizer
-        param_groups = _get_parameter_groups(self.model, config.weight_decay)
+        model = model.to(self.device)
+
+        # Optimizer (created before DDP/DS wrapping)
+        param_groups = _get_parameter_groups(model, config.weight_decay)
         self.optimizer = torch.optim.AdamW(
             param_groups,
             lr=config.learning_rate,
@@ -167,10 +174,29 @@ class Trainer:
             len(train_dataloader) / config.gradient_accumulation_steps
         )
         self.total_steps = steps_per_epoch * config.num_epochs
-        lr_lambda = _build_lr_lambda(
-            config.warmup_steps, self.total_steps, config.lr_scheduler_type
+        self.scheduler = get_scheduler(
+            name=config.lr_scheduler_type,
+            optimizer=self.optimizer,
+            num_warmup_steps=config.warmup_steps,
+            num_training_steps=self.total_steps,
         )
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+
+        # Wrap model: DeepSpeed, DDP, or single-GPU
+        if self.use_deepspeed:
+            import deepspeed
+            ds_config = _build_ds_config(config, self.world_size)
+            self.model, self.optimizer, _, self.scheduler = deepspeed.initialize(
+                model=model,
+                optimizer=self.optimizer,
+                lr_scheduler=self.scheduler,
+                config=ds_config,
+            )
+            logger.info(f"DeepSpeed ZeRO-2 initialized: rank={self.rank}, world_size={self.world_size}")
+        elif self.is_distributed:
+            self.model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=True if config.training_stage == "expert" else False)
+            logger.info(f"DDP initialized: rank={self.rank}, local_rank={self.local_rank}, world_size={self.world_size}")
+        else:
+            self.model = model
 
         # State
         self.global_step = 0
@@ -184,8 +210,10 @@ class Trainer:
 
     @property
     def _unwrapped_model(self):
-        """Get the underlying model (unwrap DDP if needed)."""
-        return self.model.module if self.is_distributed else self.model
+        """Get the underlying model (unwrap DDP/DeepSpeed if needed)."""
+        if self.use_deepspeed or self.is_distributed:
+            return self.model.module
+        return self.model
 
     # ------------------------------------------------------------------
     # Training
@@ -210,10 +238,16 @@ class Trainer:
             accum_loss = 0.0
             accum_count = 0
 
+            # Set initial rollout_steps before first batch is fetched
+            self._resample_rollout_steps()
+
             for batch_idx, batch in enumerate(self.train_dataloader):
                 loss = self._training_step(batch)
                 accum_loss += loss
                 accum_count += 1
+
+                # Resample rollout_steps for the next batch
+                self._resample_rollout_steps()
 
                 if accum_count % self.config.gradient_accumulation_steps == 0:
                     self._optimization_step()
@@ -252,7 +286,7 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _training_step(self, batch: list[dict[str, Any]]) -> float:
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        if self.use_deepspeed:
             output = self.model(
                 batch=batch,
                 device=self.device,
@@ -262,23 +296,58 @@ class Trainer:
                 top_p=self.config.rollout_top_p,
             )
             loss = output["loss"]
+            self.model.backward(loss)
+        else:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                output = self.model(
+                    batch=batch,
+                    device=self.device,
+                    training_stage=self.config.training_stage,
+                    max_generation_length=self.config.rollout_max_generation_length,
+                    temperature=self.config.rollout_temperature,
+                    top_p=self.config.rollout_top_p,
+                )
+                loss = output["loss"]
 
-        scaled_loss = loss / self.config.gradient_accumulation_steps
-        scaled_loss.backward()
-        # DDP handles gradient allreduce automatically via forward() hooks.
+            scaled_loss = loss / self.config.gradient_accumulation_steps
+            scaled_loss.backward()
 
         self._last_rollout_steps = output.get("rollout_steps", 0)
         return loss.detach().item()
 
     def _optimization_step(self):
-        if self.config.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.config.max_grad_norm
-            )
-        self.optimizer.step()
-        self.scheduler.step()
-        self.optimizer.zero_grad()
+        if self.use_deepspeed:
+            # DeepSpeed engine.step() handles grad clipping, optimizer, scheduler, and zero_grad
+            self.model.step()
+        else:
+            if self.config.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.config.max_grad_norm
+                )
+            self.optimizer.step()
+            self.scheduler.step()
+            self.optimizer.zero_grad()
         self.global_step += 1
+
+    def _resample_rollout_steps(self):
+        """Sample a new rollout_steps value on rank 0 and broadcast to all ranks.
+
+        Must be called with num_workers=0 so the dataset mutation is visible
+        to the next DataLoader __getitem__ call.
+        """
+        if self.is_distributed:
+            t = torch.empty(1, dtype=torch.long, device=self.device)
+            if self._is_main_process:
+                t.fill_(random.randint(
+                    self.config.min_rollout_steps, self.config.max_rollout_steps
+                ))
+            dist.broadcast(t, src=0)
+            rollout_steps = t.item()
+        else:
+            rollout_steps = random.randint(
+                self.config.min_rollout_steps, self.config.max_rollout_steps
+            )
+        self.train_dataloader.dataset.set_rollout_steps(rollout_steps)
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -368,6 +437,26 @@ class Trainer:
             self.config.output_dir, f"checkpoint-{self.global_step}"
         )
 
+        if self.use_deepspeed:
+            # DeepSpeed save_checkpoint is a collective op — all ranks must call
+            client_state = {
+                "global_step": self.global_step,
+                "epoch": self.epoch,
+                "best_eval_loss": self.best_eval_loss,
+            }
+            self.model.save_checkpoint(ckpt_dir, tag="deepspeed", client_state=client_state)
+            if self._is_main_process:
+                self._unwrapped_model.save_pretrained(ckpt_dir)
+                logger.info(f"Saved DeepSpeed checkpoint to {ckpt_dir}")
+                self._rotate_checkpoints()
+                if is_best:
+                    best_dir = os.path.join(self.config.output_dir, "best_model")
+                    if os.path.exists(best_dir):
+                        shutil.rmtree(best_dir)
+                    shutil.copytree(ckpt_dir, best_dir)
+                    logger.info(f"Saved best model to {best_dir}")
+            return
+
         if not self._is_main_process:
             dist.barrier()
             return
@@ -418,6 +507,17 @@ class Trainer:
             logger.info(f"Removed old checkpoint: {path}")
 
     def _load_checkpoint(self, path: str):
+        if self.use_deepspeed:
+            _, client_state = self.model.load_checkpoint(path, tag="deepspeed")
+            if client_state is None:
+                logger.warning(f"No DeepSpeed checkpoint found in {path}, starting from scratch")
+                return
+            self.global_step = client_state["global_step"]
+            self.epoch = client_state["epoch"]
+            self.best_eval_loss = client_state.get("best_eval_loss", float("inf"))
+            logger.info(f"Resumed DeepSpeed from {path} at step {self.global_step}, epoch {self.epoch}")
+            return
+
         state_path = os.path.join(path, "training_state.pt")
         if not os.path.isfile(state_path):
             logger.warning(

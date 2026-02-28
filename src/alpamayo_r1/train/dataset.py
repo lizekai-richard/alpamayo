@@ -112,6 +112,34 @@ def collate_fn(batch):
 eval_collate_fn = collate_fn
 
 
+def batched_collate_fn(batch):
+    """Collate for batch_size >= 1.  Stacks tensors across samples at each
+    window position.
+
+    Input : list of N items, each a list of W window dicts.
+    Output: list of W window dicts with tensors of shape [N, ...].
+
+    Keys in _NO_BATCH_DIM_KEYS (pixel_values, image_grid_thw) are concatenated
+    rather than stacked, because their first dimension is num_patches / num_images
+    rather than batch.
+    """
+    num_windows = len(batch[0])
+    result = []
+    for w_idx in range(num_windows):
+        window: dict = {}
+        for key in batch[0][w_idx]:
+            values = [sample[w_idx][key] for sample in batch]
+            if isinstance(values[0], torch.Tensor):
+                if key in _NO_BATCH_DIM_KEYS:
+                    window[key] = torch.cat(values, dim=0)
+                else:
+                    window[key] = torch.stack(values)
+            else:
+                window[key] = values[0]
+        result.append(window)
+    return result
+
+
 class StreamingDataset(torch.utils.data.Dataset):
     """
     Dataset that creates contiguous sliding window subsequences from pre-dumped clips.
@@ -179,6 +207,10 @@ class StreamingDataset(torch.utils.data.Dataset):
             num_threads=prefetch_threads,
         )
 
+        # Current rollout steps — set externally via set_rollout_steps() before
+        # each training step so all samples in a batch share the same value.
+        self._rollout_steps = self.max_rollout_steps
+
         self.load_data()
         self._organize_by_clip()
 
@@ -193,53 +225,32 @@ class StreamingDataset(torch.utils.data.Dataset):
         return self._clip_prefetcher.get(clip_id, self._get_clip_path(clip_id))
 
     def load_data(self):
-        """Build index of (clip_id, start, seq_len) without loading tensor data.
+        """Build a flat index of (clip_id, sample_idx) pairs.
 
-        Uses DEFAULT_CLIP_LENGTH as the assumed number of windows per clip
-        to avoid loading every .pt file at startup. Out-of-bounds indices are
-        clamped in __getitem__.
+        The start position within the clip is sampled randomly in __getitem__
+        using the current _rollout_steps value.
         """
-        self.data: list[tuple[str, int, int]] = []  # (clip_id, start, seq_len)
-        min_seq_len = self.min_rollout_steps + 1
-        total = self.DEFAULT_CLIP_LENGTH
-
+        self.data: list[tuple[str, int]] = []  # (clip_id, sample_idx)
         for clip_id in self.clip_ids:
             if not os.path.isfile(self._get_clip_path(clip_id)):
                 continue
+            for i in range(self.samples_per_clip):
+                self.data.append((clip_id, i))
 
-            seen: set[tuple[int, int]] = set()
-            max_retries = self.samples_per_clip * 10
-            collected = 0
-
-            for _ in range(max_retries):
-                if collected >= self.samples_per_clip:
-                    break
-
-                rollout_steps = random.randint(self.min_rollout_steps, self.max_rollout_steps)
-                seq_len = rollout_steps + 1
-                max_start = total - seq_len
-                if max_start < 0:
-                    continue
-
-                start = random.randint(0, max_start)
-                if (start, rollout_steps) in seen:
-                    continue
-
-                seen.add((start, rollout_steps))
-                self.data.append((clip_id, start, seq_len))
-                collected += 1
+    def set_rollout_steps(self, rollout_steps: int):
+        """Set the rollout steps for the next batch (called by the trainer)."""
+        self._rollout_steps = rollout_steps
 
     def _organize_by_clip(self):
         """Group samples by clip_id and build clip-grouped index ordering.
 
-        Within each clip, samples are sorted by start position.
+        Within each clip, samples are sorted by sample_idx.
         Clip order is shuffled (deterministic per epoch).
         For distributed training, clips are split across ranks.
         """
         groups = defaultdict(list)
-        for i, (clip_id, start, seq_len) in enumerate(self.data):
-            groups[clip_id].append(i)
-        # Sort within each clip by start position
+        for i, entry in enumerate(self.data):
+            groups[entry[0]].append(i)
         for clip_id in groups:
             groups[clip_id].sort(key=lambda i: self.data[i][1])
         self._clip_groups = groups  # clip_id -> [indices into self.data]
@@ -261,7 +272,7 @@ class StreamingDataset(torch.utils.data.Dataset):
             self._ordered_indices.extend(self._clip_groups[clip_id])
 
         # Pad for DDP so each rank has the same number of samples
-        if self._world_size > 1:
+        if self._world_size > 1 and self._ordered_indices:
             target = math.ceil(len(self.data) / self._world_size)
             while len(self._ordered_indices) < target:
                 wrap_idx = len(self._ordered_indices) % max(1, len(self._ordered_indices))
@@ -400,7 +411,7 @@ class StreamingDataset(torch.utils.data.Dataset):
 
         return item
 
-    def __getitem__(self, idx, _skip_attempts=10):
+    def __getitem__(self, idx, _skip_attempts=10, _bad_clips=None):
         try:
             return self._getitem_impl(idx)
         except (OSError, Exception) as e:
@@ -412,25 +423,32 @@ class StreamingDataset(torch.utils.data.Dataset):
                 "Skip bad sample idx=%s clip_id=%s (%s), retrying with another sample: %s",
                 idx, clip_id, type(e).__name__, e,
             )
-            others = [i for i in range(len(self)) if i != idx]
+            if _bad_clips is None:
+                _bad_clips = set()
+            _bad_clips.add(clip_id)
+            others = [
+                i for i in range(len(self))
+                if self.data[self._ordered_indices[i]][0] not in _bad_clips
+            ]
             if not others:
                 raise
-            return self.__getitem__(random.choice(others), _skip_attempts=_skip_attempts - 1)
+            return self.__getitem__(random.choice(others), _skip_attempts=_skip_attempts - 1, _bad_clips=_bad_clips)
 
     def _getitem_impl(self, idx):
         real_idx = self._ordered_indices[idx]
-        clip_id, start, seq_len = self.data[real_idx]
+        clip_id = self.data[real_idx][0]
 
-        # Trigger prefetch of the next clip on first access to a new clip
+        # Trigger prefetch of the next clip
         next_clip = self._next_clip_for.get(clip_id)
         if next_clip is not None:
             self._clip_prefetcher.prefetch(next_clip, self._get_clip_path(next_clip))
 
         all_windows = self._load_clip(clip_id)
-        # Clamp to actual clip length in case DEFAULT_CLIP_LENGTH was too large
         actual_len = len(all_windows)
-        if start + seq_len > actual_len:
-            start = max(0, actual_len - seq_len)
+
+        seq_len = self._rollout_steps + 1
+        max_start = max(0, actual_len - seq_len)
+        start = random.randint(0, max_start)
         windows = all_windows[start : start + seq_len]
 
         last = len(windows) - 1
@@ -453,7 +471,16 @@ class EvalStreamingDataset(StreamingDataset):
     Each item is a complete clip (all windows from start to end).
     - Window 0: prefill (no metrics)
     - Windows 1+: streaming windows with trajectory ground truth for minADE
+
+    Eval runs on rank 0 only, so we skip distributed sharding.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Override: eval is rank-0 only, no need to shard across ranks
+        self._rank = 0
+        self._world_size = 1
+        self._rebuild_order()
 
     def load_data(self):
         """One entry per clip — eval runs the entire clip."""
@@ -465,7 +492,7 @@ class EvalStreamingDataset(StreamingDataset):
 
     def __getitem__(self, idx):
         real_idx = self._ordered_indices[idx]
-        clip_id, _, _ = self.data[real_idx]
+        clip_id = self.data[real_idx][0]
         all_windows = self._load_clip(clip_id)
 
         result = []

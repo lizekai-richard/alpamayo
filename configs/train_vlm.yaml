@@ -9,7 +9,7 @@ shuffle: true
 min_rollout_steps: 4
 max_rollout_steps: 8
 samples_per_clip: 200
-num_workers: 4
+num_workers: 0
 
 # Eval data
 eval_data_dir: /mnt/moosefs-1/users/zekail/dumped_inputs
