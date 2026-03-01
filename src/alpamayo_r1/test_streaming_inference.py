@@ -352,7 +352,7 @@ def test_streaming_inference_compiled(args, model, processor):
 
     os.makedirs(args.output_dir, exist_ok=True)
     results = {}
-    for j in range(warmup_steps, len(min_ade_list)):
+    for j in range(1, len(min_ade_list)):
         results[j] = {
             "latency": time_list[j],
             "min_ade": min_ade_list[j],

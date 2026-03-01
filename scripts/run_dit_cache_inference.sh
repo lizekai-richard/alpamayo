@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run test_inference.py (AlpamayoR1 compile model) for selected clip IDs.
+# Run test_inference.py (AlpamayoR1 DIT Cache model) for selected clip IDs.
 # Clip IDs are read from clip_ids.json in the repo root.
 #
 # Supports multi-GPU parallelism: clips are evenly distributed across GPUs,
@@ -9,9 +9,7 @@
 #   NUM_GPUS          Number of GPUs to use (default: 8)
 #   PYTHON_BIN        Python binary (default: python)
 #   MODEL_PATH        Path to model weights
-#   NUM_TRAJ_SAMPLES  Trajectory samples per clip (default: 6)
-#   SPARSITY_RATIO    Sparsity ratio (default: 0.5)
-#   ROPE_MODE         RoPE mode (default: direct)
+#   CACHE_STEPS       Cache steps list (default: [1, 3, 5, 7, 9])
 #   OUTPUT_DIR        Where to write results
 #   CLIP_IDS_FILE     Path to clip_ids.json
 
@@ -19,17 +17,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-INFERENCE_SCRIPT="$REPO_ROOT/src/alpamayo_r1/test_inference.py"
+INFERENCE_SCRIPT="$REPO_ROOT/src/alpamayo_r1/test_inference_dit_cache.py"
 CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clip_ids.json}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/Alpamayo-R1-10B}"
-NUM_TRAJ_SAMPLES="${NUM_TRAJ_SAMPLES:-6}"
-SPARSITY_RATIO="${SPARSITY_RATIO:-0.5}"
-ROPE_MODE="${ROPE_MODE:-direct}"
 NUM_GPUS="${NUM_GPUS:-8}"
+CACHE_STEPS="${CACHE_STEPS:-[1, 3, 5, 7, 9]}"
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/dit_cache_${CACHE_STEPS}}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/6samples_sparsity${SPARSITY_RATIO}_${ROPE_MODE}}"
 # -----------------------------------------------------------------------------
 # Load clip IDs from clip_ids.json, or fall back to default list
 # -----------------------------------------------------------------------------
@@ -54,11 +50,12 @@ cd "$REPO_ROOT"
 mkdir -p "$OUTPUT_DIR"
 
 echo "=============================================="
-echo "Alpamayo-R1 Compile Inference (Multi-GPU)"
+echo "Alpamayo-R1 DIT Cache Inference (Multi-GPU)"
 echo "=============================================="
 echo "Repo root:    $REPO_ROOT"
 echo "Model path:   $MODEL_PATH"
 echo "Output dir:   $OUTPUT_DIR"
+echo "Cache steps:  $CACHE_STEPS"
 echo "Total clips:  $TOTAL_CLIPS"
 echo "Num GPUs:     $NUM_GPUS"
 echo "=============================================="
@@ -80,9 +77,7 @@ run_worker() {
       --clip-id "$clip_id" \
       --model_path "$MODEL_PATH" \
       --output_dir "$OUTPUT_DIR" \
-      --num_traj_samples "$NUM_TRAJ_SAMPLES" \
-      --sparsity_ratio "$SPARSITY_RATIO" \
-      --rope_mode "$ROPE_MODE"
+      --cache_steps "$CACHE_STEPS"
   done
 
   echo "[GPU $gpu_id] Finished all ${#clips[@]} clip(s)."
@@ -132,5 +127,5 @@ if [[ $FAILED -gt 0 ]]; then
   exit 1
 else
   echo "Done. All $TOTAL_CLIPS clip(s) completed across $NUM_GPUS GPU(s)."
-  echo "Results (compile_<clip_id>.json) saved under $OUTPUT_DIR"
+  echo "Results (dit_cache_<clip_id>.json) saved under $OUTPUT_DIR"
 fi

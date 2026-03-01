@@ -55,7 +55,8 @@ class FlowMatching(BaseDiffusion):
         device: torch.device = torch.device("cpu"),
         return_all_steps: bool = False,
         inference_step: int | None = None,
-        int_method: Literal["euler"] | None = None,
+        int_method: Literal["euler", "euler_with_cache"] | None = None,
+        cache_steps: list[int] | None = None,
         *args,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -69,7 +70,7 @@ class FlowMatching(BaseDiffusion):
             return_all_steps: Whether to return all steps.
             inference_step: The number of inference steps. (override self.num_inference_steps)
             int_method: The integration method used in inference. (override self.int_method)
-
+            cache_steps: The cache steps.
         Returns:
             torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
                 The final sampled tensor [B, *x_dims] if return_all_steps is False,
@@ -82,6 +83,17 @@ class FlowMatching(BaseDiffusion):
                 noise=noise,
                 batch_size=batch_size,
                 step_fn=step_fn,
+                device=device,
+                return_all_steps=return_all_steps,
+                inference_step=inference_step,
+            )
+        elif int_method == "euler_with_cache":
+            assert cache_steps is not None, "cache_steps must be provided for euler_with_cache"
+            return self._euler_with_cache(
+                noise=noise,
+                batch_size=batch_size,
+                step_fn=step_fn,
+                cache_steps=cache_steps,
                 device=device,
                 return_all_steps=return_all_steps,
                 inference_step=inference_step,
@@ -107,7 +119,6 @@ class FlowMatching(BaseDiffusion):
             device: The device to use.
             return_all_steps: Whether to return all steps.
             inference_step: The inference step.
-
         Returns:
             torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
                 The final sampled tensor [B, *x_dims] if return_all_steps is False,
@@ -126,6 +137,57 @@ class FlowMatching(BaseDiffusion):
             dt = dt.view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
             t_start = time_steps[i].view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
             v = step_fn(x=x, t=t_start)
+            x = x + dt * v
+            if return_all_steps:
+                all_steps.append(x)
+        if return_all_steps:
+            return torch.stack(all_steps, dim=1), time_steps
+        return x
+    
+    def _euler_with_cache(
+        self,
+        noise: torch.Tensor,
+        batch_size: int,
+        step_fn: StepFn,
+        cache_steps: list[int],
+        device: torch.device = torch.device("cpu"),
+        return_all_steps: bool = False,
+        inference_step: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Euler integration for flow matching with cache.
+
+        Args:
+            noise: Initial noise tensor of shape [batch_size, *x_dims].
+            batch_size: The batch size.
+            step_fn: The denoising step function.
+            device: The device to use.
+            return_all_steps: Whether to return all steps.
+            inference_step: The inference step.
+            cache_steps: The cache steps.
+        Returns:
+            torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+                The final sampled tensor [B, *x_dims] if return_all_steps is False,
+                otherwise a tuple of all sampled tensors [B, T, *x_dims] and the time steps [T].
+        """
+        x = noise
+        time_steps = torch.linspace(
+            0.0, 1.0, inference_step + 1, device=device, dtype=torch.bfloat16
+        )
+        n_dim = len(self.x_dims)
+        if return_all_steps:
+            all_steps = [x]
+
+        for i in range(inference_step):
+            dt = time_steps[i + 1] - time_steps[i]
+            dt = dt.view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
+            t_start = time_steps[i].view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
+            if i in cache_steps:
+                v = self._cached_velocity
+            else:
+                v = step_fn(x=x, t=t_start)
+                if not hasattr(self, "_cached_velocity"):
+                    self._cached_velocity = torch.empty_like(v)
+                self._cached_velocity.copy_(v)
             x = x + dt * v
             if return_all_steps:
                 all_steps.append(x)

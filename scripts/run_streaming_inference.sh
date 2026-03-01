@@ -1,6 +1,19 @@
 #!/bin/bash
 # Run test_streaming_inference.py for selected clip IDs.
 # Clip IDs are read from clip_ids.json in the repo root.
+#
+# Supports multi-GPU parallelism: clips are evenly distributed across GPUs,
+# each running as a separate background process with its own CUDA_VISIBLE_DEVICES.
+#
+# Environment variables:
+#   NUM_GPUS          Number of GPUs to use (default: 8)
+#   PYTHON_BIN        Python binary (default: python)
+#   MODEL_PATH        Path to model weights
+#   NUM_TRAJ_SAMPLES  Trajectory samples per clip (default: 6)
+#   SPARSITY_RATIO    Sparsity ratio (default: 0)
+#   ROPE_MODE         RoPE mode (default: contiguous)
+#   OUTPUT_DIR        Where to write results
+#   CLIP_IDS_FILE     Path to clip_ids.json
 
 set -euo pipefail
 
@@ -14,6 +27,7 @@ MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/Alpamayo-R1-10B}"
 SPARSITY_RATIO="${SPARSITY_RATIO:-0}"
 NUM_TRAJ_SAMPLES="${NUM_TRAJ_SAMPLES:-6}"
 ROPE_MODE="${ROPE_MODE:-contiguous}"
+NUM_GPUS="${NUM_GPUS:-8}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/${NUM_TRAJ_SAMPLES}samples}"
 
 # -----------------------------------------------------------------------------
@@ -30,40 +44,98 @@ else
   CLIP_IDS=("b80a15fc-d540-4c8f-81d1-5db83216b2e0")
 fi
 
+TOTAL_CLIPS=${#CLIP_IDS[@]}
+
 export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
-# Optional: run from repo root so model path "./Alpamayo-R1-10B" works
+# Run from repo root so model path "./Alpamayo-R1-10B" works
 cd "$REPO_ROOT"
 
 mkdir -p "$OUTPUT_DIR"
 
 echo "=============================================="
-echo "Alpamayo-R1 Streaming Inference"
+echo "Alpamayo-R1 Streaming Inference (Multi-GPU)"
 echo "=============================================="
 echo "Repo root:    $REPO_ROOT"
 echo "Model path:   $MODEL_PATH"
 echo "Output dir:   $OUTPUT_DIR"
-echo "Clips:        ${#CLIP_IDS[@]} clip(s)"
+echo "Total clips:  $TOTAL_CLIPS"
+echo "Num GPUs:     $NUM_GPUS"
 echo "=============================================="
 echo ""
 
-for clip_id in "${CLIP_IDS[@]}"; do
-  RESULT_FILE="$OUTPUT_DIR/streaming_${clip_id}.json"
-  if [[ -f "$RESULT_FILE" ]]; then
-    echo ">>> Skipping $clip_id (result exists: $RESULT_FILE)"
+# -----------------------------------------------------------------------------
+# Worker function: runs a subset of clips on a single GPU
+# -----------------------------------------------------------------------------
+run_worker() {
+  local gpu_id=$1
+  shift
+  local clips=("$@")
+
+  echo "[GPU $gpu_id] Processing ${#clips[@]} clip(s): ${clips[0]} ... ${clips[-1]}"
+
+  for clip_id in "${clips[@]}"; do
+    RESULT_FILE="$OUTPUT_DIR/streaming_${clip_id}.json"
+    if [[ -f "$RESULT_FILE" ]]; then
+      echo "[GPU $gpu_id] >>> Skipping $clip_id (result exists: $RESULT_FILE)"
+      continue
+    fi
+    echo "[GPU $gpu_id] >>> Clip: $clip_id"
+    CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" "$INFERENCE_SCRIPT" \
+      --clip-id "$clip_id" \
+      --model_path "$MODEL_PATH" \
+      --output_dir "$OUTPUT_DIR" \
+      --sparsity_ratio "$SPARSITY_RATIO" \
+      --num_traj_samples "$NUM_TRAJ_SAMPLES" \
+      --rope_mode "$ROPE_MODE"
+  done
+
+  echo "[GPU $gpu_id] Finished all ${#clips[@]} clip(s)."
+}
+
+# -----------------------------------------------------------------------------
+# Distribute clips across GPUs (round-robin) and launch workers
+# -----------------------------------------------------------------------------
+declare -a PIDS=()
+
+for (( gpu=0; gpu<NUM_GPUS; gpu++ )); do
+  # Collect clips for this GPU via round-robin assignment
+  worker_clips=()
+  for (( i=gpu; i<TOTAL_CLIPS; i+=NUM_GPUS )); do
+    worker_clips+=("${CLIP_IDS[$i]}")
+  done
+
+  # Skip if this GPU got no clips (more GPUs than clips)
+  if [[ ${#worker_clips[@]} -eq 0 ]]; then
     continue
   fi
-  echo "=============================================="
-  echo ">>> Clip: $clip_id"
-  echo "=============================================="
-  "$PYTHON_BIN" "$INFERENCE_SCRIPT" \
-    --clip-id "$clip_id" \
-    --model_path "$MODEL_PATH" \
-    --output_dir "$OUTPUT_DIR" \
-    --sparsity_ratio "$SPARSITY_RATIO" \
-    --num_traj_samples "$NUM_TRAJ_SAMPLES" \
-    --rope_mode "$ROPE_MODE"
-  echo ""
+
+  # Launch worker in background
+  run_worker "$gpu" "${worker_clips[@]}" &
+  PIDS+=($!)
 done
 
-echo "Done. Results (streaming_<clip_id>.json) saved under $OUTPUT_DIR"
+echo ""
+echo "Launched ${#PIDS[@]} workers (PIDs: ${PIDS[*]})"
+echo "Waiting for all workers to finish..."
+echo ""
+
+# -----------------------------------------------------------------------------
+# Wait for all workers; track failures
+# -----------------------------------------------------------------------------
+FAILED=0
+for pid in "${PIDS[@]}"; do
+  if ! wait "$pid"; then
+    echo "ERROR: Worker PID $pid failed." >&2
+    FAILED=$((FAILED + 1))
+  fi
+done
+
+echo ""
+if [[ $FAILED -gt 0 ]]; then
+  echo "WARNING: $FAILED / ${#PIDS[@]} worker(s) failed." >&2
+  exit 1
+else
+  echo "Done. All $TOTAL_CLIPS clip(s) completed across $NUM_GPUS GPU(s)."
+  echo "Results (streaming_<clip_id>.json) saved under $OUTPUT_DIR"
+fi

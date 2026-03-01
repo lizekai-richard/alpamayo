@@ -144,13 +144,8 @@ def run_inference(args, model, processor, sliding_window_inputs):
                 torch_compile="max-autotune",
                 fuse_qkv=True,
                 fuse_gate_up=True,
-                sparsity_ratio=args.sparsity_ratio,
-                rope_mode=args.rope_mode,
+                diffusion_kwargs={"cache_steps": args.cache_steps, "int_method": "euler_with_cache"},
             )
-        
-        # kv_cache_path = os.path.join(args.save_kv_cache_dir, f"clip_{args.clip_id}", f"step_{i}")
-        # os.makedirs(kv_cache_path, exist_ok=True)
-        # save_kv_cache(kv_cache_return, kv_cache_path)
 
         end_time = time.perf_counter()
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
@@ -174,13 +169,8 @@ def run_inference(args, model, processor, sliding_window_inputs):
                 return_extra=True,
                 fuse_qkv=True,
                 fuse_gate_up=True,
-                sparsity_ratio=args.sparsity_ratio,
-                rope_mode=args.rope_mode,
+                diffusion_kwargs={"cache_steps": args.cache_steps, "int_method": "euler_with_cache"},
             )
-        
-        # kv_cache_path = os.path.join(args.save_kv_cache_dir, f"clip_{args.clip_id}", f"step_{i}")
-        # os.makedirs(kv_cache_path, exist_ok=True)
-        # save_kv_cache(kv_cache_return, kv_cache_path)
 
         end_time = time.perf_counter()
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
@@ -234,12 +224,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_steps", type=int, default=120)
     parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
-    parser.add_argument("--output_dir", type=str, default="./test_results/low_loss_clips/non-streaming")
+    parser.add_argument("--output_dir", type=str, default="./test_results/dit_cache_13579")
     parser.add_argument("--num_traj_samples", type=int, default=6)
-    parser.add_argument("--sparsity_ratio", type=float, default=0)
-    parser.add_argument("--rope_mode", type=str, default="reshape")
-    parser.add_argument("--save_kv_cache", action="store_true")
-    parser.add_argument("--save_kv_cache_dir", type=str, default="./saved_kv_cache/low_loss/non-streaming")
+    parser.add_argument("--cache_steps", type=list, default=[1, 3, 5, 7, 9])
     args = parser.parse_args()
 
     model, processor = load_model(args)
