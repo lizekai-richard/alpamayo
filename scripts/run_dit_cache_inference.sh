@@ -18,13 +18,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INFERENCE_SCRIPT="$REPO_ROOT/src/alpamayo_r1/test_inference_dit_cache.py"
-CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clip_ids.json}"
+CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clips.json}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/Alpamayo-R1-10B}"
 NUM_GPUS="${NUM_GPUS:-8}"
 CACHE_STEPS="${CACHE_STEPS:-[1, 3, 5, 7, 9]}"
-OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/dit_cache_${CACHE_STEPS}}"
+DUMPED_DATA_DIR="${DUMPED_DATA_DIR:-}"
+NUM_TRAJ_SAMPLES="${NUM_TRAJ_SAMPLES:-6}"
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/${NUM_TRAJ_SAMPLES}samples_dit_cache_${CACHE_STEPS}}"
 
 # -----------------------------------------------------------------------------
 # Load clip IDs from clip_ids.json, or fall back to default list
@@ -77,7 +79,9 @@ run_worker() {
       --clip-id "$clip_id" \
       --model_path "$MODEL_PATH" \
       --output_dir "$OUTPUT_DIR" \
-      --cache_steps "$CACHE_STEPS"
+      --cache_steps "$CACHE_STEPS" \
+      --num_traj_samples "$NUM_TRAJ_SAMPLES" \
+      ${DUMPED_DATA_DIR:+--dumped_data_dir "$DUMPED_DATA_DIR"}
   done
 
   echo "[GPU $gpu_id] Finished all ${#clips[@]} clip(s)."

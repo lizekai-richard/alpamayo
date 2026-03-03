@@ -6,4 +6,4 @@ cd /home/zekail/alpamayo
 
 torchrun --nproc_per_node=8 src/alpamayo_r1/dump_data.py \
   --clip_ids_file clips_for_train.json \
-  --output_dir ./streaming_training_data
+  --output_dir ./dumped_eval_data

@@ -28,9 +28,24 @@ from alpamayo_r1.models.alpamayo_r1_streaming_compile import StreamingAlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
+def _get_rank() -> int:
+    for key in ("WORKER_RANK", "RANK", "LOCAL_RANK", "SLURM_PROCID"):
+        value = os.environ.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                pass
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+RANK = _get_rank()
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO if RANK == 0 else logging.ERROR,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
@@ -253,16 +268,32 @@ def run_streaming_inference(model, streaming_inputs):
         logger.info("MinADE: %s", min_ade)
 
 
+def load_or_create_streaming_inputs(args, processor):
+    """Load dumped inputs or create them from scratch."""
+    if args.dumped_data_dir:
+        logger.info("Loading dumped inputs from %s for clip %s", args.dumped_data_dir, args.clip_id)
+        windows = helper.load_dumped_inputs(args.dumped_data_dir, args.clip_id)
+        windows = windows[:args.num_steps]
+        vision_start_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        vision_end_id = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+        streaming_inputs = [windows[0]]
+        for w in windows[1:]:
+            streaming_inputs.append(helper.convert_to_streaming_window(w, vision_start_id, vision_end_id))
+        return streaming_inputs
+    else:
+        return create_sliding_window_inputs(
+            processor=processor,
+            num_windows=args.num_steps,
+            clip_id=args.clip_id,
+            t0_us=args.t0_us,
+            time_step_us=args.time_step_us,
+        )
+
+
 def test_streaming_inference(args, model, processor):
     """Test streaming inference with sliding window (non-compiled, single clip)."""
     logger.info("Creating sliding window inputs for clip_id: %s", args.clip_id)
-    streaming_inputs = create_sliding_window_inputs(
-        processor=processor,
-        num_windows=args.num_steps,
-        clip_id=args.clip_id,
-        t0_us=args.t0_us,
-        time_step_us=args.time_step_us,
-    )
+    streaming_inputs = load_or_create_streaming_inputs(args, processor)
     logger.info("Created %s windows", len(streaming_inputs))
     run_streaming_inference(model, streaming_inputs)
     logger.info("Completed streaming inference")
@@ -273,13 +304,7 @@ def test_streaming_inference_compiled(args, model, processor):
     """Test streaming inference with compiled model and save results."""
     reset_streaming_state(model)
     warmup_steps = args.warmup_steps
-    streaming_inputs = create_sliding_window_inputs(
-        processor=processor,
-        num_windows=args.num_steps,
-        clip_id=args.clip_id,
-        t0_us=args.t0_us,
-        time_step_us=args.time_step_us,
-    )
+    streaming_inputs = load_or_create_streaming_inputs(args, processor)
 
     min_ade_list = []
     cot_list = []
@@ -377,6 +402,7 @@ if __name__ == "__main__":
     parser.add_argument("--sparsity_ratio", type=float, default=0)
     parser.add_argument("--rope_mode", type=str, default="contiguous")
     parser.add_argument("--save_kv_cache_dir", type=str, default="./saved_kv_cache/low_loss/streaming/")
+    parser.add_argument("--dumped_data_dir", type=str, default=None, help="Path to pre-dumped eval data directory")
     args = parser.parse_args()
 
     model, processor = load_model(args)

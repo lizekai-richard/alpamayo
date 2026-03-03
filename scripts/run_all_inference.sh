@@ -1,6 +1,6 @@
 #!/bin/bash
-# Run test_inference.py (AlpamayoR1 compile model) for selected clip IDs.
-# Clip IDs are read from clip_ids.json in the repo root.
+# Run test_streaming_inference.py for selected clip IDs.
+# Clip IDs are read from clips.json in the repo root.
 #
 # Supports multi-GPU parallelism: clips are evenly distributed across GPUs,
 # each running as a separate background process with its own CUDA_VISIBLE_DEVICES.
@@ -10,29 +10,29 @@
 #   PYTHON_BIN        Python binary (default: python)
 #   MODEL_PATH        Path to model weights
 #   NUM_TRAJ_SAMPLES  Trajectory samples per clip (default: 6)
-#   SPARSITY_RATIO    Sparsity ratio (default: 0.5)
-#   ROPE_MODE         RoPE mode (default: direct)
+#   SPARSITY_RATIO    Sparsity ratio (default: 0)
+#   ROPE_MODE         RoPE mode (default: contiguous)
 #   OUTPUT_DIR        Where to write results
-#   CLIP_IDS_FILE     Path to clip_ids.json
+#   CLIP_IDS_FILE     Path to clips.json
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-INFERENCE_SCRIPT="$REPO_ROOT/src/alpamayo_r1/test_inference.py"
-CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clip_ids.json}"
+INFERENCE_SCRIPT="$REPO_ROOT/src/alpamayo_r1/test_inference_all.py"
+CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clips.json}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/Alpamayo-R1-10B}"
+MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/checkpoints_expert/checkpoint-6446}"
+DRAFT_MODEL="${DRAFT_MODEL:-$REPO_ROOT/Alpamayo-DFlash}"
 NUM_TRAJ_SAMPLES="${NUM_TRAJ_SAMPLES:-6}"
-SPARSITY_RATIO="${SPARSITY_RATIO:-0.5}"
-ROPE_MODE="${ROPE_MODE:-direct}"
+CACHE_STEPS="${CACHE_STEPS:-[1, 3, 5, 7, 9]}"
 NUM_GPUS="${NUM_GPUS:-8}"
-DUMPED_DATA_DIR="${DUMPED_DATA_DIR:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/6samples_all_checkpoint6446}"
+DUMPED_DATA_DIR="${DUMPED_DATA_DIR:-$REPO_ROOT/dumped_eval_data}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/6samples_sparsity${SPARSITY_RATIO}_${ROPE_MODE}}"
 # -----------------------------------------------------------------------------
-# Load clip IDs from clip_ids.json, or fall back to default list
+# Load clip IDs from clips.json, or fall back to default list
 # -----------------------------------------------------------------------------
 if [[ -f "$CLIP_IDS_FILE" ]]; then
   if command -v jq &>/dev/null; then
@@ -42,7 +42,7 @@ if [[ -f "$CLIP_IDS_FILE" ]]; then
   fi
 else
   echo "Clip IDs file not found: $CLIP_IDS_FILE (using default clip)" >&2
-  CLIP_IDS=("87147a1b-3eef-4c25-94d2-ec7718a49a7a")
+  CLIP_IDS=("b80a15fc-d540-4c8f-81d1-5db83216b2e0")
 fi
 
 TOTAL_CLIPS=${#CLIP_IDS[@]}
@@ -55,7 +55,7 @@ cd "$REPO_ROOT"
 mkdir -p "$OUTPUT_DIR"
 
 echo "=============================================="
-echo "Alpamayo-R1 Compile Inference (Multi-GPU)"
+echo "Alpamayo-R1 Streaming Inference (Multi-GPU)"
 echo "=============================================="
 echo "Repo root:    $REPO_ROOT"
 echo "Model path:   $MODEL_PATH"
@@ -76,14 +76,19 @@ run_worker() {
   echo "[GPU $gpu_id] Processing ${#clips[@]} clip(s): ${clips[0]} ... ${clips[-1]}"
 
   for clip_id in "${clips[@]}"; do
+    RESULT_FILE="$OUTPUT_DIR/streaming_${clip_id}.json"
+    if [[ -f "$RESULT_FILE" ]]; then
+      echo "[GPU $gpu_id] >>> Skipping $clip_id (result exists: $RESULT_FILE)"
+      continue
+    fi
     echo "[GPU $gpu_id] >>> Clip: $clip_id"
-    CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" "$INFERENCE_SCRIPT" \
+    WORKER_RANK="$gpu_id" CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" "$INFERENCE_SCRIPT" \
       --clip-id "$clip_id" \
       --model_path "$MODEL_PATH" \
       --output_dir "$OUTPUT_DIR" \
+      --cache_steps "$CACHE_STEPS" \
       --num_traj_samples "$NUM_TRAJ_SAMPLES" \
-      --sparsity_ratio "$SPARSITY_RATIO" \
-      --rope_mode "$ROPE_MODE" \
+      --draft-model "$DRAFT_MODEL" \
       ${DUMPED_DATA_DIR:+--dumped_data_dir "$DUMPED_DATA_DIR"}
   done
 
@@ -134,5 +139,5 @@ if [[ $FAILED -gt 0 ]]; then
   exit 1
 else
   echo "Done. All $TOTAL_CLIPS clip(s) completed across $NUM_GPUS GPU(s)."
-  echo "Results (compile_<clip_id>.json) saved under $OUTPUT_DIR"
+  echo "Results (streaming_<clip_id>.json) saved under $OUTPUT_DIR"
 fi

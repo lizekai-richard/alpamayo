@@ -16,26 +16,40 @@
 # End-to-end example script for the inference pipeline:
 # This script loads a dataset, runs inference, and computes the minADE.
 # It can be used to test the inference pipeline.
-
-import argparse
-import json
-import logging
 import os
-import time
-
-import numpy as np
+import json
+import argparse
+import logging
 import torch
-
-from alpamayo_r1.models.alpamayo_r1_compile import AlpamayoR1
+import time
+import numpy as np
+from alpamayo_r1.models.alpamayo_r1_all import AlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
+from alpamayo_r1.dflash_integration import setup_dflash_for_model
 
+def _get_rank() -> int:
+    for key in ("WORKER_RANK", "RANK", "LOCAL_RANK", "SLURM_PROCID"):
+        value = os.environ.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                pass
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+RANK = _get_rank()
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO if RANK == 0 else logging.ERROR,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
+# Enable TF32 matmul for better perf on Ampere+ GPUs.
 torch.set_float32_matmul_precision("high")
 
 
@@ -44,21 +58,12 @@ def load_model(args):
     processor = helper.get_processor(model.tokenizer)
     return model, processor
 
-
-def calc_minADE(gt_future_xyz, pred_xyz):
-    gt_xy = gt_future_xyz.cpu()[0, 0, :, :2].T.numpy()
-    pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
-    diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
-    min_ade = diff.min()
-    min_ade_idx = diff.argmin()
-    return min_ade, min_ade_idx
-
-def create_sliding_window_inputs(
+def create_streaming_inputs(
     processor,
     num_windows: int,
     clip_id: str,
-    t0_us: int = 2_000_000,
-    time_step_us: int = 100_000,
+    t0_us: int = 5_100_000,
+    time_step_us: int = 100_000,  # 0.1s = 100_000 us
 ):
     """
     Create sliding window inputs for streaming inference.
@@ -85,10 +90,17 @@ def create_sliding_window_inputs(
         # Window 2: t0_us + 200_000 (need frame at t0+0.2s)
         current_t0 = t0_us + window_idx * time_step_us
 
-        # Prefill: load full 4 frames per camera
-        data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=4)
-        frames = data["image_frames"].flatten(0, 1)  # (4, 4, C, H, W) -> (16, C, H, W)
-        is_prefill = True
+        if window_idx == 0:
+            # Prefill: load full 4 frames per camera
+            data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=4)
+            frames = data["image_frames"].flatten(0, 1)  # (4, 4, C, H, W) -> (16, C, H, W)
+            is_prefill = True
+        else:
+            # Streaming: load only the newest frame per camera
+            # num_frames=1 means only load the frame at current_t0
+            data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=1)
+            frames = data["image_frames"].flatten(0, 1)  # (4, 1, C, H, W) -> (4, C, H, W)
+            is_prefill = False
 
         messages = helper.create_message(frames)
         inputs = processor.apply_chat_template(
@@ -108,84 +120,109 @@ def create_sliding_window_inputs(
             "ego_future_rot": data["ego_future_rot"],
             "is_prefill": is_prefill,
         }
-        # model_inputs = helper.to_device(model_inputs, "cuda")
         streaming_inputs.append(model_inputs)
 
     return streaming_inputs
 
 
-def save_kv_cache(kv_cache, save_path):
-    for layer_idx, layer in enumerate(kv_cache.layers):
-        key_cache = layer.keys.clone().detach().cpu()
-        value_cache = layer.values.clone().detach().cpu()
-        torch.save(key_cache, os.path.join(save_path, f"key_cache_{layer_idx}.pt"))
-        torch.save(value_cache, os.path.join(save_path, f"value_cache_{layer_idx}.pt"))
+def calc_minADE(gt_future_xy, pred_xyz):
+    gt_xy = gt_future_xy.cpu()[0, 0, :, :2].T.numpy()
+    pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
+    diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
+    min_ade = diff.min()
+    min_ade_idx = diff.argmin()
+    return min_ade, min_ade_idx
+
+
+def load_or_create_streaming_inputs(args, processor):
+    """Load dumped inputs or create them from scratch."""
+    if args.dumped_data_dir:
+        logger.info("Loading dumped inputs from %s for clip %s", args.dumped_data_dir, args.clip_id)
+        windows = helper.load_dumped_inputs(args.dumped_data_dir, args.clip_id)
+        windows = windows[:args.num_steps]
+        vision_start_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        vision_end_id = processor.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+        streaming_inputs = [windows[0]]
+        for w in windows[1:]:
+            streaming_inputs.append(helper.convert_to_streaming_window(w, vision_start_id, vision_end_id))
+        return streaming_inputs
+    else:
+        return create_streaming_inputs(
+            processor=processor,
+            num_windows=args.num_steps,
+            clip_id=args.clip_id,
+            t0_us=args.t0_us,
+            time_step_us=args.time_step_us,
+        )
 
 
 @torch.inference_mode()
-def run_inference(args, model, processor, sliding_window_inputs):
-    warmup_steps = args.warmup_steps
-    logger.info("Warming up model...")
-    min_ade_list = []
-    time_list = []
-    cot_list = []
+def test_dflash_streaming_inference(args, model, processor):
+    """Test DFlash speculative decoding in streaming mode (integrated path)."""
+    setup_dflash_for_model(model, args.draft_model)
 
+    streaming_inputs = load_or_create_streaming_inputs(args, processor)
+    logger.info(f"Loaded {len(streaming_inputs)} streaming inputs")
+    min_ade_list = []
+    cot_list = []
+    time_list = []
+
+    warmup_steps = args.warmup_steps
+    logger.info("Warming up DFlash streaming...")
     for i in range(warmup_steps):
-        model_inputs = sliding_window_inputs[i]
         start_time = time.perf_counter()
+        model_inputs = streaming_inputs[i]
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_xyz, _, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+            pred_xyz, pred_rot, extra = model.sample_trajectories_with_dflash_streaming_vlm_rollout(
                 data=helper.to_device(model_inputs, "cuda"),
-                top_p=0.98,
-                temperature=0.6,
+                torch_compile="max-autotune",
                 num_traj_samples=args.num_traj_samples,
                 max_generation_length=256,
                 return_extra=True,
-                torch_compile="max-autotune",
                 fuse_qkv=True,
                 fuse_gate_up=True,
                 diffusion_kwargs={"cache_steps": args.cache_steps, "int_method": "euler_with_cache"},
             )
-
         end_time = time.perf_counter()
-        min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
-        cot = extra["cot"][0][0][min_ade_idx]
-        min_ade_list.append(float(min_ade))
-        time_list.append(end_time - start_time)
-        cot_list.append(cot)
+        if i > 0:
+            min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
+            min_ade_list.append(float(min_ade))
+            cot_list.append(extra["cot"][0][0][min_ade_idx])
+            time_list.append(end_time - start_time)
+            logger.info("Step %s: latency=%.3fs, MinADE=%.4f", i, end_time - start_time, min_ade)
+            logger.info("Chain-of-Causation:\n%s", extra["cot"][0][0][min_ade_idx])
     logger.info("Warmup completed")
 
-    for i in range(warmup_steps, len(sliding_window_inputs)):
-        model_inputs = sliding_window_inputs[i]
+    logger.info(f"Running DFlash streaming inference for {len(streaming_inputs) - warmup_steps} windows:")
+
+    for i in range(warmup_steps, len(streaming_inputs)):
+        model_inputs = streaming_inputs[i]
         start_time = time.perf_counter()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+            pred_xyz, pred_rot, extra = model.sample_trajectories_with_dflash_streaming_vlm_rollout(
                 data=helper.to_device(model_inputs, "cuda"),
-                top_p=0.98,
-                temperature=0.6,
+                torch_compile="max-autotune",
                 num_traj_samples=args.num_traj_samples,
                 max_generation_length=256,
-                torch_compile="max-autotune",
                 return_extra=True,
                 fuse_qkv=True,
                 fuse_gate_up=True,
-                diffusion_kwargs={"cache_steps": args.cache_steps, "int_method": "euler_with_cache"},
+                diffusion_kwargs={"cache_steps": args.cache_steps, "int_method": "euler_with_cache"}
             )
-
         end_time = time.perf_counter()
+
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
-        cot = extra["cot"][0][0][min_ade_idx]
-        time_list.append(end_time - start_time)
         min_ade_list.append(float(min_ade))
-        cot_list.append(cot)
+        cot_list.append(extra["cot"][0][0][min_ade_idx])
+        time_list.append(end_time - start_time)
         logger.info("Step %s: latency=%.3fs, MinADE=%.4f", i, end_time - start_time, min_ade)
-        logger.info("Chain-of-Causation:\n%s", cot)
+        logger.info("Chain-of-Causation:\n%s", extra["cot"][0][0][min_ade_idx])
 
     logger.info(
         "Total time: %.2fs, avg latency: %.3fs, avg MinADE: %.4f",
-        sum(time_list[warmup_steps:]),
-        sum(time_list[warmup_steps:]) / len(time_list[warmup_steps:]),
-        sum(min_ade_list) / len(min_ade_list),
+        sum(time_list[1:]),
+        sum(time_list[1:]) / len(time_list[1:]),
+        sum(min_ade_list[1:]) / len(min_ade_list[1:]),
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -202,43 +239,20 @@ def run_inference(args, model, processor, sliding_window_inputs):
     logger.info("Results saved to %s", out_path)
 
 
-def load_or_create_inputs(args, processor):
-    """Load dumped inputs or create them from scratch."""
-    if args.dumped_data_dir:
-        logger.info("Loading dumped inputs from %s for clip %s", args.dumped_data_dir, args.clip_id)
-        windows = helper.load_dumped_inputs(args.dumped_data_dir, args.clip_id)
-        return windows[:args.num_steps]
-    else:
-        return create_sliding_window_inputs(
-            processor=processor,
-            num_windows=args.num_steps,
-            clip_id=args.clip_id,
-            t0_us=args.t0_us,
-            time_step_us=args.time_step_us,
-        )
-
-
-def test_inference(args, model, processor):
-    logger.info("Creating sliding window inputs for clip_id: %s", args.clip_id)
-    sliding_window_inputs = load_or_create_inputs(args, processor)
-    logger.info("Created %s windows", len(sliding_window_inputs))
-    run_inference(args, model, processor, sliding_window_inputs)
-    logger.info("Completed compile inference")
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run compile-model inference on a clip.")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
-    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="e88802d8-cf67-4cd4-8578-a825a1bd1c71")
+    parser.add_argument("--draft-model", type=str, default="./Alpamayo-DFlash")
     parser.add_argument("--warmup_steps", type=int, default=3)
     parser.add_argument("--num_steps", type=int, default=120)
+    parser.add_argument("--clip-id", type=str, default="599eb73d-373a-4c86-afc4-020005056a6c")
     parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
-    parser.add_argument("--output_dir", type=str, default="./test_results/dit_cache_13579")
+    parser.add_argument("--output_dir", type=str, default="./test_results/6samples_all")
     parser.add_argument("--num_traj_samples", type=int, default=6)
-    parser.add_argument("--cache_steps", type=list, default=[1, 3, 5, 7, 9])
-    parser.add_argument("--dumped_data_dir", type=str, default="./dumped_eval_data", help="Path to pre-dumped eval data directory")
-    args = parser.parse_args()
+    parser.add_argument("--cache_steps", type=list, default=[])
+    parser.add_argument("--dumped_data_dir", type=str, default="./dumped_eval_data")
 
+    args = parser.parse_args()
     model, processor = load_model(args)
-    test_inference(args, model, processor)
+    test_dflash_streaming_inference(args, model, processor)

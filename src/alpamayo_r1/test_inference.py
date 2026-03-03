@@ -212,15 +212,25 @@ def run_inference(args, model, processor, sliding_window_inputs):
     logger.info("Results saved to %s", out_path)
 
 
+def load_or_create_inputs(args, processor):
+    """Load dumped inputs or create them from scratch."""
+    if args.dumped_data_dir:
+        logger.info("Loading dumped inputs from %s for clip %s", args.dumped_data_dir, args.clip_id)
+        windows = helper.load_dumped_inputs(args.dumped_data_dir, args.clip_id)
+        return windows[:args.num_steps]
+    else:
+        return create_sliding_window_inputs(
+            processor=processor,
+            num_windows=args.num_steps,
+            clip_id=args.clip_id,
+            t0_us=args.t0_us,
+            time_step_us=args.time_step_us,
+        )
+
+
 def test_inference(args, model, processor):
     logger.info("Creating sliding window inputs for clip_id: %s", args.clip_id)
-    sliding_window_inputs = create_sliding_window_inputs(
-        processor=processor,
-        num_windows=args.num_steps,
-        clip_id=args.clip_id,
-        t0_us=args.t0_us,
-        time_step_us=args.time_step_us,
-    )
+    sliding_window_inputs = load_or_create_inputs(args, processor)
     logger.info("Created %s windows", len(sliding_window_inputs))
     run_inference(args, model, processor, sliding_window_inputs)
     logger.info("Completed compile inference")
@@ -240,6 +250,7 @@ if __name__ == "__main__":
     parser.add_argument("--rope_mode", type=str, default="reshape")
     parser.add_argument("--save_kv_cache", action="store_true")
     parser.add_argument("--save_kv_cache_dir", type=str, default="./saved_kv_cache/low_loss/non-streaming")
+    parser.add_argument("--dumped_data_dir", type=str, default=None, help="Path to pre-dumped eval data directory")
     args = parser.parse_args()
 
     model, processor = load_model(args)

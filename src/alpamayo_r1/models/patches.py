@@ -578,6 +578,26 @@ class Qwen3VLTextMLP(qwen3vl.Qwen3VLTextMLP):
 
 
 class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
+
+    def set_capture_layer_ids(self, layer_ids: list[int] | None):
+        """Configure which layer hidden states to capture during forward.
+
+        This is torch.compile-friendly because the set is a constant determined
+        before compilation — the compiler traces ``if layer_idx in set`` as
+        static control flow.
+
+        Args:
+            layer_ids: Layer indices whose hidden states should be returned in
+                ``BaseModelOutputWithPast.hidden_states``.  Pass ``None`` to
+                disable capturing.
+        """
+        if layer_ids:
+            self._capture_layer_ids = layer_ids
+            self._capture_layer_ids_set = set(layer_ids)  # O(1) lookup
+        else:
+            self._capture_layer_ids = None
+            self._capture_layer_ids_set = set()
+
     def forward(
         self,
         input_ids=None,
@@ -615,6 +635,8 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
             self._cached_deepstack_indices = visual_pos_masks.flatten().nonzero(as_tuple=True)[0]
 
         hidden_states = inputs_embeds
+        captured: list[torch.Tensor] = []
+        _do_capture = hasattr(self, '_capture_layer_ids') and self._capture_layer_ids is not None
         for layer_idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
                 hidden_states,
@@ -624,14 +646,23 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
             )
+            # Capture specific layers for DFlash draft context (compile-friendly)
+            if _do_capture and layer_idx in self._capture_layer_ids_set:
+                captured.append(hidden_states)
             if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
                 flat_hidden = hidden_states.view(-1, hidden_states.shape[-1])
                 flat_hidden.index_add_(
                     0, self._cached_deepstack_indices, deepstack_visual_embeds[layer_idx]
                 )
 
+        # Store captured states on the model instance so they can be read
+        # after a VLM-level forward (VLM wrapper doesn't propagate hidden_states).
+        if captured:
+            self._last_captured_hidden_states = tuple(captured)
+
         return BaseModelOutputWithPast(
-            last_hidden_state=self.norm(hidden_states), past_key_values=past_key_values
+            last_hidden_state=self.norm(hidden_states), past_key_values=past_key_values,
+            hidden_states=tuple(captured) if captured else None,
         )
 
 _PATCHED_CLASSES = {

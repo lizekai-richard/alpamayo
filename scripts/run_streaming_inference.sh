@@ -20,7 +20,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INFERENCE_SCRIPT="$REPO_ROOT/src/alpamayo_r1/test_streaming_inference.py"
-CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clip_ids.json}"
+CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clips.json}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/Alpamayo-R1-10B}"
@@ -29,6 +29,7 @@ NUM_TRAJ_SAMPLES="${NUM_TRAJ_SAMPLES:-6}"
 ROPE_MODE="${ROPE_MODE:-contiguous}"
 NUM_GPUS="${NUM_GPUS:-8}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/${NUM_TRAJ_SAMPLES}samples}"
+DUMPED_DATA_DIR="${DUMPED_DATA_DIR:-}"
 
 # -----------------------------------------------------------------------------
 # Load clip IDs from clip_ids.json, or fall back to default list
@@ -81,13 +82,14 @@ run_worker() {
       continue
     fi
     echo "[GPU $gpu_id] >>> Clip: $clip_id"
-    CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" "$INFERENCE_SCRIPT" \
+    WORKER_RANK="$gpu_id" CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" "$INFERENCE_SCRIPT" \
       --clip-id "$clip_id" \
       --model_path "$MODEL_PATH" \
       --output_dir "$OUTPUT_DIR" \
       --sparsity_ratio "$SPARSITY_RATIO" \
       --num_traj_samples "$NUM_TRAJ_SAMPLES" \
-      --rope_mode "$ROPE_MODE"
+      --rope_mode "$ROPE_MODE" \
+      ${DUMPED_DATA_DIR:+--dumped_data_dir "$DUMPED_DATA_DIR"}
   done
 
   echo "[GPU $gpu_id] Finished all ${#clips[@]} clip(s)."
