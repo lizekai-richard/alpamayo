@@ -542,7 +542,7 @@ class AlpamayoR1(ReasoningVLA):
             cur_pos, cur_pos + self.num_action_tokens, device=device
         )
 
-        sampled_action = self._action(
+        sampled_action, all_vs = self._action(
             num_action_tokens=self.num_action_tokens,
             total_samples=batch_size * num_samples,
             device=device,
@@ -569,7 +569,7 @@ class AlpamayoR1(ReasoningVLA):
                 extra[key] = np.array(extra[key]).reshape(
                     [batch_size, num_traj_sets, num_traj_samples]
                 )
-            return pred_xyz, pred_rot, extra
+            return pred_xyz, pred_rot, extra, all_vs
         return pred_xyz, pred_rot
 
     def _build_logits_processor(
