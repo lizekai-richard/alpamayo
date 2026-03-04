@@ -180,7 +180,7 @@ def run_inference(args, model, processor, sliding_window_inputs):
                     "int_method": args.int_method,
                 },
             )
-        all_steps_vs.append(all_vs)
+        all_steps_vs.append([v.clone() for v in all_vs])
         end_time = time.perf_counter()
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
         cot = extra["cot"][0][0][min_ade_idx]
