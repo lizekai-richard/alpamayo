@@ -131,21 +131,18 @@ class FlowMatching(BaseDiffusion):
         n_dim = len(self.x_dims)
         if return_all_steps:
             all_steps = [x]
-        
-        all_vs = []
 
         for i in range(inference_step):
             dt = time_steps[i + 1] - time_steps[i]
             dt = dt.view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
             t_start = time_steps[i].view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
             v = step_fn(x=x, t=t_start)
-            all_vs.append(v)
             x = x + dt * v
             if return_all_steps:
                 all_steps.append(x)
         if return_all_steps:
             return torch.stack(all_steps, dim=1), time_steps
-        return x, all_vs
+        return x
     
     def _euler_with_cache(
         self,

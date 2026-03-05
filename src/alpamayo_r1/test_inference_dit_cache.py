@@ -135,7 +135,7 @@ def run_inference(args, model, processor, sliding_window_inputs):
         model_inputs = sliding_window_inputs[i]
         start_time = time.perf_counter()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_xyz, _, extra, _ = model.sample_trajectories_from_data_with_vlm_rollout(
+            pred_xyz, _, extra = model.sample_trajectories_from_data_with_vlm_rollout(
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
@@ -164,7 +164,7 @@ def run_inference(args, model, processor, sliding_window_inputs):
         model_inputs = sliding_window_inputs[i]
         start_time = time.perf_counter()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            pred_xyz, pred_rot, extra, all_vs = model.sample_trajectories_from_data_with_vlm_rollout(
+            pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
                 data=helper.to_device(model_inputs, "cuda"),
                 top_p=0.98,
                 temperature=0.6,
@@ -180,7 +180,6 @@ def run_inference(args, model, processor, sliding_window_inputs):
                     "int_method": args.int_method,
                 },
             )
-        all_steps_vs.append([v.clone() for v in all_vs])
         end_time = time.perf_counter()
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
         cot = extra["cot"][0][0][min_ade_idx]
@@ -210,8 +209,6 @@ def run_inference(args, model, processor, sliding_window_inputs):
         json.dump(results, f, indent=2)
     logger.info("Results saved to %s", out_path)
 
-    torch.save(all_steps_vs, os.path.join(args.output_dir, f"all_steps_vs_{args.clip_id}.pt"))
-
 
 def load_or_create_inputs(args, processor):
     """Load dumped inputs or create them from scratch."""
@@ -240,15 +237,15 @@ def test_inference(args, model, processor):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run compile-model inference on a clip.")
     parser.add_argument("--model_path", type=str, default="/data/scratch/zekaili/Alpamayo-R1-10B")
-    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="599eb73d-373a-4c86-afc4-020005056a6c")
+    parser.add_argument("--clip-id", "--clip_id", dest="clip_id", type=str, default="b3aa6ae8-d9e8-4597-bf19-b125da79ad74")
     parser.add_argument("--warmup_steps", type=int, default=3)
     parser.add_argument("--num_steps", type=int, default=120)
     parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
-    parser.add_argument("--output_dir", type=str, default="/data/scratch/zekaili/test_results/10steps")
+    parser.add_argument("--output_dir", type=str, default="/data/scratch/zekaili/test_results/8steps")
     parser.add_argument("--num_traj_samples", type=int, default=6)
-    parser.add_argument("--int_method", type=str, default="euler")
-    parser.add_argument("--diffusion_steps", type=int, default=10)
+    parser.add_argument("--int_method", type=str, default="euler_with_cache")
+    parser.add_argument("--diffusion_steps", type=int, default=8)
     parser.add_argument("--cache_steps", type=list, default=None)
     parser.add_argument("--dumped_data_dir", type=str, default="/data/scratch/zekaili/dumped_eval_data", help="Path to pre-dumped eval data directory")
     args = parser.parse_args()

@@ -6,7 +6,8 @@
 # each running as a separate background process with its own CUDA_VISIBLE_DEVICES.
 #
 # Environment variables:
-#   NUM_GPUS          Number of GPUs to use (default: 8)
+#   NUM_GPUS          Number of GPUs to use (default: 2, ignored if GPU_IDS is set)
+#   GPU_IDS           Comma-separated GPU IDs to use (e.g. "2,5"); overrides NUM_GPUS
 #   PYTHON_BIN        Python binary (default: python)
 #   MODEL_PATH        Path to model weights
 #   CACHE_STEPS       Cache steps list (default: [1, 3, 5, 7, 9])
@@ -21,12 +22,24 @@ INFERENCE_SCRIPT="$REPO_ROOT/src/alpamayo_r1/test_inference_dit_cache.py"
 CLIP_IDS_FILE="${CLIP_IDS_FILE:-$REPO_ROOT/clips.json}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-MODEL_PATH="${MODEL_PATH:-$REPO_ROOT/Alpamayo-R1-10B}"
-NUM_GPUS="${NUM_GPUS:-8}"
-CACHE_STEPS="${CACHE_STEPS:-[1, 3, 5, 7, 9]}"
-DUMPED_DATA_DIR="${DUMPED_DATA_DIR:-}"
-NUM_TRAJ_SAMPLES="${NUM_TRAJ_SAMPLES:-6}"
-OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/test_results/${NUM_TRAJ_SAMPLES}samples_dit_cache_${CACHE_STEPS}}"
+MODEL_PATH="${MODEL_PATH:-/data/scratch/zekaili/Alpamayo-R1-10B}"
+NUM_GPUS="${NUM_GPUS:-2}"
+
+# Build GPU ID array: honour GPU_IDS if set, otherwise use 0..NUM_GPUS-1
+if [[ -n "${GPU_IDS:-}" ]]; then
+  IFS=',' read -ra GPU_ID_ARRAY <<< "$GPU_IDS"
+  NUM_GPUS=${#GPU_ID_ARRAY[@]}
+else
+  GPU_ID_ARRAY=()
+  for (( i=0; i<NUM_GPUS; i++ )); do
+    GPU_ID_ARRAY+=("$i")
+  done
+fi
+DIFFUSION_STEPS="${DIFFUSION_STEPS:-8}"
+CACHE_STEPS="${CACHE_STEPS:-[3, 4, 5, 6]}"
+DUMPED_DATA_DIR="${DUMPED_DATA_DIR:-/data/scratch/zekaili/dumped_eval_data}"
+NUM_TRAJ_SAMPLES="${NUM_TRAJ_SAMPLES:-1}"
+OUTPUT_DIR="${OUTPUT_DIR:-./test_results/${NUM_TRAJ_SAMPLES}samples_8steps_cache3456}"
 
 # -----------------------------------------------------------------------------
 # Load clip IDs from clip_ids.json, or fall back to default list
@@ -81,6 +94,7 @@ run_worker() {
       --output_dir "$OUTPUT_DIR" \
       --cache_steps "$CACHE_STEPS" \
       --num_traj_samples "$NUM_TRAJ_SAMPLES" \
+      --diffusion_steps "$DIFFUSION_STEPS" \
       ${DUMPED_DATA_DIR:+--dumped_data_dir "$DUMPED_DATA_DIR"}
   done
 
@@ -92,10 +106,12 @@ run_worker() {
 # -----------------------------------------------------------------------------
 declare -a PIDS=()
 
-for (( gpu=0; gpu<NUM_GPUS; gpu++ )); do
+for (( idx=0; idx<NUM_GPUS; idx++ )); do
+  gpu_id="${GPU_ID_ARRAY[$idx]}"
+
   # Collect clips for this GPU via round-robin assignment
   worker_clips=()
-  for (( i=gpu; i<TOTAL_CLIPS; i+=NUM_GPUS )); do
+  for (( i=idx; i<TOTAL_CLIPS; i+=NUM_GPUS )); do
     worker_clips+=("${CLIP_IDS[$i]}")
   done
 
@@ -105,7 +121,7 @@ for (( gpu=0; gpu<NUM_GPUS; gpu++ )); do
   fi
 
   # Launch worker in background
-  run_worker "$gpu" "${worker_clips[@]}" &
+  run_worker "$gpu_id" "${worker_clips[@]}" &
   PIDS+=($!)
 done
 
