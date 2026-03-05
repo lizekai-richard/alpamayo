@@ -455,21 +455,22 @@ def _benchmark_one_clip(wrapper, processor, clip_id, args, is_streaming):
 
     if args.dumped_data_dir:
         # Load pre-dumped sliding window inputs (non-streaming, 16 frames each)
-        total_windows = args.warmup_steps + args.num_steps
+        # num_steps is total windows (warmup included)
         dumped = helper.load_dumped_inputs(args.dumped_data_dir, clip_id)
-        all_inputs = dumped[:total_windows]
+        all_inputs = dumped[:args.num_steps]
     elif is_streaming:
-        total_windows = 1 + args.warmup_steps + args.num_steps
+        total_windows = 1 + args.num_steps  # +1 for first prefill
         all_inputs = create_streaming_inputs(
             processor, total_windows, clip_id, args.t0_us, args.time_step_us,
         )
     else:
-        total_windows = args.warmup_steps + args.num_steps
         all_inputs = create_non_streaming_inputs(
-            processor, total_windows, clip_id, args.t0_us, args.time_step_us,
+            processor, args.num_steps, clip_id, args.t0_us, args.time_step_us,
         )
 
-    logger.info(f"Clip {clip_id}: warmup={args.warmup_steps}, steps={args.num_steps}")
+    num_windows = len(all_inputs)
+    warmup_steps = min(args.warmup_steps, num_windows)
+    logger.info(f"Clip {clip_id}: windows={num_windows}, warmup={warmup_steps}")
 
     first_prefill_s = None
     step_offset = 0
@@ -482,7 +483,7 @@ def _benchmark_one_clip(wrapper, processor, clip_id, args, is_streaming):
         step_offset = 1
 
     # Warmup
-    for i in range(args.warmup_steps):
+    for i in range(warmup_steps):
         idx = step_offset + i
         timing, _ = wrapper.run_step(all_inputs[idx], idx, num_samples)
         logger.info(
@@ -492,14 +493,16 @@ def _benchmark_one_clip(wrapper, processor, clip_id, args, is_streaming):
             f"A: {timing.action_s:.3f}s"
         )
 
-    # Benchmark
+    # Benchmark (remaining steps after warmup)
     benchmark_results = []
-    for i in range(args.num_steps):
-        idx = step_offset + args.warmup_steps + i
+    for i in range(warmup_steps, num_windows):
+        idx = step_offset + i
+        if idx >= len(all_inputs):
+            break
         timing, result = wrapper.run_step(all_inputs[idx], idx, num_samples)
         benchmark_results.append(timing)
         logger.info(
-            f"  [STEP {i:2d}] Total: {timing.total_s:.3f}s | "
+            f"  [STEP {i - warmup_steps:2d}] Total: {timing.total_s:.3f}s | "
             f"E: {timing.encode_s:.3f}s P: {timing.prefill_s:.3f}s "
             f"D: {timing.decode_s:.3f}s ({timing.decode_token_count}tok, "
             f"{timing.decode_s_per_token*1000:.1f}ms/tok) "
