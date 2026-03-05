@@ -24,11 +24,9 @@ Settings:
   - alpamayo_sysopt_streaming_pruning: Streaming + torch.compile + QKV/MLP fusion + token pruning
 
 Usage:
-  python -m alpamayo_r1.benchmark_compile --setting alpamayo --num_samples 1
-  python -m alpamayo_r1.benchmark_compile --setting alpamayo_sysopt --num_samples 3
-  python -m alpamayo_r1.benchmark_compile --setting alpamayo_sysopt_streaming --num_samples 1
-  python -m alpamayo_r1.benchmark_compile --setting alpamayo_sysopt_pruning --sparsity_ratio 0.5
-  python -m alpamayo_r1.benchmark_compile --setting alpamayo_sysopt_streaming_pruning --sparsity_ratio 0.5
+  python -m alpamayo_r1.benchmark_compile --setting alpamayo --clip_file clips.json --num_samples 1
+  torchrun --nproc_per_node=8 -m alpamayo_r1.benchmark_compile \
+      --setting alpamayo --clip_file clips.json --num_samples 1
 """
 
 import argparse
@@ -40,17 +38,24 @@ import time
 from dataclasses import dataclass, asdict
 import numpy as np
 import torch
+import torch.distributed as dist
 
 torch.set_float32_matmul_precision("high")
 
 from alpamayo_r1 import helper
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 
+_rank = int(os.environ.get("RANK", 0))
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO if _rank == 0 else logging.WARNING,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _is_torchrun() -> bool:
+    """Auto-detect distributed launch (torchrun sets WORLD_SIZE)."""
+    return int(os.environ.get("WORLD_SIZE", 1)) > 1
 
 
 # =============================================================================
@@ -444,11 +449,95 @@ class InstrumentedAlpamayoSysoptStreaming:
 # Benchmark Runner
 # =============================================================================
 
+def _benchmark_one_clip(wrapper, processor, clip_id, args, is_streaming):
+    """Run warmup + benchmark for a single clip. Returns per-step results list."""
+    num_samples = args.num_samples
+
+    if args.dumped_data_dir:
+        # Load pre-dumped sliding window inputs (non-streaming, 16 frames each)
+        total_windows = args.warmup_steps + args.num_steps
+        dumped = helper.load_dumped_inputs(args.dumped_data_dir, clip_id)
+        all_inputs = dumped[:total_windows]
+    elif is_streaming:
+        total_windows = 1 + args.warmup_steps + args.num_steps
+        all_inputs = create_streaming_inputs(
+            processor, total_windows, clip_id, args.t0_us, args.time_step_us,
+        )
+    else:
+        total_windows = args.warmup_steps + args.num_steps
+        all_inputs = create_non_streaming_inputs(
+            processor, total_windows, clip_id, args.t0_us, args.time_step_us,
+        )
+
+    logger.info(f"Clip {clip_id}: warmup={args.warmup_steps}, steps={args.num_steps}")
+
+    first_prefill_s = None
+    step_offset = 0
+
+    # Streaming: first prefill (no output)
+    if is_streaming:
+        timing, _ = wrapper.run_step(all_inputs[0], 0, num_samples)
+        first_prefill_s = timing.total_s
+        logger.info(f"  [FIRST PREFILL] {timing.total_s:.3f}s")
+        step_offset = 1
+
+    # Warmup
+    for i in range(args.warmup_steps):
+        idx = step_offset + i
+        timing, _ = wrapper.run_step(all_inputs[idx], idx, num_samples)
+        logger.info(
+            f"  [WARMUP {i}] Total: {timing.total_s:.3f}s | "
+            f"E: {timing.encode_s:.3f}s P: {timing.prefill_s:.3f}s "
+            f"D: {timing.decode_s:.3f}s ({timing.decode_token_count}tok) "
+            f"A: {timing.action_s:.3f}s"
+        )
+
+    # Benchmark
+    benchmark_results = []
+    for i in range(args.num_steps):
+        idx = step_offset + args.warmup_steps + i
+        timing, result = wrapper.run_step(all_inputs[idx], idx, num_samples)
+        benchmark_results.append(timing)
+        logger.info(
+            f"  [STEP {i:2d}] Total: {timing.total_s:.3f}s | "
+            f"E: {timing.encode_s:.3f}s P: {timing.prefill_s:.3f}s "
+            f"D: {timing.decode_s:.3f}s ({timing.decode_token_count}tok, "
+            f"{timing.decode_s_per_token*1000:.1f}ms/tok) "
+            f"A: {timing.action_s:.3f}s"
+        )
+
+    return {
+        "clip_id": clip_id,
+        "first_prefill_s": first_prefill_s,
+        "per_step": [asdict(r) for r in benchmark_results],
+    }
+
+
 def run_benchmark(args):
     setting = args.setting
     num_samples = args.num_samples
 
-    # Load model
+    # --- DDP setup ---
+    distributed = _is_torchrun()
+    if distributed:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+    else:
+        rank = 0
+        world_size = 1
+
+    # --- Load clip list ---
+    with open(args.clip_file, "r") as f:
+        all_clip_ids = json.load(f)
+    my_clip_ids = all_clip_ids[rank::world_size]
+    if rank == 0:
+        logger.info(f"Total clips: {len(all_clip_ids)}, world_size: {world_size}")
+    logger.info(f"Rank {rank}: assigned {len(my_clip_ids)} clips")
+
+    # --- Load model ---
     if setting == "alpamayo":
         wrapper = InstrumentedAlpamayo(args.model_path)
     elif setting in ("alpamayo_sysopt", "alpamayo_sysopt_pruning"):
@@ -462,130 +551,94 @@ def run_benchmark(args):
 
     processor = wrapper.processor
     is_streaming = setting in ("alpamayo_sysopt_streaming", "alpamayo_sysopt_streaming_pruning")
-
-    # Create inputs
-    if is_streaming:
-        total_windows = 1 + args.warmup_steps + args.num_steps  # +1 for first prefill
-        all_inputs = create_streaming_inputs(
-            processor, total_windows, args.clip_id, args.t0_us, args.time_step_us,
-        )
-    else:
-        total_windows = args.warmup_steps + args.num_steps
-        all_inputs = create_non_streaming_inputs(
-            processor, total_windows, args.clip_id, args.t0_us, args.time_step_us,
-        )
-
     sparsity_ratio = getattr(wrapper, "sparsity_ratio", 0.0)
-    logger.info(f"{'='*70}")
-    logger.info(f"BENCHMARK: {setting} | num_traj_samples={num_samples} | sparsity_ratio={sparsity_ratio}")
-    logger.info(f"{'='*70}")
-    logger.info(f"Warmup: {args.warmup_steps} | Steps: {args.num_steps}")
 
-    first_prefill_s = None
-    warmup_results = []
-    benchmark_results = []
-    step_offset = 0
+    if rank == 0:
+        logger.info(f"{'='*70}")
+        logger.info(f"BENCHMARK: {setting} | num_traj_samples={num_samples} | sparsity_ratio={sparsity_ratio}")
+        logger.info(f"{'='*70}")
 
-    # Streaming: first prefill (no output)
-    if is_streaming:
-        timing, _ = wrapper.run_step(all_inputs[0], 0, num_samples)
-        first_prefill_s = timing.total_s
-        logger.info(f"[FIRST PREFILL] {timing.total_s:.3f}s")
-        step_offset = 1
+    # --- Run benchmark for each assigned clip ---
+    local_results = []
+    for clip_id in my_clip_ids:
+        clip_result = _benchmark_one_clip(wrapper, processor, clip_id, args, is_streaming)
+        local_results.append(clip_result)
 
-    # Warmup
-    for i in range(args.warmup_steps):
-        idx = step_offset + i
-        timing, _ = wrapper.run_step(all_inputs[idx], idx, num_samples)
-        warmup_results.append(timing)
-        logger.info(
-            f"[WARMUP {i}] Total: {timing.total_s:.3f}s | "
-            f"E: {timing.encode_s:.3f}s P: {timing.prefill_s:.3f}s "
-            f"D: {timing.decode_s:.3f}s ({timing.decode_token_count}tok) "
-            f"A: {timing.action_s:.3f}s"
-        )
-
-    # Benchmark
-    for i in range(args.num_steps):
-        idx = step_offset + args.warmup_steps + i
-        timing, result = wrapper.run_step(all_inputs[idx], idx, num_samples)
-        benchmark_results.append(timing)
-        logger.info(
-            f"[STEP {i:2d}] Total: {timing.total_s:.3f}s | "
-            f"E: {timing.encode_s:.3f}s P: {timing.prefill_s:.3f}s "
-            f"D: {timing.decode_s:.3f}s ({timing.decode_token_count}tok, "
-            f"{timing.decode_s_per_token*1000:.1f}ms/tok) "
-            f"A: {timing.action_s:.3f}s"
-        )
-
-    # Compute stats: total seconds for encode/prefill/action, s/token for decode only
-    encode_vals = []
-    prefill_vals = []
-    decode_per_tok = []
-    action_vals = []
-    total_vals = []
-
-    for r in benchmark_results:
-        total_vals.append(r.total_s)
-        encode_vals.append(r.encode_s)
-        prefill_vals.append(r.prefill_s)
-        action_vals.append(r.action_s)
-        if r.decode_token_count > 0:
-            decode_per_tok.append(r.decode_s / r.decode_token_count)
-
-    # Summary
-    logger.info(f"\n{'='*70}")
-    logger.info(f"SUMMARY: {setting} | num_traj_samples={num_samples} | sparsity_ratio={sparsity_ratio}")
-    logger.info(f"{'='*70}")
-    logger.info(f"Encode  (s):     {np.mean(encode_vals):.4f} +/- {np.std(encode_vals):.4f}")
-    logger.info(f"Prefill (s):     {np.mean(prefill_vals):.4f} +/- {np.std(prefill_vals):.4f}")
-    if decode_per_tok:
-        logger.info(f"Decode  (s/tok): {np.mean(decode_per_tok):.5f} +/- {np.std(decode_per_tok):.5f}")
-    logger.info(f"Action  (s):     {np.mean(action_vals):.4f} +/- {np.std(action_vals):.4f}")
-    logger.info(f"Total   (s):     {np.mean(total_vals):.4f} +/- {np.std(total_vals):.4f}")
-    avg_tok = np.mean([r.decode_token_count for r in benchmark_results])
-    logger.info(f"Avg decode tokens: {avg_tok:.1f}")
-
-    # Save results
-    os.makedirs(args.output_dir, exist_ok=True)
-    output = {
-        "setting": setting,
-        "num_traj_samples": num_samples,
-        "sparsity_ratio": sparsity_ratio,
-        "torch_compile": "max-autotune" if setting != "alpamayo" else None,
-        "fuse_qkv": setting != "alpamayo",
-        "fuse_gate_up": setting != "alpamayo",
-        "warmup_steps": args.warmup_steps,
-        "num_runs": args.num_steps,
-        "clip_id": args.clip_id,
-        "breakdown": {
-            "encode_s": {"mean": float(np.mean(encode_vals)),
-                         "std": float(np.std(encode_vals))},
-            "prefill_s": {"mean": float(np.mean(prefill_vals)),
-                          "std": float(np.std(prefill_vals))},
-            "decode_s_per_token": {"mean": float(np.mean(decode_per_tok)) if decode_per_tok else 0.0,
-                                   "std": float(np.std(decode_per_tok)) if decode_per_tok else 0.0},
-            "action_s": {"mean": float(np.mean(action_vals)),
-                         "std": float(np.std(action_vals))},
-        },
-        "total_inference_s": {
-            "mean": float(np.mean(total_vals)),
-            "std": float(np.std(total_vals)),
-        },
-        "per_run": [asdict(r) for r in benchmark_results],
-    }
-
-    if first_prefill_s is not None:
-        output["first_prefill_s"] = first_prefill_s
-
-    if sparsity_ratio > 0:
-        filename = f"{setting}_n{num_samples}_s{sparsity_ratio}.json"
+    # --- Gather results to rank 0 ---
+    if distributed:
+        dist.barrier()
+        gathered = [None] * world_size if rank == 0 else None
+        dist.gather_object(local_results, gathered, dst=0)
     else:
-        filename = f"{setting}_n{num_samples}.json"
-    filepath = os.path.join(args.output_dir, filename)
-    with open(filepath, "w") as f:
-        json.dump(output, f, indent=2)
-    logger.info(f"\nResults saved to {filepath}")
+        gathered = [local_results]
+
+    # --- Rank 0: merge and save ---
+    if rank == 0:
+        all_clip_results = []
+        for rank_results in gathered:
+            all_clip_results.extend(rank_results)
+
+        # Aggregate stats across all clips
+        encode_vals, prefill_vals, decode_per_tok, action_vals, total_vals = [], [], [], [], []
+        for clip_res in all_clip_results:
+            for step in clip_res["per_step"]:
+                total_vals.append(step["total_s"])
+                encode_vals.append(step["encode_s"])
+                prefill_vals.append(step["prefill_s"])
+                action_vals.append(step["action_s"])
+                if step["decode_token_count"] > 0:
+                    decode_per_tok.append(step["decode_s"] / step["decode_token_count"])
+
+        logger.info(f"\n{'='*70}")
+        logger.info(f"SUMMARY: {setting} | num_traj_samples={num_samples} | sparsity_ratio={sparsity_ratio}")
+        logger.info(f"{'='*70}")
+        logger.info(f"Total clips: {len(all_clip_results)}")
+        logger.info(f"Encode  (s):     {np.mean(encode_vals):.4f} +/- {np.std(encode_vals):.4f}")
+        logger.info(f"Prefill (s):     {np.mean(prefill_vals):.4f} +/- {np.std(prefill_vals):.4f}")
+        if decode_per_tok:
+            logger.info(f"Decode  (s/tok): {np.mean(decode_per_tok):.5f} +/- {np.std(decode_per_tok):.5f}")
+        logger.info(f"Action  (s):     {np.mean(action_vals):.4f} +/- {np.std(action_vals):.4f}")
+        logger.info(f"Total   (s):     {np.mean(total_vals):.4f} +/- {np.std(total_vals):.4f}")
+
+        os.makedirs(args.output_dir, exist_ok=True)
+        output = {
+            "setting": setting,
+            "num_traj_samples": num_samples,
+            "sparsity_ratio": sparsity_ratio,
+            "torch_compile": "max-autotune" if setting != "alpamayo" else None,
+            "fuse_qkv": setting != "alpamayo",
+            "fuse_gate_up": setting != "alpamayo",
+            "warmup_steps": args.warmup_steps,
+            "num_steps": args.num_steps,
+            "num_clips": len(all_clip_results),
+            "breakdown": {
+                "encode_s": {"mean": float(np.mean(encode_vals)),
+                             "std": float(np.std(encode_vals))},
+                "prefill_s": {"mean": float(np.mean(prefill_vals)),
+                              "std": float(np.std(prefill_vals))},
+                "decode_s_per_token": {"mean": float(np.mean(decode_per_tok)) if decode_per_tok else 0.0,
+                                       "std": float(np.std(decode_per_tok)) if decode_per_tok else 0.0},
+                "action_s": {"mean": float(np.mean(action_vals)),
+                             "std": float(np.std(action_vals))},
+            },
+            "total_inference_s": {
+                "mean": float(np.mean(total_vals)),
+                "std": float(np.std(total_vals)),
+            },
+            "per_clip": all_clip_results,
+        }
+
+        if sparsity_ratio > 0:
+            filename = f"{setting}_n{num_samples}_s{sparsity_ratio}.json"
+        else:
+            filename = f"{setting}_n{num_samples}.json"
+        filepath = os.path.join(args.output_dir, filename)
+        with open(filepath, "w") as f:
+            json.dump(output, f, indent=2)
+        logger.info(f"\nResults saved to {filepath}")
+
+    if distributed:
+        dist.destroy_process_group()
 
 
 # =============================================================================
@@ -608,8 +661,10 @@ def main():
     parser.add_argument("--sparsity_ratio", type=float, default=0.5,
                         help="Fraction of image tokens to prune (only for *_pruning settings)")
     parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
-    parser.add_argument("--clip_id", type=str,
-                        default="2d50798c-a96e-4164-b791-bbad2a59c2de")
+    parser.add_argument("--clip_file", type=str, default="clips.json",
+                        help="JSON file containing a list of clip IDs")
+    parser.add_argument("--dumped_data_dir", type=str, default=None,
+                        help="Directory with pre-dumped sliding window inputs (skips live data loading)")
     parser.add_argument("--t0_us", type=int, default=2_000_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
     parser.add_argument("--warmup_steps", type=int, default=3)
