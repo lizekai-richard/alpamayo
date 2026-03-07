@@ -25,8 +25,7 @@ Settings:
 
 Usage:
   python -m alpamayo_r1.benchmark_compile --setting alpamayo --clip_file clips.json --num_samples 1
-  torchrun --nproc_per_node=8 -m alpamayo_r1.benchmark_compile \
-      --setting alpamayo --clip_file clips.json --num_samples 1
+  torchrun --nproc_per_node=4 -m alpamayo_r1.benchmark_compile --setting alpamayo --clip_file clips.json --num_samples 1 --dumped_data_dir /data/scratch/zekaili/dumped_eval_data
 """
 
 import argparse
@@ -455,21 +454,22 @@ def _benchmark_one_clip(wrapper, processor, clip_id, args, is_streaming):
 
     if args.dumped_data_dir:
         # Load pre-dumped sliding window inputs (non-streaming, 16 frames each)
-        total_windows = args.warmup_steps + args.num_steps
+        # num_steps is total windows (warmup included)
         dumped = helper.load_dumped_inputs(args.dumped_data_dir, clip_id)
-        all_inputs = dumped[:total_windows]
+        all_inputs = dumped[:args.num_steps]
     elif is_streaming:
-        total_windows = 1 + args.warmup_steps + args.num_steps
+        total_windows = 1 + args.num_steps  # +1 for first prefill
         all_inputs = create_streaming_inputs(
             processor, total_windows, clip_id, args.t0_us, args.time_step_us,
         )
     else:
-        total_windows = args.warmup_steps + args.num_steps
         all_inputs = create_non_streaming_inputs(
-            processor, total_windows, clip_id, args.t0_us, args.time_step_us,
+            processor, args.num_steps, clip_id, args.t0_us, args.time_step_us,
         )
 
-    logger.info(f"Clip {clip_id}: warmup={args.warmup_steps}, steps={args.num_steps}")
+    num_windows = len(all_inputs)
+    warmup_steps = min(args.warmup_steps, num_windows)
+    logger.info(f"Clip {clip_id}: windows={num_windows}, warmup={warmup_steps}")
 
     first_prefill_s = None
     step_offset = 0
@@ -482,7 +482,7 @@ def _benchmark_one_clip(wrapper, processor, clip_id, args, is_streaming):
         step_offset = 1
 
     # Warmup
-    for i in range(args.warmup_steps):
+    for i in range(warmup_steps):
         idx = step_offset + i
         timing, _ = wrapper.run_step(all_inputs[idx], idx, num_samples)
         logger.info(
@@ -492,14 +492,16 @@ def _benchmark_one_clip(wrapper, processor, clip_id, args, is_streaming):
             f"A: {timing.action_s:.3f}s"
         )
 
-    # Benchmark
+    # Benchmark (remaining steps after warmup)
     benchmark_results = []
-    for i in range(args.num_steps):
-        idx = step_offset + args.warmup_steps + i
+    for i in range(warmup_steps, num_windows):
+        idx = step_offset + i
+        if idx >= len(all_inputs):
+            break
         timing, result = wrapper.run_step(all_inputs[idx], idx, num_samples)
         benchmark_results.append(timing)
         logger.info(
-            f"  [STEP {i:2d}] Total: {timing.total_s:.3f}s | "
+            f"  [STEP {i - warmup_steps:2d}] Total: {timing.total_s:.3f}s | "
             f"E: {timing.encode_s:.3f}s P: {timing.prefill_s:.3f}s "
             f"D: {timing.decode_s:.3f}s ({timing.decode_token_count}tok, "
             f"{timing.decode_s_per_token*1000:.1f}ms/tok) "
@@ -579,13 +581,14 @@ def run_benchmark(args):
             all_clip_results.extend(rank_results)
 
         # Aggregate stats across all clips
-        encode_vals, prefill_vals, decode_per_tok, action_vals, total_vals = [], [], [], [], []
+        encode_vals, prefill_vals, decode_per_tok, decode_total_vals, action_vals, total_vals = [], [], [], [], [], []
         for clip_res in all_clip_results:
             for step in clip_res["per_step"]:
                 total_vals.append(step["total_s"])
                 encode_vals.append(step["encode_s"])
                 prefill_vals.append(step["prefill_s"])
                 action_vals.append(step["action_s"])
+                decode_total_vals.append(step["decode_s"])
                 if step["decode_token_count"] > 0:
                     decode_per_tok.append(step["decode_s"] / step["decode_token_count"])
 
@@ -595,6 +598,7 @@ def run_benchmark(args):
         logger.info(f"Total clips: {len(all_clip_results)}")
         logger.info(f"Encode  (s):     {np.mean(encode_vals):.4f} +/- {np.std(encode_vals):.4f}")
         logger.info(f"Prefill (s):     {np.mean(prefill_vals):.4f} +/- {np.std(prefill_vals):.4f}")
+        logger.info(f"Decode  (s):     {np.mean(decode_total_vals):.4f} +/- {np.std(decode_total_vals):.4f}")
         if decode_per_tok:
             logger.info(f"Decode  (s/tok): {np.mean(decode_per_tok):.5f} +/- {np.std(decode_per_tok):.5f}")
         logger.info(f"Action  (s):     {np.mean(action_vals):.4f} +/- {np.std(action_vals):.4f}")
@@ -616,6 +620,8 @@ def run_benchmark(args):
                              "std": float(np.std(encode_vals))},
                 "prefill_s": {"mean": float(np.mean(prefill_vals)),
                               "std": float(np.std(prefill_vals))},
+                "decode_s_total": {"mean": float(np.mean(decode_total_vals)),
+                                   "std": float(np.std(decode_total_vals))},
                 "decode_s_per_token": {"mean": float(np.mean(decode_per_tok)) if decode_per_tok else 0.0,
                                        "std": float(np.std(decode_per_tok)) if decode_per_tok else 0.0},
                 "action_s": {"mean": float(np.mean(action_vals)),
@@ -660,15 +666,15 @@ def main():
                         help="num_traj_samples")
     parser.add_argument("--sparsity_ratio", type=float, default=0.5,
                         help="Fraction of image tokens to prune (only for *_pruning settings)")
-    parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
-    parser.add_argument("--clip_file", type=str, default="clips.json",
+    parser.add_argument("--model_path", type=str, default="/data/scratch/zekaili/Alpamayo-R1-10B")
+    parser.add_argument("--clip_file", type=str, default="./clips.json",
                         help="JSON file containing a list of clip IDs")
     parser.add_argument("--dumped_data_dir", type=str, default=None,
                         help="Directory with pre-dumped sliding window inputs (skips live data loading)")
-    parser.add_argument("--t0_us", type=int, default=2_000_000)
+    parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
     parser.add_argument("--warmup_steps", type=int, default=3)
-    parser.add_argument("--num_steps", type=int, default=12)
+    parser.add_argument("--num_steps", type=int, default=120)
     parser.add_argument("--output_dir", type=str, default="./benchmark_results")
     args = parser.parse_args()
     run_benchmark(args)
