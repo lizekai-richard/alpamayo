@@ -14,7 +14,6 @@ from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 import logging
 import gc
-from flash_colreduce import flash_colreduce
 
 logger = logging.getLogger(__name__)
 
@@ -290,8 +289,6 @@ class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
         hidden_states,
         cu_seqlens,
         position_embeddings,
-        return_colsum=False,
-        return_attn_weight=False,
         **kwargs,
     ):
         seq_len = hidden_states.shape[0]
@@ -312,19 +309,7 @@ class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
         output = F.scaled_dot_product_attention(query, key, value, scale=self.scaling)
         output = self.proj(output.transpose(1, 2).reshape(seq_len, -1))
 
-        if return_colsum:
-            colsum = flash_colreduce(query, key, reduction="sum")
-        else:
-            colsum = None
-        
-        # if return_attn_weight:
-        #     with torch.no_grad():
-        #         attn_weight = query @ key.transpose(-2, -1) * self.scaling
-        #         attn_weight = torch.softmax(attn_weight, dim=-1)
-        #     return output, colsum, attn_weight
-        # else:
-        #     return output, colsum, None
-        return output, colsum, None
+        return output
 
 
 class Qwen3VLVisionBlock(qwen3vl.Qwen3VLVisionBlock):
@@ -338,18 +323,16 @@ class Qwen3VLVisionBlock(qwen3vl.Qwen3VLVisionBlock):
         return_attn_weight=False,
         **kwargs,
     ): 
-        attn_output, colsum, attn_weight = self.attn(
+        attn_output = self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
             rotary_pos_emb=rotary_pos_emb,
             position_embeddings=position_embeddings,
-            return_colsum=return_colsum,
-            return_attn_weight=return_attn_weight,
             **kwargs,
         )
         hidden_states = hidden_states + attn_output
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states, colsum, attn_weight
+        return hidden_states
 
 
 class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
@@ -375,28 +358,16 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
         hidden_states = (hidden_states + self._cached_pos_embeds).reshape(hidden_states.size(0), -1)
 
         deepstack_features = []
-        colsums = []
-        deepstack_colsums = []
-        # attn_weights = []
-        return_colsum_layer_indices = self.deepstack_visual_indexes + [len(self.blocks) - 1]
         for layer_idx, block in enumerate(self.blocks):
-            hidden_states, colsum, _ = block(
+            hidden_states = block(
                 hidden_states,
                 cu_seqlens=self._cached_cu_seqlens,
-                position_embeddings=self._cached_position_embeddings,
-                return_colsum=layer_idx in return_colsum_layer_indices,
-                # return_attn_weight=layer_idx == len(self.blocks) - 1,
+                position_embeddings=self._cached_position_embeddings
             )
-            if colsum is not None and layer_idx == len(self.blocks) - 1:
-                colsums.append(colsum)
             if layer_idx in self.deepstack_visual_indexes:
                 merger_idx = self.deepstack_visual_indexes.index(layer_idx)
                 deepstack_features.append(self.deepstack_merger_list[merger_idx](hidden_states))
-                if colsum is not None:
-                    deepstack_colsums.append(colsum)
-            # if attn_weight is not None:
-                # attn_weights.append(attn_weight)
-        return self.merger(hidden_states), deepstack_features, colsums, deepstack_colsums
+        return self.merger(hidden_states), deepstack_features
 
 
 def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):
@@ -761,3 +732,52 @@ def patch_for_torch_compile(
 
     for module_path, module, patched_class in modules_to_replace:
         _replace_module(model, module_path, module, patched_class, mode=mode, fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+
+
+def fuse_expert_projections(model, mode: str = "streaming"):
+    n_attn = n_mlp = 0
+    for layer in model.expert.layers:
+        attn = layer.self_attn
+        if hasattr(attn, "q_proj") and not getattr(attn, "fuse_qkv", False):
+            config = attn.config if hasattr(attn, "config") else layer.self_attn.config
+            layer_idx = getattr(attn, "layer_idx", 0)
+            device, dtype = attn.q_proj.weight.device, attn.q_proj.weight.dtype
+            new_attn = Qwen3VLTextAttention(config, layer_idx, mode=mode, fuse_qkv=True)
+            new_attn.o_proj = attn.o_proj
+            if hasattr(attn, "q_norm"): new_attn.q_norm = attn.q_norm
+            if hasattr(attn, "k_norm"): new_attn.k_norm = attn.k_norm
+            with torch.no_grad():
+                q_s, k_s = attn.q_proj.weight.shape[0], attn.k_proj.weight.shape[0]
+                new_attn.qkv_proj.weight[:q_s].copy_(attn.q_proj.weight)
+                new_attn.qkv_proj.weight[q_s:q_s+k_s].copy_(attn.k_proj.weight)
+                new_attn.qkv_proj.weight[q_s+k_s:].copy_(attn.v_proj.weight)
+                if new_attn.qkv_proj.bias is not None:
+                    new_attn.qkv_proj.bias[:q_s].copy_(attn.q_proj.bias)
+                    new_attn.qkv_proj.bias[q_s:q_s+k_s].copy_(attn.k_proj.bias)
+                    new_attn.qkv_proj.bias[q_s+k_s:].copy_(attn.v_proj.bias)
+            layer.self_attn = new_attn.to(device=device, dtype=dtype)
+            n_attn += 1
+
+        mlp = layer.mlp
+        if hasattr(mlp, "gate_proj") and not getattr(mlp, "fuse_gate_up", False):
+            config = mlp.config if hasattr(mlp, "config") else getattr(layer, "config", None)
+            if config is None:
+                from types import SimpleNamespace
+                config = SimpleNamespace(
+                    hidden_size=mlp.gate_proj.in_features,
+                    intermediate_size=mlp.gate_proj.out_features,
+                    hidden_act=getattr(mlp, "hidden_act", "silu"),
+                )
+            device, dtype = mlp.gate_proj.weight.device, mlp.gate_proj.weight.dtype
+            new_mlp = Qwen3VLTextMLP(config, fuse_gate_up=True)
+            new_mlp.down_proj = mlp.down_proj
+            new_mlp.act_fn = mlp.act_fn
+            with torch.no_grad():
+                g_s = mlp.gate_proj.weight.shape[0]
+                new_mlp.gate_up_proj.weight[:g_s].copy_(mlp.gate_proj.weight)
+                new_mlp.gate_up_proj.weight[g_s:].copy_(mlp.up_proj.weight)
+                if new_mlp.gate_up_proj.bias is not None:
+                    new_mlp.gate_up_proj.bias[:g_s].copy_(mlp.gate_proj.bias)
+                    new_mlp.gate_up_proj.bias[g_s:].copy_(mlp.up_proj.bias)
+            layer.mlp = new_mlp.to(device=device, dtype=dtype)
+            n_mlp += 1

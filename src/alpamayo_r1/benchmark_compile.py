@@ -225,7 +225,7 @@ class InstrumentedAlpamayo:
                     top_p=0.98,
                     temperature=0.6,
                     num_traj_samples=num_traj_samples,
-                    max_generation_length=256,
+                    max_generation_length=128,
                     return_extra=True,
                 )
 

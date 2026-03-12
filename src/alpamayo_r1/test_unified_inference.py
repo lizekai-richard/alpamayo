@@ -23,9 +23,12 @@ import logging
 import torch
 import time
 import numpy as np
-from alpamayo_r1.models.alpamayo_r1_unified import AlpamayoR1
+from alpamayo_r1.models.alpamayo_r1_unified import AlpamayoR1FlashDrive
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
+from alpamayo_r1.utils import setup_dflash_for_model
+from alpamayo_r1.utils import load_paroquant_model, convert_model_to_marlin_w4a8
+from alpamayo_r1.utils import fuse_expert_projections
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,11 +39,6 @@ logger = logging.getLogger(__name__)
 # Enable TF32 matmul for better perf on Ampere+ GPUs.
 torch.set_float32_matmul_precision("high")
 
-
-def load_model(args):
-    model = AlpamayoR1.from_pretrained(args.model_path, dtype=torch.bfloat16).to("cuda")
-    processor = helper.get_processor(model.tokenizer)
-    return model, processor
 
 def create_streaming_inputs(
     processor,
@@ -192,27 +190,31 @@ def run_streaming_inference(args, model, model_inputs, _logging: bool = True):
             - ego_history_rot: history trajectory rotations
     """
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+        pred_xyz, pred_rot, extra = model.sample_trajectories_from_flashdrive(
             data=helper.to_device(model_inputs, "cuda"),
+            streaming=True,
+            dflash=not args.disable_dflash,
             top_p=0.98,
             temperature=0.6,
             num_traj_samples=args.num_traj_samples,
-            max_generation_length=256,
+            max_new_tokens=128,
             return_extra=True,
-            torch_compile="max-autotune",
-            fuse_qkv=True,
-            fuse_gate_up=True,
-            sparsity_ratio=args.sparsity_ratio
+            diffusion_kwargs={
+                "inference_step": args.diffusion_steps,
+                "cache_steps": args.cache_steps,
+                "int_method": "euler" if args.cache_steps is None else "euler_with_cache"
+            },
         )
         if pred_xyz is not None:
             min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
+            cot = extra["cot"][0][0][min_ade_idx]
     
     if _logging:
-        logger.info("Chain-of-Causation:\n%s", extra["cot"][0][0][min_ade_idx])
+        logger.info("Chain-of-Causation:\n%s", cot)
         logger.info(f"MinADE: {min_ade}")
     
     if pred_xyz is not None:
-        return float(min_ade), extra["cot"][0][0][min_ade_idx]
+        return float(min_ade), cot
     else:
         return float('inf'), None
 
@@ -223,144 +225,134 @@ def run_non_streaming_inference(args, model, model_inputs, _logging: bool = True
     Run non-streaming inference with sliding window inputs.
     """
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+        pred_xyz, pred_rot, extra = model.sample_trajectories_from_flashdrive(
             data=helper.to_device(model_inputs, "cuda"),
+            streaming=False,
+            dflash=not args.disable_dflash,
             top_p=0.98,
             temperature=0.6,
+            max_new_tokens=128,
             num_traj_samples=args.num_traj_samples,
-            max_generation_length=256,
+            num_traj_sets=1,
             return_extra=True,
-            torch_compile="max-autotune",
-            fuse_qkv=True,
-            fuse_gate_up=True,
-            sparsity_ratio=args.sparsity_ratio
+            diffusion_kwargs={
+                "inference_step": args.diffusion_steps,
+                "cache_steps": args.cache_steps,
+                "int_method": "euler" if args.cache_steps is None else "euler_with_cache"
+            },
         )
         min_ade, min_ade_idx = calc_minADE(model_inputs["ego_future_xyz"], pred_xyz)
+        cot = extra["cot"][0][0][min_ade_idx]
 
     if _logging:
-        logger.info("Chain-of-Causation:\n%s", extra["cot"][0][0][min_ade_idx])
+        logger.info("Chain-of-Causation:\n%s", cot)
         logger.info(f"MinADE: {min_ade}")
     
-    return float(min_ade), extra["cot"][0][0][min_ade_idx]
-
-@torch.inference_mode()
-def test_non_streaming_inference(args, model, processor):
-    """Test non-streaming inference."""
-    warmup_steps = args.warmup_steps
-    non_streaming_inputs = create_non_streaming_inputs(
-        processor=processor,
-        num_windows=args.num_steps,
-        clip_id=args.clip_id,
-        t0_us=args.t0_us,
-        time_step_us=args.time_step_us,
-    )
-
-    logger.info("Warming up model...")
-    for i in range(warmup_steps):
-        model_inputs = non_streaming_inputs[i]
-        run_non_streaming_inference(args, model, model_inputs, _logging=False)
-    logger.info("Warmup completed")
-
-    logger.info(f"Running non-streaming inference for {len(non_streaming_inputs)} windows:")
-    time_list = []
-    min_ade_list = []
-    cot_list = []
-    for i in range(warmup_steps, len(non_streaming_inputs)):
-        model_inputs = non_streaming_inputs[i]
-        start_time = time.perf_counter()
-        min_ade, cot = run_non_streaming_inference(args, model, model_inputs, _logging=True)
-        min_ade_list.append(min_ade)
-        cot_list.append(cot)
-        end_time = time.perf_counter()
-        time_list.append(end_time - start_time)
-        logger.info(f"Time taken for step {i}: {end_time - start_time} seconds")
-    logger.info(f"Total time taken: {sum(time_list)} seconds")
-    logger.info(f"Average time per step: {sum(time_list) / len(time_list)} seconds")
-    logger.info(f"\nCompleted non-streaming inference")
-
-    results = {}
-    for i in range(len(time_list)):
-        results[i] = {
-            "latency": time_list[i],
-            "min_ade": min_ade_list[i],
-            "cot": cot_list[i],
-        }
-    with open(os.path.join(args.output_dir, f"original_{args.clip_id}.json"), "w") as f:
-        json.dump(results, f)
+    return float(min_ade), cot
 
 
-def warmup_model(args, model, processor, warmup_clip_id):
+def warmup_model(args, model, processor, all_inputs):
     """Warmup the model."""
     warmup_steps = args.warmup_steps
-    streaming_inputs = create_streaming_inputs(
-        processor=processor,
-        num_windows=args.num_steps,
-        clip_id=warmup_clip_id,
-        t0_us=args.t0_us,
-        time_step_us=args.time_step_us,
-    )
     for i in range(warmup_steps):
-        model_inputs = streaming_inputs[i]
-        run_streaming_inference(args, model, model_inputs, _logging=False)
+        model_inputs = all_inputs[i]
+        if not args.disable_streaming:
+            run_streaming_inference(args, model, model_inputs, _logging=False)
+        else:
+            run_non_streaming_inference(args, model, model_inputs, _logging=False)
     logger.info("Warmup completed")
 
 
-@torch.inference_mode()
-def test_streaming_inference(args, model, processor):
-    """Test streaming inference."""
-    warmup_steps = args.warmup_steps
-    streaming_inputs = create_streaming_inputs(
-        processor=processor,
-        num_windows=args.num_steps,
-        clip_id=args.clip_id,
-        t0_us=args.t0_us,
-        time_step_us=args.time_step_us,
-    )
-        
-    logger.info("Warming up model...")
-    # warmup the model
-    for i in range(warmup_steps):
-        model_inputs = streaming_inputs[i]
-        run_streaming_inference(args, model, model_inputs, _logging=False)
-    logger.info("Warmup completed")
+def create_inputs(args, clip_id, processor, streaming=False):
+    """Load dumped inputs or create them from scratch."""
+    num_steps = args.num_steps
+    if streaming:
+        return create_streaming_inputs(
+            processor=processor,
+            num_windows=num_steps,
+            clip_id=clip_id,
+            t0_us=args.t0_us,
+            time_step_us=args.time_step_us,
+        )
+    else:
+        return create_non_streaming_inputs(
+            processor=processor,
+            num_windows=num_steps,
+            clip_id=clip_id,
+            t0_us=args.t0_us,
+            time_step_us=args.time_step_us,
+        )
 
-    min_ade_list = []
-    cot_list = []
-    for i in range(warmup_steps, len(streaming_inputs)):
-        model_inputs = streaming_inputs[i]
-        min_ade, cot = run_streaming_inference(args, model, model_inputs, _logging=True)
-        min_ade_list.append(min_ade)
-        cot_list.append(cot)
 
-    logger.info(f"\nCompleted streaming inference")
+def flashdrive_inference(args, model, processor):
+    if not args.disable_streaming:
+        all_inputs = create_inputs(
+            args=args,
+            clip_id=args.clip_id,
+            processor=processor,
+            streaming=True,
+        )
+    else:
+        all_inputs = create_inputs(
+            args=args,
+            clip_id=args.clip_id,
+            processor=processor,
+            streaming=False,
+        )
+    
+    warmup_model(args, model, processor, all_inputs)
 
-    results = {}
-    for i in range(len(min_ade_list)):
-        results[i] = {
-            "min_ade": min_ade_list[i],
-            "cot": cot_list[i],
-        }
-    with open(os.path.join(args.output_dir, f"streaming_{args.clip_id}.json"), "w") as f:
-        json.dump(results, f)
+    minADE_list = []
+    for i, model_inputs in enumerate(all_inputs):
+        if not args.disable_streaming:
+            minADE, _ = run_streaming_inference(args, model, model_inputs, _logging=True)
+            minADE_list.append(minADE)
+        else:
+            minADE, _ = run_non_streaming_inference(args, model, model_inputs, _logging=True)
+            minADE_list.append(minADE)
+        logger.info(f"Step {i+1}/{len(all_inputs)} completed")
+    logger.info(f"Average MinADE: {np.mean(minADE_list)}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B")
-    parser.add_argument("--mode", type=str, default="streaming", choices=["streaming", "non_streaming"])
+    parser.add_argument("--model_path", type=str, default="/data/scratch/zekaili/train_expert_ckpts_deepspeed/checkpoint-6446")
     parser.add_argument("--warmup_steps", type=int, default=3)
-    parser.add_argument("--num_steps", type=int, default=15)
+    parser.add_argument("--num_steps", type=int, default=120)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_traj_samples", type=int, default=1)
-    parser.add_argument("--sparsity_ratio", type=float, default=0.0)
-    parser.add_argument("--clip_id", type=str, default="53baf60a-902f-446d-8e30-5eb7dbc992e7")
-    parser.add_argument("--t0_us", type=int, default=1_600_000)
+    parser.add_argument("--clip_id", type=str, default="87147a1b-3eef-4c25-94d2-ec7718a49a7a")
+    parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
-    parser.add_argument("--output_dir", type=str, default="./test_results")
-
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--draft_model_path", type=str, default="/data/scratch/zekaili/Alpamayo-DFlash")
+    parser.add_argument("--quantized_model_path", type=str, default="/data/scratch/zekaili/quant_cache/ckpt-paro-w4-vlm-mm.pt")
+    parser.add_argument("--disable_compile", action="store_true")
+    parser.add_argument("--disable_streaming", action="store_true")
+    parser.add_argument("--disable_dflash", action="store_true")
+    parser.add_argument("--disable_w4a8", action="store_true")
+    parser.add_argument("--torch_compile", type=str, default="max-autotune")
+    parser.add_argument("--diffusion_steps", type=int, default=8)
+    parser.add_argument("--cache_steps", type=int, nargs="*", default=[3, 4, 5, 6])
+    
     args = parser.parse_args()
-    model, processor = load_model(args)
-    if args.mode == "streaming":
-        test_streaming_inference(args, model, processor)
-    elif args.mode == "non_streaming":
-        test_non_streaming_inference(args, model, processor)
+    if args.disable_w4a8:
+        model = AlpamayoR1FlashDrive.from_pretrained(args.model_path, dtype=torch.bfloat16)
+        model = model.to(args.device)
+        model.eval()
+        processor = helper.get_processor(model.tokenizer)
+    else:
+        model = load_paroquant_model(
+            model_path=args.model_path,
+            paro_checkpoint=args.quantized_model_path,
+            mode="streaming" if not args.disable_streaming else "non-streaming",
+            device=args.device,
+        )
+        convert_model_to_marlin_w4a8(model)
+        processor = helper.get_processor(model.tokenizer)
+        fuse_expert_projections(model)
+
+    if not args.disable_dflash:
+        setup_dflash_for_model(model, args.draft_model_path)
+
+    flashdrive_inference(args, model, processor)
