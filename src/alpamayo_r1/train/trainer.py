@@ -109,24 +109,23 @@ def _build_ds_config(config: TrainerConfig, world_size: int) -> dict:
     return ds_config
 
 
-def _calc_min_ade(
+def _calc_ade(
     gt_future_xyz: torch.Tensor, pred_xyz: torch.Tensor
-) -> tuple[torch.Tensor, int]:
-    """Compute minADE for a single sample.
+) -> list[float]:
+    """Compute ADE for a single sample.
 
     Args:
         gt_future_xyz: [1, 1, T, 3] ground-truth future trajectory.
         pred_xyz: [1, num_traj_sets, num_traj_samples, T, 3] predicted trajectories.
 
     Returns:
-        Tuple of (scalar minADE, index of best trajectory sample).
+        List of ADEs for each trajectory sample.
     """
     gt_xy = gt_future_xyz[0, 0, :, :2]  # [T, 2]
     pred_xy = pred_xyz[0, 0, :, :, :2]  # [num_traj_samples, T, 2]
     diff = (pred_xy - gt_xy.unsqueeze(0)).norm(dim=-1)  # [num_traj_samples, T]
     ade = diff.mean(dim=-1)  # [num_traj_samples]
-    best_idx = ade.argmin().item()
-    return ade[best_idx], best_idx
+    return ade
 
 
 class Trainer:
@@ -368,9 +367,10 @@ class Trainer:
     def _run_eval_loop(self) -> dict[str, float]:
         self.model.eval()
         device = self.device
-        total_min_ade = 0.0
-        n_min_ade = 0
+        
         clip_cot_texts: dict[str, list[str]] = {}  # clip_id -> list of cot texts
+
+        all_minade_1, all_minade_6 = [], []
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.eval_dataloader):
@@ -382,6 +382,11 @@ class Trainer:
 
                 # Reset streaming state before each clip
                 self._unwrapped_model.reset_streaming_state()
+
+                total_minade_1 = 0.0
+                total_minade_6 = 0.0
+                n_minade_1 = 0
+                n_minade_6 = 0
 
                 # Run through the entire clip
                 for i, window in enumerate(batch):
@@ -400,26 +405,30 @@ class Trainer:
                             },
                             device,
                         ),
-                        top_p=self.config.rollout_top_p,
-                        temperature=self.config.rollout_temperature,
-                        num_traj_samples=self.config.rollout_num_traj_samples,
-                        max_generation_length=self.config.rollout_max_generation_length,
+                        top_p=self.config.eval_top_p,
+                        temperature=self.config.eval_temperature,
+                        num_traj_samples=self.config.eval_num_traj_samples,
+                        max_generation_length=self.config.eval_max_generation_length,
                         return_extra=True,
                     )
                     if i > 0:
                         pred_xyz, pred_rot, extra = results
-                        min_ade, min_ade_idx = _calc_min_ade(
-                            window["ego_future_xyz"].to(device), pred_xyz,
-                        )
-                        best_cot = extra["cot"][0][0][min_ade_idx]
-                        total_min_ade += min_ade
-                        n_min_ade += 1
+                        ade_list = _calc_ade(window["ego_future_xyz"].to(device), pred_xyz)
+                        minade_1, minade_6, minade_6_idx = ade_list[0], ade_list.min(), ade_list.argmin()
+                        best_cot = extra["cot"][0][0][minade_6_idx]
+                        total_minade_1 += minade_1
+                        total_minade_6 += minade_6
+                        n_minade_1 += 1
+                        n_minade_6 += 1
                         clip_id = window["clip_id"]
                         clip_cot_texts.setdefault(clip_id, []).append(best_cot)
+                        
+                all_minade_1.append(total_minade_1 / n_minade_1)
+                all_minade_6.append(total_minade_6 / n_minade_6)
 
         metrics: dict[str, float] = {}
-        if n_min_ade > 0:
-            metrics["eval/min_ade"] = total_min_ade / n_min_ade
+        metrics["eval/minade_1"] = sum(all_minade_1) / len(all_minade_1)
+        metrics["eval/minade_6"] = sum(all_minade_6) / len(all_minade_6)
 
         parts = [f"{k}: {v:.4f}" for k, v in metrics.items()]
         logger.info(f"Eval: {', '.join(parts)}")

@@ -73,6 +73,7 @@ def create_sliding_window_inputs(
     clip_id: str,
     t0_us: int = 2_000_000,
     time_step_us: int = 100_000,
+    avdi=None,
 ):
     """
     Create sliding window inputs for streaming inference.
@@ -100,7 +101,7 @@ def create_sliding_window_inputs(
         current_t0 = t0_us + window_idx * time_step_us
 
         # Prefill: load full 4 frames per camera
-        data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=4)
+        data = load_physical_aiavdataset(clip_id, t0_us=current_t0, num_frames=4, avdi=avdi)
         frames = data["image_frames"].flatten(0, 1)  # (4, 4, C, H, W) -> (16, C, H, W)
         is_prefill = True
 

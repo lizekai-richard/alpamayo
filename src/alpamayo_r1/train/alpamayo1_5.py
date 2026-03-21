@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,17 +14,20 @@
 # limitations under the License.
 
 import copy
-import math
+from functools import partial
 import logging
-import numpy as np
 from typing import Any
+
 import einops
 import hydra.utils as hyu
+import numpy as np
 import torch
-from transformers import AutoConfig, AutoModel
-from transformers.generation.logits_process import (
+from transformers import (
+    AutoConfig,
+    AutoModel,
     LogitsProcessor,
     LogitsProcessorList,
+    StoppingCriteriaList,
     TemperatureLogitsWarper,
     TopKLogitsWarper,
     TopPLogitsWarper,
@@ -32,19 +35,21 @@ from transformers.generation.logits_process import (
 
 from alpamayo_r1.action_space import ActionSpace
 from alpamayo_r1.models.base_model import ReasoningVLA
-from alpamayo_r1.config import AlpamayoR1Config
+from alpamayo_r1.config import Alpamayo1_5Config
 from alpamayo_r1.diffusion.base import BaseDiffusion
 from alpamayo_r1.models.token_utils import (
+    StopAfterEOS,
     extract_text_tokens,
     replace_padding_after_eos,
     to_special_token,
 )
-from alpamayo_r1.models.streaming_masking_utils import (
+from alpamayo_r1.utils.streaming.streaming_masking_utils import (
     create_streaming_attention_mask_sdpa,
     create_streaming_attention_mask_sdpa_training,
 )
 from alpamayo_r1.train.patches import StaticCache
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast
+from alpamayo_r1.nav_utils import remove_nav_text
 
 logger = logging.getLogger(__name__)
 
@@ -77,32 +82,35 @@ class ExpertLogitsProcessor(LogitsProcessor):
             torch.FloatTensor: The modified scores tensor with trajectory tokens masked out (set to -inf).
         """
         # Directly assign -inf to the trajectory token positions in the scores tensor
-        scores[:, self.traj_token_offset : self.traj_token_offset + self.traj_vocab_size] = float('-inf')
+        scores[:, self.traj_token_offset : self.traj_token_offset + self.traj_vocab_size] = float(
+            "-inf"
+        )
         return scores
 
 
-class AlpamayoR1(ReasoningVLA):
-    """Streaming Expert model for reasoning VLA with torch.compile support."""
+class Alpamayo1_5(ReasoningVLA):
+    """Expert model for reasoning VLA."""
 
-    config_class: type[AlpamayoR1Config] = AlpamayoR1Config
+    config_class: type[Alpamayo1_5Config] = Alpamayo1_5Config
     base_model_prefix = "vlm"
 
     def __init__(
         self,
-        config: AlpamayoR1Config,
+        config: Alpamayo1_5Config,
         pretrained_modules: dict[str, torch.nn.Module] | None = None,
         original_vocab_size: int | None = None,
     ):
         super().__init__(config, pretrained_modules, original_vocab_size, print_param_count=False)
 
-        # Expert model setup
+        # we only need the text config for the expert model
         expert_config = copy.deepcopy(self.vlm.config.text_config)
         if config.expert_cfg is not None:
             for key, value in config.expert_cfg.items():
                 setattr(expert_config, key, value)
         self.expert = AutoModel.from_config(expert_config)
+        # we don't need the embed_tokens of the expert model
+        del self.expert.embed_tokens
 
-        # Action space and diffusion setup
         self.action_space: ActionSpace = hyu.instantiate(config.action_space_cfg)
         self.diffusion: BaseDiffusion = hyu.instantiate(
             config.diffusion_cfg,
@@ -144,7 +152,7 @@ class AlpamayoR1(ReasoningVLA):
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
-
+    
     def reset_streaming_state(self):
         """Reset all streaming state between batches."""
         self._past_key_values = None
@@ -156,7 +164,7 @@ class AlpamayoR1(ReasoningVLA):
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
-
+    
     def set_training_stage(self, stage: str):
         """Configure which modules are trainable based on training stage.
 
@@ -179,22 +187,110 @@ class AlpamayoR1(ReasoningVLA):
         else:
             raise ValueError(f"Unknown training stage: {stage!r}. Expected 'vlm' or 'expert'.")
 
-    # ==================== Properties ====================
+    @staticmethod
+    def _find_eos_offset(
+        sequences: torch.Tensor,
+        eos_token_id: int,
+        device: torch.device,
+        warn: bool = True,
+    ) -> torch.Tensor:
+        """Find the first eos_token_id position in each sequence and return offset = pos + 1.
 
-    @property
-    def traj_start_token_id(self) -> int:
-        """Token ID for <traj_future_start>."""
-        if not hasattr(self, "_traj_start_token_id"):
-            self._traj_start_token_id = self.tokenizer.convert_tokens_to_ids(
-                to_special_token("traj_future_start")
+        Falls back to the last token position when eos_token_id is not found.
+        The returned offset marks the boundary between VLM-generated tokens and
+        the region where expert diffusion tokens will be appended.
+        """
+        b_star = sequences.shape[0]
+        mask = sequences == eos_token_id
+        has_eos = mask.any(dim=1)  # [b_star]
+        if warn:
+            for i in range(b_star):
+                if not has_eos[i]:
+                    logger.warning(
+                        f"No <traj_future_start> token found in generated sequences"
+                        f" for sequence {i}"
+                    )
+        eos_positions = mask.int().argmax(dim=1)  # [b_star], first occurrence
+        last_positions = torch.full((b_star,), sequences.shape[1] - 1, device=device)
+        return torch.where(has_eos, eos_positions, last_positions) + 1
+
+    @staticmethod
+    def _build_expert_pos_ids_and_attn_mask(
+        offset: torch.Tensor,
+        rope_deltas: torch.Tensor,
+        kv_cache_seq_len: int,
+        n_diffusion_tokens: int,
+        b_star: int,
+        device: torch.device,
+        prefix_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build position IDs and 4D attention mask for the expert denoiser.
+
+        Args:
+            offset: [b_star] — token position right after <traj_future_start>.
+            rope_deltas: [b_star, 1] — RoPE delta from the VLM.
+            kv_cache_seq_len: sequence length already in the KV cache.
+            n_diffusion_tokens: number of expert diffusion tokens to append.
+            b_star: batch size (B * num_return_sequences).
+            device: torch device.
+            prefix_mask: [b_star, L] optional 1D attention mask (already repeated
+                to match b_star); zeros mark padding positions that should be
+                masked in the expert's cross-attention to the KV cache.
+
+        Returns:
+            position_ids: [3, b_star, n_diffusion_tokens] — Qwen2.5-VL RoPE ids.
+            attention_mask: [b_star, 1, n_diffusion_tokens, KV] — 4D float mask
+                (0 = attend, -inf = masked).
+        """
+        # Qwen2.5-VL uses 3-component (temporal, height, width) RoPE
+        position_ids = torch.arange(n_diffusion_tokens, device=device)
+        position_ids = einops.repeat(position_ids, "l -> 3 b l", b=b_star).clone()
+        position_ids += (rope_deltas + offset[:, None]).to(position_ids.device)
+
+        # [b_star, H, Q, KV] — mask the gap between offset and diffusion tokens
+        attention_mask = torch.zeros(
+            (b_star, 1, n_diffusion_tokens, kv_cache_seq_len + n_diffusion_tokens),
+            dtype=torch.float32,
+            device=device,
+        )
+        for i in range(b_star):
+            attention_mask[i, :, :, offset[i] : -n_diffusion_tokens] = torch.finfo(
+                attention_mask.dtype
+            ).min
+
+        # Propagate input padding mask (left-padding) into the KV prefix region
+        if prefix_mask is not None:
+            # [b_star, H, Q, KV]
+            input_mask = prefix_mask[:, None, None, :]
+            attention_mask[:, :, :, : input_mask.shape[-1]] = torch.where(
+                input_mask == 0,
+                torch.finfo(attention_mask.dtype).min,
+                attention_mask[:, :, :, : input_mask.shape[-1]],
             )
-        return self._traj_start_token_id
 
-    @property
-    def num_action_tokens(self) -> int:
-        """Number of action tokens (trajectory length)."""
-        return self.action_space.get_action_space_dims()[0]
-
+        return position_ids, attention_mask
+    
+    def _build_logits_processor(
+        self,
+        temperature: float,
+        top_k: int | None,
+        top_p: float,
+    ) -> LogitsProcessorList:
+        """Build logits processor for generation."""
+        processors = [
+            ExpertLogitsProcessor(
+                traj_token_offset=self.config.traj_token_start_idx,
+                traj_vocab_size=self.config.traj_vocab_size,
+            )
+        ]
+        if temperature > 0 and temperature != 1.0:
+            processors.append(TemperatureLogitsWarper(temperature))
+        if top_k is not None and top_k > 0:
+            processors.append(TopKLogitsWarper(top_k=top_k, min_tokens_to_keep=1))
+        if top_p < 1.0:
+            processors.append(TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=1))
+        return LogitsProcessorList(processors)
+    
     # ==================== Streaming Helpers ====================
 
     def _retrieve_streaming_related_inputs(self, input_ids):
@@ -413,46 +509,6 @@ class AlpamayoR1(ReasoningVLA):
             **(diffusion_kwargs or {}),
         )
 
-    # ==================== Logits Processor ====================
-
-    def _build_logits_processor(
-        self,
-        temperature: float,
-        top_k: int | None,
-        top_p: float,
-    ) -> LogitsProcessorList:
-        """Build logits processor for generation."""
-        processors = [
-            ExpertLogitsProcessor(
-                traj_token_offset=self.config.traj_token_start_idx,
-                traj_vocab_size=self.config.traj_vocab_size,
-            )
-        ]
-        if temperature > 0 and temperature != 1.0:
-            processors.append(TemperatureLogitsWarper(temperature))
-        if top_k is not None and top_k > 0:
-            processors.append(TopKLogitsWarper(top_k=top_k, min_tokens_to_keep=1))
-        if top_p < 1.0:
-            processors.append(TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=1))
-        return LogitsProcessorList(processors)
-
-    def _find_traj_start_positions(self, output_ids: torch.Tensor) -> torch.Tensor:
-        """Find <traj_future_start> token position for each sequence."""
-        traj_start_mask = output_ids == self.traj_start_token_id
-        has_traj_start = traj_start_mask.any(dim=1)
-
-        if not has_traj_start.all():
-            missing = (~has_traj_start).nonzero(as_tuple=True)[0].tolist()
-            logger.warning(f"No <traj_future_start> token found in sequences: {missing}")
-
-        return torch.where(
-            has_traj_start,
-            traj_start_mask.int().argmax(dim=1),
-            output_ids.shape[1] - 1,
-        )
-
-    # ==================== Main Inference ====================
-
     # We don't need any output from the first prefill. Only need to cache key/values, position_ids, and attention_mask.
     def _first_prefill(
         self,
@@ -544,7 +600,7 @@ class AlpamayoR1(ReasoningVLA):
 
         # ===== Training: compute loss on last window (with grad) =====
         if training_stage == "vlm":
-            vlm_output = self._forward_training_window(batch[-1], device)
+            vlm_output = self._forward_vlm_last_window(batch[-1], device)
             return {"loss": vlm_output.loss, "rollout_steps": len(batch) - 1}
         else:  # expert
             loss = self._forward_expert_last_window(batch[-1], device, max_generation_length, temperature, top_p)
@@ -616,35 +672,12 @@ class AlpamayoR1(ReasoningVLA):
         # Update streaming state (shift KV cache frames)
         self._update_past_key_values()
 
-        # # ===== Decode: generate CoT to populate KV cache =====
-        # logits_processor = self._build_logits_processor(temperature, None, top_p)
-        # output_ids = input_ids.clone()
-        # unfinished = torch.ones(1, dtype=torch.bool, device=device)
-        # cur_pos = cache_position[-1].item() + 1
-
-        # for _ in range(max_generation_length):
-        #     logits = logits_processor(output_ids, logits)
-        #     probs = torch.softmax(logits, dim=-1)
-        #     next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        #     next_token = torch.where(unfinished, next_token, self.tokenizer.pad_token_id)
-        #     output_ids = torch.cat([output_ids, next_token.unsqueeze(-1)], dim=-1)
-        #     unfinished = unfinished & (next_token != self.traj_start_token_id)
-        #     if not unfinished.any():
-        #         break
-        #     logits = self._decode(
-        #         input_ids=next_token.unsqueeze(-1),
-        #         position_ids=self._cached_position_ids,
-        #         cache_position=torch.tensor([cur_pos], device=device),
-        #     )
-        #     cur_pos += 1
-
-
-    def _forward_training_window(
+    def _forward_vlm_last_window(
         self,
         window: dict[str, Any],
         device: torch.device,
     ) -> Qwen3VLCausalLMOutputWithPast:
-        """Compute VLM loss on the last window (with gradient)."""
+        """Run VLM training on the last window."""
         input_ids = window["input_ids"].to(device)
         attention_mask = window["attention_mask"].to(device)
         pixel_values = window["pixel_values"].to(device)
@@ -761,7 +794,8 @@ class AlpamayoR1(ReasoningVLA):
             )
 
             # Compute scalar values needed for expert mask construction
-            traj_start_pos = self._find_traj_start_positions(output_ids)
+            # traj_start_pos = self._find_traj_start_positions(output_ids)
+            traj_start_pos = self._find_eos_offset(output_ids, self.traj_start_token_id, device)
             action_start_pos = self.prefill_seq_length + (traj_start_pos - seq_len) + 1
             # Save as python ints so they can be used outside inference_mode
             action_start_pos_val = action_start_pos.cpu().tolist()
@@ -814,7 +848,6 @@ class AlpamayoR1(ReasoningVLA):
         v_pred = self.action_out_proj(hidden).view(batch_size, *action_dims)
         return torch.nn.functional.mse_loss(v_pred, v_target)
     
-    @torch.inference_mode()
     def sample_trajectories_from_data_with_streaming_vlm_rollout(
         self,
         data: dict[str, Any],
@@ -824,57 +857,59 @@ class AlpamayoR1(ReasoningVLA):
         num_traj_samples: int = 6,
         num_traj_sets: int = 1,
         diffusion_kwargs: dict[str, Any] | None = None,
-        return_extra: bool = False,
         *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample trajectories with streaming VLM rollout.
+        """Sample trajectories from the data with VLM rollout.
 
         Args:
-            data: Input data containing tokenized_data, ego_history_xyz, ego_history_rot.
-            top_p: Top-p sampling parameter.
-            top_k: Top-k sampling parameter.
-            temperature: Sampling temperature.
-            num_traj_samples: Number of trajectory samples.
-            num_traj_sets: Number of trajectory sets.
-            diffusion_kwargs: Additional kwargs for diffusion sampling.
-            return_extra: Whether to return extra information.
+            data: The input data.
+            top_p: The top-p value for sampling.
+            top_k: The top-k value for sampling.
+            temperature: The temperature for sampling.
+            num_traj_samples: The number of trajectory samples.
+            num_traj_sets: The number of trajectory sets.
+            *args: Variable length argument list.
+            **kwargs: Arbitrary keyword arguments.
 
         Returns:
-            A tuple containing the predicted trajectories, the target trajectories, and extra information.
+            pred_xyz: The predicted xyz.
+            pred_rot: The predicted rotation.
+            logprob: The log probability.
         """
-        tokenized = data["tokenized_data"]
-        input_ids = tokenized["input_ids"]
-        attention_mask = tokenized["attention_mask"]
-        pixel_values = tokenized["pixel_values"]
-        image_grid_thw = tokenized["image_grid_thw"]
+        data = copy.deepcopy(data)
+        n_samples_total = num_traj_samples * num_traj_sets
         ego_history_xyz = data["ego_history_xyz"]
         ego_history_rot = data["ego_history_rot"]
-
-        batch_size, num_traj_groups, _, _ = ego_history_xyz.shape
-        num_samples = num_traj_samples * num_traj_sets
-        assert num_traj_groups == 1, "Only one trajectory group is supported."
+        pixel_values = data["pixel_values"]
+        image_grid_thw = data["image_grid_thw"]
+        batch_size, n_traj_group, _, _ = ego_history_xyz.shape
+        assert n_traj_group == 1, "Only one trajectory group is supported for inference."
+        tokenized_data = data["tokenized_data"]
+        input_ids = tokenized_data.pop("input_ids")
+        traj_data_vlm = {
+            "ego_history_xyz": ego_history_xyz,
+            "ego_history_rot": ego_history_rot,
+        }
+        input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
         device = input_ids.device
 
-        # Fuse trajectory tokens
-        input_ids = self.fuse_traj_tokens(
-            input_ids, {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot}
+        # 1) run autoregressive generation for the VLM
+        max_generation_length = kwargs.get(
+            "max_generation_length", self.config.tokens_per_future_traj
         )
-
-        # Setup generation
-        max_new_tokens = kwargs.get("max_generation_length", self.config.tokens_per_future_traj)
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
 
         if self.is_first_prefill:
             self.prefill_seq_length = input_ids.shape[1]
-            self.max_cache_len = self.prefill_seq_length + max_new_tokens + self.num_action_tokens
-
+            self.max_cache_len = self.prefill_seq_length + max_generation_length + self.num_action_tokens
+        
         # Initialize KV cache on first call
         if self._past_key_values is None:
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
                 max_cache_len=self.max_cache_len,
-                max_batch_size=num_samples * batch_size,
+                max_batch_size=n_samples_total * batch_size,
                 offloading=False,
             )
         
@@ -896,7 +931,7 @@ class AlpamayoR1(ReasoningVLA):
             self._cached_streaming_attention_mask = self._get_streaming_attention_mask(
                 cache_position=cache_position, device=device,
             )
-
+        
         logits = self._prefill(
             inputs_embeds=inputs_embeds,
             position_ids=self._cached_position_ids,
@@ -905,16 +940,16 @@ class AlpamayoR1(ReasoningVLA):
             deepstack_image_embeds=deepstack_image_embeds,
             streaming_attention_mask=self._cached_streaming_attention_mask,
         )
-        
+
         output_ids = input_ids.clone()
-        if num_samples > 1:
+        if n_samples_total > 1:
             self._past_key_values.expand_batch()
-            logits = logits.expand(num_samples, -1).contiguous()
-            output_ids = output_ids.expand(num_samples, -1).contiguous()
-        unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
+            logits = logits.expand(n_samples_total, -1).contiguous()
+            output_ids = output_ids.expand(n_samples_total, -1).contiguous()
+        unfinished = torch.ones(batch_size * n_samples_total, dtype=torch.bool, device=device)
         cur_pos = cache_position[-1].item() + 1
 
-        for _ in range(max_new_tokens):
+        for _ in range(max_generation_length):
             logits = logits_processor(output_ids, logits)
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
@@ -940,11 +975,7 @@ class AlpamayoR1(ReasoningVLA):
         )
 
         # Find <traj_future_start> position
-        traj_start_pos = self._find_traj_start_positions(output_ids)
-
-        # ===== Action (Diffusion) =====
-        # Note: Action only attends to prompt tokens, NOT reasoning tokens (they are masked out).
-        # This is by design - the expert model conditions only on the original prompt.
+        traj_start_pos = self._find_eos_offset(output_ids, self.traj_start_token_id, device)
 
         # MODIFIED: Calculate offset for action tokens. In streaming setting, the offset is wrong without the modification due to truncated input length.
         # But the length of kv cache is always the same.
@@ -952,7 +983,7 @@ class AlpamayoR1(ReasoningVLA):
 
         # Build position_ids for action tokens
         # Build attention mask: attend to prompt only, mask out reasoning tokens
-        indices = torch.arange(self._past_key_values.max_cache_len, device=device).expand(num_samples, -1)
+        indices = torch.arange(self._past_key_values.max_cache_len, device=device).expand(n_samples_total, -1)
         is_prompt = indices < action_start_pos[:, None]
         is_action = (indices >= cur_pos) & (indices < cur_pos + self.num_action_tokens)
         attention_mask = torch.where(
@@ -966,7 +997,7 @@ class AlpamayoR1(ReasoningVLA):
 
         sampled_action = self._action(
             num_action_tokens=self.num_action_tokens,
-            total_samples=batch_size * num_samples,
+            total_samples=batch_size * n_samples_total,
             device=device,
             cache_position=cache_position,
             attention_mask=attention_mask,
@@ -974,8 +1005,8 @@ class AlpamayoR1(ReasoningVLA):
         )
 
         # Convert actions to trajectories
-        hist_xyz = einops.repeat(ego_history_xyz[:, -1], "b ... -> (b n) ...", n=num_samples)
-        hist_rot = einops.repeat(ego_history_rot[:, -1], "b ... -> (b n) ...", n=num_samples)
+        hist_xyz = einops.repeat(ego_history_xyz[:, -1], "b ... -> (b n) ...", n=n_samples_total)
+        hist_rot = einops.repeat(ego_history_rot[:, -1], "b ... -> (b n) ...", n=n_samples_total)
         pred_xyz, pred_rot = self.action_space.action_to_traj(sampled_action, hist_xyz, hist_rot)
         pred_xyz = einops.rearrange(
             pred_xyz, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
@@ -987,7 +1018,7 @@ class AlpamayoR1(ReasoningVLA):
         # Update streaming state
         self._update_past_key_values()
 
-        if return_extra:
+        if kwargs.get("return_extra", False):
             extra = extract_text_tokens(self.tokenizer, output_ids)
             for key in extra:
                 extra[key] = np.array(extra[key]).reshape(
@@ -997,5 +1028,5 @@ class AlpamayoR1(ReasoningVLA):
         return pred_xyz, pred_rot
 
 
-AutoConfig.register("alpamayo_r1", AlpamayoR1Config)
-AutoModel.register(AlpamayoR1Config, AlpamayoR1)
+AutoConfig.register("alpamayo1_5", Alpamayo1_5Config)
+AutoModel.register(Alpamayo1_5Config, Alpamayo1_5)

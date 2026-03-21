@@ -44,3 +44,33 @@ class AlpamayoR1Config(ReasoningVLAConfig):
         self.expert_cfg = expert_cfg
         self.keep_same_dtype = keep_same_dtype
         self.expert_non_causal_attention = expert_non_causal_attention
+
+
+class Alpamayo1_5Config(ReasoningVLAConfig):
+    """Configuration for the Alpamayo 1.5 release model."""
+
+    model_type = "alpamayo1_5"
+
+    def __init__(
+        self,
+        diffusion_cfg: dict[str, Any] | None = None,
+        action_space_cfg: dict[str, Any] | None = None,
+        action_in_proj_cfg: dict[str, Any] | None = None,
+        action_out_proj_cfg: dict[str, Any] | None = None,
+        expert_cfg: dict[str, Any] | None = None,
+        keep_same_dtype: bool = True,
+        expert_non_causal_attention: bool = True,
+        include_camera_ids: bool = False,
+        include_frame_nums: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.diffusion_cfg = diffusion_cfg
+        self.action_space_cfg = action_space_cfg
+        self.action_in_proj_cfg = action_in_proj_cfg
+        self.action_out_proj_cfg = action_out_proj_cfg
+        self.expert_cfg = expert_cfg
+        self.keep_same_dtype = keep_same_dtype
+        self.expert_non_causal_attention = expert_non_causal_attention
+        self.include_camera_ids = include_camera_ids
+        self.include_frame_nums = include_frame_nums

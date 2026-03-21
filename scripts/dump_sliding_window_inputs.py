@@ -53,7 +53,7 @@ def main():
     parser = argparse.ArgumentParser(description="Dump sliding_window_inputs for each clip to disk.")
     parser.add_argument("--clip_ids_file", type=str, required=True, help="JSON file with list of clip IDs.")
     parser.add_argument("--output_dir", type=str, required=True, help="Root dir for dumps: output_dir/<clip_id>/sliding_window_inputs.pt")
-    parser.add_argument("--model_path", type=str, default="./Alpamayo-R1-10B", help="Model path (for processor/tokenizer).")
+    parser.add_argument("--model_path", type=str, default="nvidia/Alpamayo-R1-10B", help="Model path (for processor/tokenizer).")
     parser.add_argument("--num_steps", type=int, default=120)
     parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
@@ -77,6 +77,8 @@ def main():
     _model, processor = load_model(args, device=torch.device("cpu"))
     del _model  # free memory; we only need processor for create_sliding_window_inputs
 
+    avdi = helper.create_avdi()
+
     if dist.is_initialized():
         dist.barrier()  # sync all ranks after model load before starting work
 
@@ -93,8 +95,8 @@ def main():
                 clip_id=clip_id,
                 t0_us=args.t0_us,
                 time_step_us=args.time_step_us,
+                avdi=avdi,
             )
-            # Move all tensors to CPU and save
             sliding_window_inputs_cpu = _to_cpu(sliding_window_inputs)
             os.makedirs(out_subdir, exist_ok=True)
             torch.save(sliding_window_inputs_cpu, out_file)

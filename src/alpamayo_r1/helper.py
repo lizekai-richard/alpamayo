@@ -21,6 +21,9 @@ import os
 import torch
 import collections.abc
 
+import logging
+logger = logging.getLogger(__name__)
+
 MIN_PIXELS = 163840
 MAX_PIXELS = 196608
 BASE_PROCESSOR_NAME = "Qwen/Qwen3-VL-2B-Instruct"
@@ -178,3 +181,27 @@ def to_device(
         return [to_device(elem, device=device, dtype=dtype) for elem in data]
     else:
         return data
+
+
+def _patch_sensor_presence_rename():
+    """Monkey-patch physical_ai_av for dataset rename: sensor_presence.parquet -> feature_presence.parquet."""
+    from physical_ai_av.utils import hf_interface
+    _orig = hf_interface.HfRepoInterface.download_file
+
+    def _patched(self, filename, **kwargs):
+        if filename == "metadata/sensor_presence.parquet":
+            filename = "metadata/feature_presence.parquet"
+        return _orig(self, filename, **kwargs)
+
+    hf_interface.HfRepoInterface.download_file = _patched
+
+
+def create_avdi(cache_dir=None):
+    """Create PhysicalAIAVDatasetInterface; apply sensor_presence->feature_presence workaround if needed."""
+    import physical_ai_av
+    try:
+        return physical_ai_av.PhysicalAIAVDatasetInterface(cache_dir=cache_dir)
+    except IndexError:
+        logger.warning("Dataset renamed sensor_presence -> feature_presence; applying workaround...")
+        _patch_sensor_presence_rename()
+        return physical_ai_av.PhysicalAIAVDatasetInterface(cache_dir=cache_dir)

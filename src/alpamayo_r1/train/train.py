@@ -8,7 +8,8 @@ import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
 
-from alpamayo_r1.train.alpamayo_r1 import AlpamayoR1
+from alpamayo_r1.train.alpamayo1 import AlpamayoR1
+from alpamayo_r1.train.alpamayo1_5 import Alpamayo1_5
 from alpamayo_r1 import helper
 from alpamayo_r1.train.dataset import StreamingDataset, EvalStreamingDataset, collate_fn, batched_collate_fn, eval_collate_fn
 from alpamayo_r1.train.trainer import Trainer, TrainerConfig
