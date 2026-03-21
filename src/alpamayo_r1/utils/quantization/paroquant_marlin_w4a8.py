@@ -22,16 +22,10 @@ import os
 import sys
 from typing import NamedTuple
 
-# inference_engine lives in the paroquant repo root, not in the installed paroquant package.
-# Add paroquant repo root to path so "from inference_engine ..." works.
-_paroquant_root = os.environ.get("PAROQUANT_ROOT")
-if _paroquant_root and _paroquant_root not in sys.path:
-    sys.path.insert(0, _paroquant_root)
-
 import torch
 import torch.nn as nn
-from inference_engine.model_executor.modules.rotation_linear import RotateLinearInt4
-from inference_engine.model_executor.modules.qmodule import WQLinear
+from alpamayo_r1.utils.quantization.rotation_linear import RotateLinearInt4
+from alpamayo_r1.utils.quantization.qmodule import WQLinear
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     awq_to_marlin_zero_points,
@@ -449,7 +443,7 @@ def load_paroquant_model(
     Returns:
         AlpamayoR1 with ParoQuant INT4 weights on CUDA, eval mode.
     """
-    from alpamayo_r1.models.alpamayo_r1_unified import AlpamayoR1FlashDrive
+    from alpamayo_r1.models.alpamayo_r1_flashdrive import AlpamayoR1FlashDrive
 
     model = AlpamayoR1FlashDrive.from_pretrained(model_path, dtype=dtype)
     model.setup_patch_for_torch_compile(
@@ -527,3 +521,89 @@ def convert_model_to_marlin_w4a8(model):
         n += 1
     logger.info(f"Converted {n} WQLinear -> MarlinW4A8Linear (Marlin W4A8)")
     return n
+
+
+def save_w4a8_pretrained(model: nn.Module, save_path: str) -> None:
+    """Save a fully converted W4A8 model via HuggingFace save_pretrained."""
+    import json as _json
+    from pathlib import Path
+
+    save_path = str(save_path)
+    model.save_pretrained(save_path)
+
+    meta = {
+        "format": "paroquant_marlin_w4a8",
+        "num_quantized_layers": sum(
+            1 for _, m in model.named_modules()
+            if type(m).__name__ == "MarlinW4A8Linear"
+        ),
+    }
+    Path(save_path, "w4a8_config.json").write_text(_json.dumps(meta, indent=2))
+    logger.info(f"Saved W4A8 model to {save_path}")
+
+
+def load_w4a8_pretrained(
+    save_path: str,
+    base_model_path: str,
+    *,
+    mode: str = "streaming",
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> nn.Module:
+    """Load a saved W4A8 model."""
+    from pathlib import Path
+
+    from alpamayo_r1.models.alpamayo_r1_flashdrive import AlpamayoR1FlashDrive
+    from alpamayo_r1.utils.system.patches import patch_for_torch_compile
+    import paroquant_kernels as _pq_kernels  # noqa: F401 — registers rotation ops
+
+    logger.info(f"Creating model architecture from {base_model_path}...")
+    model = AlpamayoR1FlashDrive.from_pretrained(base_model_path, dtype=dtype)
+
+    patch_for_torch_compile(model, mode=mode, fuse_qkv=False, fuse_gate_up=False)
+
+    logger.info("Creating RotateLinearInt4 shells...")
+    replace_linears_with_rotate_linear(model, target="vlm", init_only=True)
+
+    n_marlin = 0
+    for _, mod in model.named_modules():
+        if isinstance(mod, RotateLinearInt4) and isinstance(mod.qlinear, WQLinear):
+            wq = mod.qlinear
+            mod.qlinear = MarlinW4A8Linear(wq.in_features, wq.out_features, wq.group_size)
+            n_marlin += 1
+    logger.info(f"Created {n_marlin} MarlinW4A8Linear shells")
+
+    _wrap_rotate_linears(model, target="vlm")
+    model._patched_for_compile = True
+
+    logger.info(f"Loading weights from {save_path}...")
+    save_dir = Path(save_path)
+    if not save_dir.is_dir():
+        from huggingface_hub import snapshot_download
+        save_dir = Path(snapshot_download(save_path))
+    safetensor_files = sorted(save_dir.glob("model*.safetensors"))
+    if safetensor_files:
+        from safetensors.torch import load_file
+        sd = {}
+        for f in safetensor_files:
+            sd.update(load_file(str(f), device="cpu"))
+    else:
+        pt_file = save_dir / "pytorch_model.bin"
+        sd = torch.load(str(pt_file), map_location="cpu", weights_only=True)
+
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing:
+        quant_missing = [k for k in missing if "qlinear" in k or "rotation" in k]
+        if quant_missing:
+            logger.warning(f"Missing quantization keys ({len(quant_missing)}): {quant_missing[:5]}")
+        else:
+            logger.info(f"Missing keys ({len(missing)}, all non-quant — OK)")
+    if unexpected:
+        logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+    del sd
+
+    logger.info(f"Moving model to {device}...")
+    model = model.to(device)
+    model.eval()
+    logger.info("W4A8 model loaded successfully")
+    return model

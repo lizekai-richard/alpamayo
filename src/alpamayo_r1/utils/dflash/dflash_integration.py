@@ -919,7 +919,7 @@ class DFlashAlpamayoAccelerator:
         # Skip for capture-ids path (already using StaticCache from prefill).
         if use_static and not self._use_capture_layer_ids:
             if use_compiled:
-                from alpamayo_r1.models.patches import patch_for_torch_compile
+                from alpamayo_r1.utils.system.patches import patch_for_torch_compile
                 if not hasattr(self, "_patched_for_compile"):
                     patch_for_torch_compile(self.target_vlm, mode="non-streaming")
                     self._patched_for_compile = True

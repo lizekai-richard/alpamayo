@@ -33,7 +33,12 @@ from .interface import (
     scaled_pairwise_rotation,
 )
 
+gemm_forward_cuda_new = _C.gemm_forward_cuda_new
+gemv_forward_cuda_new = _C.gemv_forward_cuda_new
+
 __all__ = [
     "scaled_pairwise_rotation",
     "RotateTensorFunc",
+    "gemm_forward_cuda_new",
+    "gemv_forward_cuda_new",
 ]

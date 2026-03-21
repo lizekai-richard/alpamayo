@@ -21,69 +21,54 @@ import einops
 import hydra.utils as hyu
 import numpy as np
 import torch
-from transformers import AutoConfig, AutoModel, StoppingCriteriaList
-from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
+from transformers import AutoConfig, AutoModel
+from transformers import StaticCache
+from transformers.generation.logits_process import (
+    LogitsProcessor,
+    LogitsProcessorList,
+    TemperatureLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+)
+
 from alpamayo_r1.action_space import ActionSpace
-from alpamayo_r1.models.base_model import ReasoningVLA
 from alpamayo_r1.config import AlpamayoR1Config
+from alpamayo_r1.models.base_model import ReasoningVLA
 from alpamayo_r1.diffusion.base import BaseDiffusion
+from alpamayo_r1.utils.system.patches import patch_for_torch_compile
+from alpamayo_r1.utils.system.patches import StaticCache
 from alpamayo_r1.models.token_utils import (
-    StopAfterEOS,
     extract_text_tokens,
     replace_padding_after_eos,
     to_special_token,
 )
-from alpamayo_r1.models.patches import StaticCache
-from alpamayo_r1.models.streaming_masking_utils import create_streaming_attention_mask_sdpa
-
-# Check Flex Attention availability
-FLEX_ATTENTION_AVAILABLE = False
-try:
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-    from alpamayo_r1.models.streaming_masking_utils import (
-        create_streaming_attention_mask_flex,
-    )
-    FLEX_ATTENTION_AVAILABLE = True
-except ImportError:
-    pass
+from alpamayo_r1.models.streaming_masking_utils import (
+    create_streaming_attention_mask_sdpa,
+)
 
 logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 
 
 class ExpertLogitsProcessor(LogitsProcessor):
     """Masks out the logits for discrete trajectory tokens."""
 
     def __init__(self, traj_token_offset: int, traj_vocab_size: int):
-        """Initialize the ExpertLogitsProcessor.
-
-        Args:
-            traj_token_offset: The offset of the trajectory tokens.
-            traj_vocab_size: The vocabulary size of the trajectory tokens.
-        """
         super().__init__()
         self.traj_token_offset = traj_token_offset
         self.traj_vocab_size = traj_vocab_size
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        """Call the ExpertLogitsProcessor to mask out the logits for discrete trajectory tokens.
-
-        The discrete trajectory tokens are not used for the expert model thus masking them out for
-        better CoC generation.
-
-        Args:
-            input_ids: The input IDs.
-            scores: The scores.
-
-        Returns:
-            torch.FloatTensor: The modified scores tensor with trajectory tokens masked out (set to -inf).
-        """
-        # Directly assign -inf to the trajectory token positions in the scores tensor
-        scores[:, self.traj_token_offset : self.traj_token_offset + self.traj_vocab_size] = float('-inf')
+        scores[:, self.traj_token_offset : self.traj_token_offset + self.traj_vocab_size] = float("-inf")
         return scores
 
 
 class StreamingAlpamayoR1(ReasoningVLA):
-    """Expert model for reasoning VLA."""
+    """Streaming Expert model for reasoning VLA with torch.compile support."""
 
     config_class: type[AlpamayoR1Config] = AlpamayoR1Config
     base_model_prefix = "vlm"
@@ -96,13 +81,14 @@ class StreamingAlpamayoR1(ReasoningVLA):
     ):
         super().__init__(config, pretrained_modules, original_vocab_size, print_param_count=False)
 
-        # we only need the text config for the expert model
+        # Expert model setup
         expert_config = copy.deepcopy(self.vlm.config.text_config)
         if config.expert_cfg is not None:
             for key, value in config.expert_cfg.items():
                 setattr(expert_config, key, value)
         self.expert = AutoModel.from_config(expert_config)
 
+        # Action space and diffusion setup
         self.action_space: ActionSpace = hyu.instantiate(config.action_space_cfg)
         self.diffusion: BaseDiffusion = hyu.instantiate(
             config.diffusion_cfg,
@@ -129,214 +115,804 @@ class StreamingAlpamayoR1(ReasoningVLA):
 
         self.post_init()
 
+        # Streaming-specific parameters
+        self.prefill_seq_length = 3006
+        self.max_cache_len = self.prefill_seq_length + 256 + 64
+        self.num_views = 4
+        self.num_frames_per_view = 4
+        self.num_image_tokens_per_frame = 180
+
+        # Streaming state (will be initialized on first call)
+        self._past_key_values = None
         self._cached_position_ids = None
         self._cached_attention_mask = None
         self._cached_streaming_attention_mask = None
         self._cached_rope_deltas = None
+        self._cached_keep_mask = None
         self.vision_start_end_ids_ranges = None
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
-        self.num_views = 4
-        self.num_frames_per_view = 4
         self.is_first_prefill = True
-    
+
+    # ==================== Properties ====================
+
+    @property
+    def traj_start_token_id(self) -> int:
+        """Token ID for <traj_future_start>."""
+        if not hasattr(self, "_traj_start_token_id"):
+            self._traj_start_token_id = self.tokenizer.convert_tokens_to_ids(
+                to_special_token("traj_future_start")
+            )
+        return self._traj_start_token_id
+
+    @property
+    def num_action_tokens(self) -> int:
+        """Number of action tokens (trajectory length)."""
+        return self.action_space.get_action_space_dims()[0]
+
+    # ==================== Streaming Helpers ====================
+
     def _retrieve_streaming_related_inputs(self, input_ids):
         """
-            This function returns:
-            - vision_start_end_ids_ranges: Per-view list of frame ranges. Shape: [num_views][num_frames_per_view],
-              where each element is a tuple (start, end) for vision_start to vision_end tokens.
-            - image_tokens_ids_ranges: Per-view list of frame ranges. Shape: [num_views][num_frames_per_view],
-              where each element is a tuple (start, end) for image tokens only (excluding vision_start/end).
-            - traj_and_text_ids_range: The traj and text token ids range.
-            For all ranges, we follow the python style and store a (closed, open) range
+        Returns vision and trajectory token ranges for streaming.
+
+        Returns:
+            vision_start_end_ids_ranges: Per-view list of frame ranges [num_views][num_frames_per_view]
+            image_token_ids_ranges: Per-view list of image token ranges
+            traj_and_text_ids_range: (start, end) tuple for trajectory and text tokens
         """
         vision_start_end_ids_ranges = [[] for _ in range(self.num_views)]
         image_token_ids_ranges = [[] for _ in range(self.num_views)]
-        traj_and_text_ids_range = []
 
-        # For subsequent streaming generation steps, the new kv cache (one frame per view) will be inserted in every view range. The trajectory history and text will also be recomputed.
-        vision_start_token = "<|vision_start|>" if not hasattr(self.processor.tokenizer, "vision_start_token") else self.processor.tokenizer.vision_start_token
-        vision_end_token = "<|vision_end|>" if not hasattr(self.processor.tokenizer, "vision_end_token") else self.processor.tokenizer.vision_end_token
-
-        vision_start_token_id = self.processor.tokenizer.encode(vision_start_token)[0]
-        vision_end_token_id = self.processor.tokenizer.encode(vision_end_token)[0]
+        vision_start_token = "<|vision_start|>"
+        vision_end_token = "<|vision_end|>"
+        vision_start_token_id = self.tokenizer.encode(vision_start_token)[0]
+        vision_end_token_id = self.tokenizer.encode(vision_end_token)[0]
 
         vision_start_token_mask = (input_ids == vision_start_token_id)
         vision_end_token_mask = (input_ids == vision_end_token_id)
 
-        # Get all positions where image tokens occur
         all_vision_start_token_ids = torch.where(vision_start_token_mask)[1]
         all_vision_end_token_ids = torch.where(vision_end_token_mask)[1]
 
-        # Organize ranges per-view (num_views x num_frames_per_view)
-        # Frames are ordered as: view0_f0, view0_f1, view0_f2, view0_f3, view1_f0, view1_f1, ...
-        for frame_idx, (vision_start, vision_end) in enumerate(zip(all_vision_start_token_ids, all_vision_end_token_ids)):
+        for frame_idx, (vision_start, vision_end) in enumerate(
+            zip(all_vision_start_token_ids, all_vision_end_token_ids)
+        ):
             view_idx = frame_idx // self.num_frames_per_view
             vision_start_end_ids_ranges[view_idx].append((vision_start.item(), vision_end.item() + 1))
-            image_tokens_start = vision_start.item() + 1
-            image_tokens_end = vision_end.item()
-            image_token_ids_ranges[view_idx].append((image_tokens_start, image_tokens_end))
+            image_token_ids_ranges[view_idx].append((vision_start.item() + 1, vision_end.item()))
 
         last_vision_end_id = all_vision_end_token_ids[-1]
         traj_and_text_ids_range = (last_vision_end_id.item() + 1, self.prefill_seq_length)
 
         return vision_start_end_ids_ranges, image_token_ids_ranges, traj_and_text_ids_range
-    
+
     def _update_past_key_values(self):
-        """Update the past key values.
-            For each view, shift the the last three frames to the left and keep one dummy frame buffer
-            Discard all trajectory and text tokens
-        """
-        # Create mask once for all layers
-        for layers in self.past_key_values.layers:
-            key_cache = layers.keys
-            value_cache = layers.values
+        """Shift KV cache: move frames 2-4 to positions 1-3 for each view."""
+        for layer in self._past_key_values.layers:
+            key_cache = layer.keys
+            value_cache = layer.values
 
             for i in range(self.num_views):
-                new_kv_start = self.vision_start_end_ids_ranges[i][0][0]  # first frame vision start
-                new_kv_end = self.vision_start_end_ids_ranges[i][-2][1]  # third frame vision end
+                new_kv_start = self.vision_start_end_ids_ranges[i][0][0]
+                new_kv_end = self.vision_start_end_ids_ranges[i][-2][1]
+                old_kv_start = self.vision_start_end_ids_ranges[i][1][0]
+                old_kv_end = self.vision_start_end_ids_ranges[i][-1][1]
 
-                old_kv_start = self.vision_start_end_ids_ranges[i][1][0]  # second frame vision start
-                old_kv_end = self.vision_start_end_ids_ranges[i][-1][1]  # fourth frame vision end
+                key_cache[:, :, new_kv_start:new_kv_end, :].copy_(
+                    key_cache[:, :, old_kv_start:old_kv_end, :].clone()
+                )
+                value_cache[:, :, new_kv_start:new_kv_end, :].copy_(
+                    value_cache[:, :, old_kv_start:old_kv_end, :].clone()
+                )
 
-                key_cache[:, :, new_kv_start:new_kv_end, :].copy_(key_cache[:, :, old_kv_start:old_kv_end, :].clone())
-                value_cache[:, :, new_kv_start:new_kv_end, :].copy_(value_cache[:, :, old_kv_start:old_kv_end, :].clone())
-                
-    
-    def create_cache_position(self, vision_start_end_ids_ranges, traj_and_text_ids_range):
-        """Create the cache position.
-            The cache positions are fixed: last frame tokens for each view + trajectory and text tokens
-        """
+    def _create_cache_position(self) -> torch.Tensor:
+        """Create cache positions for streaming prefill."""
         if self.is_first_prefill:
-            cache_position = torch.arange(0, self.prefill_seq_length)
+            return torch.arange(0, self.prefill_seq_length)
         else:
             cache_position = []
             for i in range(self.num_views):
-                last_frame_vision_start, last_frame_vision_end = vision_start_end_ids_ranges[i][-1]
-                cache_position.append(torch.arange(last_frame_vision_start, last_frame_vision_end))
-
-            cache_position.append(torch.arange(traj_and_text_ids_range[0], traj_and_text_ids_range[1]))
-            cache_position = torch.cat(cache_position, dim=0)
-        return cache_position
+                start, end = self.vision_start_end_ids_ranges[i][-1]
+                cache_position.append(torch.arange(start, end))
+            cache_position.append(
+                torch.arange(self.traj_and_text_ids_range[0], self.traj_and_text_ids_range[1])
+            )
+            return torch.cat(cache_position, dim=0)
 
     def _get_streaming_attention_mask(
         self,
         cache_position: torch.Tensor,
-        vision_start_end_ids_ranges: list[list[tuple[int, int]]],
-        traj_and_text_ids_range: tuple[int, int],
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
-        use_flex: bool = False,
-    ):
-        """
-        Get or create streaming attention mask with caching.
-
-        The mask is cached because in streaming inference, the mask configuration
-        (vision_start_end_ids_ranges, traj_and_text_ids_range) stays constant across
-        streaming steps - only the KV cache values change, not the attention pattern.
-
-        The mask has shape [1, 1, query_length, max_cache_len] where:
-        - [0:prefill_seq_length] contains the streaming attention pattern
-        - [prefill_seq_length:max_cache_len] is padding (-inf)
-
-        Args:
-            cache_position: The cache positions for the query tokens.
-            vision_start_end_ids_ranges: List of views, each containing list of
-                (start, end) tuples for each frame's vision tokens.
-            traj_and_text_ids_range: (start, end) tuple for trajectory and text tokens.
-            valid_length: Positions >= valid_length in KV dimension will be masked as padding.
-            device: The device to create tensors on.
-            dtype: The dtype for SDPA mask (ignored for Flex Attention).
-            use_flex: If True and available, use Flex Attention BlockMask.
-
-        Returns:
-            For SDPA: 4D float mask [batch_size, 1, query_length, max_cache_len]
-            For Flex: BlockMask object
-        """
-
-        # Create SDPA mask with kv_length=max_cache_len
-        # valid_length controls which positions are actual content vs padding
-        streaming_attention_mask = create_streaming_attention_mask_sdpa(
+    ) -> torch.Tensor:
+        """Create streaming attention mask for non-first prefill."""
+        return create_streaming_attention_mask_sdpa(
             batch_size=1,
             cache_position=cache_position,
             kv_length=self.max_cache_len,
-            vision_start_end_ids_ranges=vision_start_end_ids_ranges,
-            traj_and_text_ids_range=traj_and_text_ids_range,
+            vision_start_end_ids_ranges=self.vision_start_end_ids_ranges,
+            traj_and_text_ids_range=self.traj_and_text_ids_range,
             valid_length=self.prefill_seq_length,
             device=device,
             dtype=dtype,
         )
 
-        return streaming_attention_mask
-
-    def crop_static_cache(self, valid_length: int):
-        """
-        Crop the static cache by zeroing out positions beyond valid_length.
-
-        Unlike DynamicCache.crop() which slices tensors, StaticCache has fixed-size
-        tensors. This method zeros out the invalid positions so that get_seq_length()
-        returns the correct value.
-
-        Args:
-            valid_length: Keep positions [0:valid_length], zero out [valid_length:].
-        """
-        for layer in self.past_key_values.layers:
+    def _crop_static_cache(self, valid_length: int):
+        """Zero out cache positions beyond valid_length."""
+        for layer in self._past_key_values.layers:
             if layer.is_initialized:
                 layer.keys[:, :, valid_length:, :].zero_()
                 layer.values[:, :, valid_length:, :].zero_()
-    
-    def _prepare_inputs_for_prefill(self, input_ids, attention_mask, image_grid_thw, max_generation_length, device):
-        if self.is_first_prefill:
-            max_cache_len = input_ids.shape[1] + max_generation_length + self.num_action_tokens
-            self.max_cache_len = max_cache_len
-            self.prefill_seq_length = input_ids.shape[1]
-            if not hasattr(self, "past_key_values"):
-                self.past_key_values = StaticCache(
-                    config=self.vlm.config,
-                    max_cache_len=max_cache_len,
-                    offloading=False
+
+    # ==================== Compiled Functions ====================
+
+    def _encode(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Encode images using the visual encoder."""
+        if not hasattr(self, "_encode_fn"):
+            self._encode_pixel_values = torch.empty_like(pixel_values)
+            self._encode_image_grid_thw = torch.empty_like(image_grid_thw)
+
+            def encode_fn():
+                pixels = self._encode_pixel_values.type(self.vlm.model.visual.dtype)
+                return self.vlm.model.visual(pixels, grid_thw=self._encode_image_grid_thw)
+
+            self._encode_fn = encode_fn
+
+        self._encode_pixel_values.copy_(pixel_values)
+        self._encode_image_grid_thw.copy_(image_grid_thw)
+
+        if not hasattr(self, "_compiled_encode_fn"):
+            if self._torch_compile:
+                self._encode_fn()  # Warmup
+                self._compiled_encode_fn = torch.compile(
+                    self._encode_fn, mode=self._torch_compile, fullgraph=True
+                )
+            else:
+                self._compiled_encode_fn = self._encode_fn
+
+        if self._torch_compile:
+            torch.compiler.cudagraph_mark_step_begin()
+        return self._compiled_encode_fn()
+
+    def _prefill(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_position: torch.Tensor,
+        visual_pos_masks: torch.Tensor,
+        deepstack_image_embeds: list[torch.Tensor],
+        streaming_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run prefill forward pass."""
+        if not hasattr(self, "_prefill_fn"):
+            self._prefill_inputs_embeds = torch.empty_like(inputs_embeds)
+            self._prefill_position_ids = torch.empty_like(position_ids)
+            self._prefill_cache_position = torch.empty_like(cache_position)
+            self._prefill_visual_pos_masks = torch.empty_like(visual_pos_masks)
+            self._prefill_deepstack_embeds = [torch.empty_like(e) for e in deepstack_image_embeds]
+            self._prefill_streaming_attention_mask = torch.empty_like(streaming_attention_mask)
+
+            def prefill_fn():
+                hidden = self.vlm.model.language_model(
+                    inputs_embeds=self._prefill_inputs_embeds,
+                    position_ids=self._prefill_position_ids,
+                    past_key_values=self._past_key_values,
+                    cache_position=self._prefill_cache_position,
+                    visual_pos_masks=self._prefill_visual_pos_masks,
+                    deepstack_visual_embeds=self._prefill_deepstack_embeds,
+                    streaming_attention_mask=self._prefill_streaming_attention_mask,
+                    use_cache=True,
+                ).last_hidden_state[:, -1]
+                return self.vlm.lm_head(hidden)
+
+            self._prefill_fn = prefill_fn
+
+        self._prefill_inputs_embeds.copy_(inputs_embeds)
+        self._prefill_position_ids.copy_(position_ids)
+        self._prefill_cache_position.copy_(cache_position)
+        self._prefill_visual_pos_masks.copy_(visual_pos_masks)
+        self._prefill_streaming_attention_mask.copy_(streaming_attention_mask)
+        for buf, emb in zip(self._prefill_deepstack_embeds, deepstack_image_embeds):
+            buf.copy_(emb)
+        
+        if not hasattr(self, "_compiled_prefill_fn"):
+            if self._torch_compile:
+                self._prefill_fn()
+                self._compiled_prefill_fn = torch.compile(
+                    self._prefill_fn, mode=self._torch_compile, fullgraph=True
+                )
+            else:
+                self._compiled_prefill_fn = self._prefill_fn
+
+        if self._torch_compile:
+            torch.compiler.cudagraph_mark_step_begin()
+        return self._compiled_prefill_fn()
+
+    def _decode(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_position: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run decode forward pass for a single token."""
+        if not hasattr(self, "_decode_fn"):
+            self._decode_input_ids = torch.empty_like(input_ids)
+            self._decode_position_ids = torch.empty_like(position_ids)
+            self._decode_cache_position = torch.empty_like(cache_position)
+
+            def decode_fn():
+                hidden = self.vlm.model.language_model(
+                    input_ids=self._decode_input_ids,
+                    position_ids=self._decode_position_ids,
+                    past_key_values=self._past_key_values,
+                    cache_position=self._decode_cache_position,
+                    use_cache=True,
+                ).last_hidden_state[:, -1]
+                return self.vlm.lm_head(hidden)
+
+            self._decode_fn = decode_fn
+
+        self._decode_input_ids.copy_(input_ids)
+        self._decode_position_ids.copy_(position_ids)
+        self._decode_cache_position.copy_(cache_position)
+
+        if not hasattr(self, "_compiled_decode_fn"):
+            if self._torch_compile:
+                self._decode_fn()
+                self._compiled_decode_fn = torch.compile(
+                    self._decode_fn, mode=self._torch_compile, fullgraph=True
+                )
+            else:
+                self._compiled_decode_fn = self._decode_fn
+
+        if self._torch_compile:
+            torch.compiler.cudagraph_mark_step_begin()
+        return self._compiled_decode_fn()
+
+    def _action(
+        self,
+        num_action_tokens: int,
+        total_samples: int,
+        device: torch.device,
+        attention_mask: torch.Tensor,
+        cache_position: torch.Tensor,
+        diffusion_kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
+        if not hasattr(self, "_action_fn"):
+            # Initialize static buffers
+            self._action_attention_mask = torch.empty_like(attention_mask)
+            self._action_cache_position = torch.empty_like(cache_position)
+            self._action_noise = torch.empty(
+                total_samples, *self.action_space.get_action_space_dims(), device=device, dtype=torch.bfloat16
+            )
+            expert_kwargs = {"is_causal": False} if self.config.expert_non_causal_attention else {}
+            action_dims = self.action_space.get_action_space_dims()
+
+            def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+                action_embeds = self.action_in_proj(x, t)
+                if action_embeds.dim() == 2:
+                    action_embeds = action_embeds.view(x.shape[0], num_action_tokens, -1)
+
+                hidden = self.expert(
+                    inputs_embeds=action_embeds,
+                    position_ids=self._cached_position_ids,
+                    past_key_values=self._past_key_values,
+                    attention_mask=self._action_attention_mask,
+                    cache_position=self._action_cache_position,
+                    use_cache=True,
+                    **expert_kwargs,
+                ).last_hidden_state[:, -num_action_tokens:]
+                return self.action_out_proj(hidden).view(-1, *action_dims)
+
+            def action_fn():
+                return self.diffusion.sample(
+                    noise=self._action_noise,
+                    batch_size=total_samples,
+                    step_fn=step_fn,
+                    device=device,
+                    return_all_steps=False,
+                    **(diffusion_kwargs or {}),
                 )
 
-        if not self.is_first_prefill:
-            vision_start_token_ids = self.processor.tokenizer.encode("<|vision_start|>")[0]
-            first_vision_start_token_id = torch.where(input_ids == vision_start_token_ids)[1][0].item()
-            input_ids = input_ids[:, first_vision_start_token_id:]  # slice on sequence dim, not batch dim
+            self._action_fn = action_fn
 
-        """Prefill the prefill inputs."""
-        cache_position = self.create_cache_position(
-            vision_start_end_ids_ranges=self.vision_start_end_ids_ranges,
-            traj_and_text_ids_range=self.traj_and_text_ids_range,
+        # Copy inputs to static buffers
+        # self._action_position_ids.copy_(position_ids)
+        self._action_attention_mask.copy_(attention_mask)
+        self._action_cache_position.copy_(cache_position)
+
+        # Generate noise outside compiled graph for deterministic RNG
+        self._action_noise.normal_()
+
+        # Warmup and compile on first call (if enabled)
+        if not hasattr(self, "_compiled_action_fn"):
+            if self._torch_compile:
+                self._action_fn()  # Warmup for compile
+                self._compiled_action_fn = torch.compile(
+                    self._action_fn, mode=self._torch_compile, fullgraph=True
+                )
+            else:
+                self._compiled_action_fn = self._action_fn
+
+        if self._torch_compile:
+            torch.compiler.cudagraph_mark_step_begin()
+        return self._compiled_action_fn()
+
+    # ==================== Logits Processor ====================
+
+    def _build_logits_processor(
+        self,
+        temperature: float,
+        top_k: int | None,
+        top_p: float,
+    ) -> LogitsProcessorList:
+        """Build logits processor for generation."""
+        processors = [
+            ExpertLogitsProcessor(
+                traj_token_offset=self.config.traj_token_start_idx,
+                traj_vocab_size=self.config.traj_vocab_size,
+            )
+        ]
+        if temperature > 0 and temperature != 1.0:
+            processors.append(TemperatureLogitsWarper(temperature))
+        if top_k is not None and top_k > 0:
+            processors.append(TopKLogitsWarper(top_k=top_k, min_tokens_to_keep=1))
+        if top_p < 1.0:
+            processors.append(TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=1))
+        return LogitsProcessorList(processors)
+
+    def _find_traj_start_positions(self, output_ids: torch.Tensor) -> torch.Tensor:
+        """Find <traj_future_start> token position for each sequence."""
+        traj_start_mask = output_ids == self.traj_start_token_id
+        has_traj_start = traj_start_mask.any(dim=1)
+
+        if not has_traj_start.all():
+            missing = (~has_traj_start).nonzero(as_tuple=True)[0].tolist()
+            logger.warning(f"No <traj_future_start> token found in sequences: {missing}")
+
+        return torch.where(
+            has_traj_start,
+            traj_start_mask.int().argmax(dim=1),
+            output_ids.shape[1] - 1,
         )
-        cache_position = cache_position.to(input_ids.device)
 
-        if not hasattr(self, "_cached_position_ids"):
-            position_ids, rope_deltas = self.vlm.model.get_rope_index(input_ids=input_ids, image_grid_thw=image_grid_thw)
-            padding_length = self.max_cache_len - self.prefill_seq_length
-            if padding_length > 0:
-                last_position_id = position_ids[:, :, -1:]
-                padding_position_ids = last_position_id + torch.arange(1, padding_length + 1, device=last_position_id.device)
-                position_ids = torch.cat([position_ids, padding_position_ids], dim=-1)
-        
-            self._cached_position_ids = position_ids
-            self._cached_rope_deltas = rope_deltas
-        
-        if not hasattr(self, "_cached_attention_mask"):
-            self._cached_attention_mask = attention_mask
-        
-        if not self.is_first_prefill and hasattr(self, "_cached_streaming_attention_mask"):
-            self._cached_streaming_attention_mask = self._get_streaming_attention_mask(
-                cache_position=cache_position,
-                device=device,
+    def _find_first_truncation_positions(
+        self,
+        output_ids: torch.Tensor,
+        prompt_length: int | torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Find first truncation position (sentence-ending '.' or <|im_end|>) after prompt tokens."""
+        if not hasattr(self, "_truncation_token_mask"):
+            vocab_size = len(self.tokenizer)
+            token_strings = self.tokenizer.convert_ids_to_tokens(list(range(vocab_size)))
+            im_end_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
+            self._truncation_token_mask = torch.tensor(
+                [(token is not None and token.endswith(".")) or tid == im_end_token_id
+                 for tid, token in enumerate(token_strings)],
+                dtype=torch.bool,
             )
 
-        return {
-            'input_ids': input_ids,
-            'attention_mask': self._cached_attention_mask,
-            'position_ids': self._cached_position_ids,
-            'cache_position': cache_position,
-            'streaming_attention_mask': self._cached_streaming_attention_mask,
-        }
+        period_token_mask = self._truncation_token_mask.to(output_ids.device)[output_ids]
+        if prompt_length is None:
+            prompt_length = getattr(self, "_cached_prompt_length", 0)
+
+        seq_len = output_ids.shape[1]
+        if isinstance(prompt_length, int):
+            position_indices = torch.arange(seq_len, device=output_ids.device)
+            mask_after_prompt = position_indices >= prompt_length
+        else:
+            prompt_length = torch.as_tensor(prompt_length, device=output_ids.device).long()
+            position_indices = torch.arange(seq_len, device=output_ids.device).unsqueeze(0)
+            if prompt_length.dim() == 0:
+                mask_after_prompt = position_indices >= prompt_length.item()
+            else:
+                mask_after_prompt = position_indices >= prompt_length[:, None]
+
+        period_token_mask = period_token_mask & mask_after_prompt
+        has_period = period_token_mask.any(dim=1)
+
+        period_positions = period_token_mask.int().argmax(dim=1)
+        if has_period.all():
+            return period_positions
+
+        return -1
+
+    def _find_first_period_positions(
+        self,
+        output_ids: torch.Tensor,
+        start_pos: torch.Tensor,
+        end_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        """Find first token containing '.' between start_pos and end_pos (inclusive)."""
+        output_ids_cpu = output_ids.tolist()
+        start_pos_cpu = start_pos.tolist()
+        end_pos_cpu = end_pos.tolist()
+        first_period_positions = []
+        for seq_ids, seq_start, seq_end in zip(output_ids_cpu, start_pos_cpu, end_pos_cpu):
+            if seq_end < seq_start:
+                first_period_positions.append(seq_end)
+                continue
+            tokens = self.tokenizer.convert_ids_to_tokens(seq_ids[seq_start : seq_end + 1])
+            found = None
+            for idx, token in enumerate(tokens):
+                if "." in token:
+                    found = seq_start + idx
+                    break
+            if found is None:
+                found = seq_end
+            first_period_positions.append(found)
+        return torch.tensor(first_period_positions, device=output_ids.device, dtype=end_pos.dtype)
+    
+    # ==================== Token Pruning ====================
+    
+    def _merge_colsum(self, colsums: list[torch.Tensor], deepstack_colsums: list[torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        # colsums is a list of tensors, each tensor is of shape [B, H, L].
+        merged_colsums = None
+        colsums = colsums[0]
+        colsums = colsums.mean(dim=1)  # [B, L]
+
+        ratio = self.vlm.config.vision_config.spatial_merge_size
+        # PatchMerger groups every consecutive m² tokens via x.view(-1, hidden_size * m²),
+        # so we must sum every consecutive m² colsums to match.
+        colsums = colsums.view(colsums.shape[0], -1, ratio * ratio)
+        colsums = colsums.sum(dim=2)
+        merged_colsums = colsums
         
+        merged_deepstack_colsums = []
+        for i in range(len(deepstack_colsums)):
+            deepstack_colsum = deepstack_colsums[i]  # [B, H, L]
+            deepstack_colsum = deepstack_colsum.mean(dim=1)  # [B, L]
+
+            ratio = self.vlm.config.vision_config.spatial_merge_size
+            deepstack_colsum = deepstack_colsum.view(deepstack_colsum.shape[0], -1, ratio * ratio)
+            deepstack_colsum = deepstack_colsum.sum(dim=2)
+            merged_deepstack_colsums.append(deepstack_colsum)
+
+        return merged_colsums, merged_deepstack_colsums
+    
+    def _prune_tokens(self, colsums: torch.Tensor, sparsity_ratio: float) -> torch.Tensor:
+        """Select top-k tokens per image based on colsum importance scores.
+
+        Args:
+            colsums: [num_images, tokens_per_image] importance scores.
+            sparsity_ratio: Fraction of tokens to remove (0.5 = keep 50%).
+
+        Returns:
+            Sorted indices of kept tokens, shape [num_images, K].
+        """
+        num_tokens = colsums.shape[-1]
+        num_keep = int(num_tokens * (1 - sparsity_ratio))
+        _, indices = torch.topk(colsums, num_keep, dim=-1)
+        return indices.sort(dim=-1).values
+
+    @staticmethod
+    def _compute_reshape_dims(K: int, orig_h: int, orig_w: int) -> tuple[int, int]:
+        """Find new_h, new_w such that new_h * new_w == K with aspect ratio closest to orig_h:orig_w."""
+        ratio = orig_h / orig_w
+        best_h, best_w, best_diff = 1, K, float('inf')
+        for h in range(1, int(K**0.5) + 1):
+            if K % h == 0:
+                w = K // h
+                diff = abs(h / w - ratio)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_h, best_w = h, w
+        return best_h, best_w
+
+    def _get_pruned_rope_index(
+        self,
+        input_ids: torch.LongTensor,
+        image_grid_thw: torch.LongTensor,
+        token_indices: torch.LongTensor,
+        rope_mode: str = "contiguous",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reconstruct mRoPE position_ids after token pruning.
+
+        Mirrors Qwen3VLModel.get_rope_index but replaces the full T×H×W grid
+        with only the kept tokens.
+
+        Args:
+            input_ids: [B, seq_len] original (unpruned) input IDs.
+            image_grid_thw: [num_images, 3] with (T, H, W) per image.
+            token_indices: [num_images, K] sorted kept token indices per image.
+            rope_mode: "contiguous" (remap h/w to 0..N-1),
+                       "direct" (keep original h/w, gaps allowed),
+                       "reshape" (assign new h/w grid matching aspect ratio).
+
+        Returns:
+            position_ids: [3, B, new_seq_len] with remapped mRoPE positions.
+            rope_deltas: [B, 1] position delta for decode phase.
+            keep_mask: [B, seq_len] bool mask (True = keep this position).
+        """
+        spatial_merge_size = self.vlm.config.vision_config.spatial_merge_size
+        image_token_id = self.vlm.config.image_token_id
+        vision_start_token_id = self.vlm.config.vision_start_token_id
+
+        batch_size, seq_len = input_ids.shape
+        K = token_indices.shape[1]
+
+        keep_mask = self._get_keep_mask(input_ids, image_grid_thw, token_indices)
+
+        # --- Direct mode: use original positions, recompute rope_deltas ---
+        if rope_mode == "direct":
+            orig_position_ids, _ = self.vlm.model.get_rope_index(
+                input_ids, image_grid_thw, None, None,
+            )
+            # Filter position_ids by keep_mask: [3, B, seq_len] -> [3, B, new_seq_len]
+            position_ids = torch.stack([
+                orig_position_ids[:, i, keep_mask[i]] for i in range(batch_size)
+            ], dim=1)
+            # Recompute rope_deltas for the pruned sequence length.
+            # decode loop uses: position = new_seq_len + rope_delta
+            # which must equal max_pos + 1 to continue from where prefill left off.
+            new_seq_lens = keep_mask.sum(dim=1)  # [B]
+            max_pos = position_ids.amax(dim=(0, 2))  # [B]
+            rope_deltas = (max_pos + 1 - new_seq_lens).unsqueeze(1)  # [B, 1]
+            return position_ids, rope_deltas, keep_mask
+
+        # --- Contiguous / Reshape mode: reconstruct position_ids ---
+        mrope_position_deltas = []
+        all_new_position_ids = []
+        image_index = 0
+
+        for i in range(batch_size):
+            ids = input_ids[i]
+            input_tokens = ids.tolist()
+
+            vision_start_indices = torch.argwhere(ids == vision_start_token_id).squeeze(1)
+            vision_tokens = ids[vision_start_indices + 1]
+            image_nums = (vision_tokens == image_token_id).sum().item()
+
+            llm_pos_ids_list: list = []
+            st = 0
+
+            for _ in range(image_nums):
+                ed = input_tokens.index(image_token_id, st)
+
+                t, h, w = image_grid_thw[image_index]
+                llm_grid_h = h.item() // spatial_merge_size
+                llm_grid_w = w.item() // spatial_merge_size
+                original_num_tokens = t.item() * llm_grid_h * llm_grid_w
+
+                # --- Text segment before this image ---
+                text_len = ed - st
+                if text_len > 0:
+                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                    llm_pos_ids_list.append(
+                        torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx
+                    )
+
+                # --- Pruned image tokens ---
+                kept = token_indices[image_index]
+
+                if rope_mode == "reshape":
+                    new_h, new_w = self._compute_reshape_dims(K, llm_grid_h, llm_grid_w)
+                    t_new = torch.zeros(K, device=kept.device, dtype=kept.dtype)
+                    h_new = torch.arange(K, device=kept.device) // new_w
+                    w_new = torch.arange(K, device=kept.device) % new_w
+                else:  # "contiguous"
+                    h_orig = kept // llm_grid_w
+                    _, h_inv = torch.unique(h_orig, sorted=True, return_inverse=True)
+                    h_new = h_inv  # 0..new_h-1
+                    # Per-row contiguous w: rank 0,1,...,count-1 within each row.
+                    # kept is sorted so all tokens of each row appear consecutively.
+                    w_new = torch.empty(K, dtype=torch.long, device=kept.device)
+                    ptr = 0
+                    for hi in range(int(h_inv.max().item()) + 1):
+                        count = int((h_inv == hi).sum().item())
+                        w_new[ptr : ptr + count] = torch.arange(count, device=kept.device)
+                        ptr += count
+                    t_new = torch.zeros(K, dtype=torch.long, device=kept.device)
+
+                st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                llm_pos_ids_list.append(
+                    torch.stack([t_new, h_new, w_new]) + st_idx
+                )
+
+                st = ed + original_num_tokens
+                image_index += 1
+
+            # --- Trailing text segment ---
+            if st < len(input_tokens):
+                st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(
+                    torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx
+                )
+
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            all_new_position_ids.append(llm_positions)
+
+            new_seq_len = keep_mask[i].sum().item()
+            mrope_position_deltas.append(llm_positions.max() + 1 - new_seq_len)
+
+        position_ids = torch.stack(all_new_position_ids, dim=1).to(input_ids.device)
+        rope_deltas = torch.tensor(
+            mrope_position_deltas, device=input_ids.device
+        ).unsqueeze(1)
+
+        return position_ids, rope_deltas, keep_mask
+
+    def _prune_embeddings(
+        self,
+        image_embeds: torch.Tensor,
+        deepstack_image_embeds: list[torch.Tensor],
+        image_grid_thw: torch.LongTensor,
+        vision_token_indices: torch.LongTensor,
+        deepstack_token_indices: list[torch.LongTensor],
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Prune image embeddings to keep only selected tokens per image.
+
+        Args:
+            image_embeds: [total_img_tokens, hidden_dim] all images concatenated.
+            deepstack_image_embeds: list of [total_img_tokens, hidden_dim] tensors.
+            image_grid_thw: [num_images, 3] with (T, H, W) per image.
+            vision_token_indices: [num_images, K] sorted kept indices per image.
+            deepstack_token_indices: [num_images, K] sorted kept indices per image.
+
+        Returns:
+            Pruned image_embeds and deepstack_image_embeds with same structure.
+        """
+        # ===== Prune vision embeddings =====
+        spatial_merge_size = self.vlm.config.vision_config.spatial_merge_size
+        tokens_per_image = (
+            image_grid_thw[:, 0]
+            * (image_grid_thw[:, 1] // spatial_merge_size)
+            * (image_grid_thw[:, 2] // spatial_merge_size)
+        )  # [num_images]
+
+        # Split by image, select kept tokens, concatenate back
+        per_image = image_embeds.split(tokens_per_image.tolist(), dim=0)
+        pruned_image_embeds = torch.cat([emb[idx] for emb, idx in zip(per_image, vision_token_indices)], dim=0)
+
+        # ===== Prune deepstack embeddings =====
+        pruned_deepstack_embeds = []
+        for i, ds_embeds in enumerate(deepstack_image_embeds):
+            per_image_ds = ds_embeds.split(tokens_per_image.tolist(), dim=0)
+            pruned_deepstack_embeds.append(
+                torch.cat([emb[idx] for emb, idx in zip(per_image_ds, deepstack_token_indices[i])], dim=0)
+            )
+
+        return pruned_image_embeds, pruned_deepstack_embeds
+    
+    def _get_keep_mask(
+        self,
+        input_ids: torch.LongTensor,
+        image_grid_thw: torch.LongTensor,
+        token_indices: torch.LongTensor,
+    ) -> torch.Tensor:
+        """Build a boolean mask indicating which positions to keep after pruning.
+
+        Args:
+            input_ids: [B, seq_len] original (unpruned) input IDs.
+            image_grid_thw: [num_images, 3] with (T, H, W) per image.
+            token_indices: [num_images, K] sorted kept token indices per image.
+
+        Returns:
+            keep_mask: [B, seq_len] bool mask (True = keep this position).
+        """
+        spatial_merge_size = self.vlm.config.vision_config.spatial_merge_size
+        image_token_id = self.vlm.config.image_token_id
+        vision_start_token_id = self.vlm.config.vision_start_token_id
+
+        batch_size, seq_len = input_ids.shape
+        K = token_indices.shape[1]
+        keep_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=input_ids.device)
+        image_index = 0
+
+        for i in range(batch_size):
+            ids = input_ids[i]
+            input_tokens = ids.tolist()
+            vision_start_indices = torch.argwhere(ids == vision_start_token_id).squeeze(1)
+            vision_tokens = ids[vision_start_indices + 1]
+            image_nums = (vision_tokens == image_token_id).sum().item()
+            st = 0
+            for _ in range(image_nums):
+                ed = input_tokens.index(image_token_id, st)
+                t, h, w = image_grid_thw[image_index]
+                original_num_tokens = t.item() * (h.item() // spatial_merge_size) * (w.item() // spatial_merge_size)
+                keep_mask[i, ed + K : ed + original_num_tokens] = False
+                st = ed + original_num_tokens
+                image_index += 1
+
+        return keep_mask
+
+    # ==================== Main Inference ====================
+
+    # We don't need any output from the first prefill. Only need to cache key/values, position_ids, and attention_mask.
+    def _first_prefill(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        batch_size: int,
+        sparsity_ratio: float,
+        rope_mode: str,
+        device: torch.device,
+    ):
+
+        # Launch the first non-streaming prefill
+        # inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
+        image_embeds, deepstack_image_embeds, colsums, deepstack_colsums = self.vlm.model.visual(pixel_values, grid_thw=image_grid_thw)
+        
+        if sparsity_ratio > 0:
+            vision_colsums, deepstack_colsums = self._merge_colsum(colsums, deepstack_colsums)
+            vision_token_indices = self._prune_tokens(vision_colsums, sparsity_ratio=sparsity_ratio)
+            deepstack_token_indices = []
+            for i in range(len(deepstack_colsums)):
+                deepstack_token_indices.append(self._prune_tokens(deepstack_colsums[i], sparsity_ratio=sparsity_ratio))
+
+            # Prune image embeddings
+            image_embeds, deepstack_image_embeds = self._prune_embeddings(
+                image_embeds, deepstack_image_embeds, image_grid_thw, vision_token_indices, deepstack_token_indices
+            )
+            # Reconstruct position IDs for pruned image tokens
+            position_ids, rope_deltas, keep_mask = self._get_pruned_rope_index(
+                input_ids, image_grid_thw, vision_token_indices, rope_mode=rope_mode
+            )
+            input_ids = input_ids[keep_mask].view(batch_size, -1)
+        else:
+            position_ids, rope_deltas = self.vlm.model.get_rope_index(
+                input_ids, image_grid_thw, None, None
+            )
+
+        inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
+        image_mask = (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        padding_length = self.max_cache_len - input_ids.shape[1]
+        if padding_length > 0:
+            last_pos = position_ids[:, :, -1:]
+            padding_pos = last_pos + torch.arange(1, padding_length + 1, device=device)
+            position_ids = torch.cat([position_ids, padding_pos], dim=-1)
+        
+        # Cache all streaming related inputs
+        (
+            vision_start_end_ids_ranges, 
+            image_token_ids_ranges, 
+            traj_and_text_ids_range
+        ) = self._retrieve_streaming_related_inputs(input_ids[:1])
+        cache_position = self._create_cache_position().to(device)
+
+        self._cached_position_ids = position_ids
+        self._cached_rope_deltas = rope_deltas
+        self._cached_attention_mask = attention_mask
+        self.vision_start_end_ids_ranges = vision_start_end_ids_ranges
+        self.image_token_ids_ranges = image_token_ids_ranges
+        self.traj_and_text_ids_range = traj_and_text_ids_range
+
+        _ = self.vlm.model.language_model(
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=self._past_key_values,
+            cache_position=cache_position,
+            visual_pos_masks=image_mask[..., 0],
+            deepstack_visual_embeds=deepstack_image_embeds,
+            streaming_attention_mask=None,
+            use_cache=True,
+        ).last_hidden_state[:, -1]
+
+        # Delete the cached_pos_embeds in QwenVLVisionModel
+        if hasattr(self.vlm.model.visual, "_cached_pos_embeds"):
+            delattr(self.vlm.model.visual, "_cached_pos_embeds")
+        logger.info("Deleted _cached_pos_embeds in Qwen3VLVisionModel")
+        
+        for block in self.vlm.model.visual.blocks:
+            if hasattr(block.attn, "_num_chunks"):
+                delattr(block.attn, "_num_chunks")
+        logger.info("Deleted _num_chunks in Qwen3VLVisionModel")
+        
+        if hasattr(self.vlm.model.language_model, "_cached_deepstack_indices"):
+            delattr(self.vlm.model.language_model, "_cached_deepstack_indices")
+        logger.info("Deleted _cached_deepstack_indices in Qwen3VLTextModel")
+
     @torch.inference_mode()
     def sample_trajectories_from_data_with_streaming_vlm_rollout(
         self,
@@ -347,214 +923,219 @@ class StreamingAlpamayoR1(ReasoningVLA):
         num_traj_samples: int = 6,
         num_traj_sets: int = 1,
         diffusion_kwargs: dict[str, Any] | None = None,
+        torch_compile: str = "max-autotune",
+        fuse_qkv: bool = False,
+        fuse_gate_up: bool = False,
+        sparsity_ratio: float = 0.5,
+        rope_mode: str = "contiguous",
         *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample trajectories from the data with streaming VLM rollout.
+        """Sample trajectories with streaming VLM rollout.
 
         Args:
-            data: The input data.
-            top_p: The top-p value for sampling.
-            top_k: The top-k value for sampling.
-            temperature: The temperature for sampling.
-            num_traj_samples: The number of trajectory samples.
-            num_traj_sets: The number of trajectory sets.
-            *args: Variable length argument list.
-            **kwargs: Arbitrary keyword arguments.
-
+            data: Input data containing tokenized_data, ego_history_xyz, ego_history_rot.
+            top_p: Top-p sampling parameter.
+            top_k: Top-k sampling parameter.
+            temperature: Sampling temperature.
+            num_traj_samples: Number of trajectory samples.
+            num_traj_sets: Number of trajectory sets.
+            diffusion_kwargs: Additional kwargs for diffusion sampling.
+            use_compile: Whether to use torch.compile for optimization.
+            fuse_qkv: Whether to fuse q/k/v projections into a single QKVLinear.
+            fuse_gate_up: Whether to fuse gate/up projections into a single MergedColumnLinear.
+            rope_mode: mRoPE mode for pruned tokens ("contiguous", "direct", "reshape").
         Returns:
-            pred_xyz: The predicted xyz.
-            pred_rot: The predicted rotation.
-            logprob: The log probability.
+            pred_xyz: Predicted xyz trajectories.
+            pred_rot: Predicted rotation trajectories.
+            extra: (optional) Extra information including CoC text.
         """
-        n_samples_total = num_traj_samples * num_traj_sets
+        self._torch_compile = torch_compile
+        if self._torch_compile and not hasattr(self, "_patched_for_compile"):
+            patch_for_torch_compile(self, mode="streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+            self._patched_for_compile = True
+
+        # Extract inputs
+        tokenized = data["tokenized_data"]
+        input_ids = tokenized["input_ids"]
+        attention_mask = tokenized["attention_mask"]
+        pixel_values = tokenized["pixel_values"]
+        image_grid_thw = tokenized["image_grid_thw"]
         ego_history_xyz = data["ego_history_xyz"]
         ego_history_rot = data["ego_history_rot"]
-        B, n_traj_group, _, _ = ego_history_xyz.shape
-        assert n_traj_group == 1, "Only one trajectory group is supported for inference."
-        tokenized_data = data["tokenized_data"]
-        input_ids = tokenized_data.pop("input_ids")
-        attention_mask = tokenized_data.pop("attention_mask")
-        image_grid_thw = tokenized_data.pop("image_grid_thw")
-        pixel_values = tokenized_data.pop("pixel_values")
-        traj_data_vlm = {
-            "ego_history_xyz": ego_history_xyz,
-            "ego_history_rot": ego_history_rot,
-        }
-        input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
+
+        batch_size, num_traj_groups, _, _ = ego_history_xyz.shape
+        num_samples = num_traj_samples * num_traj_sets
+        assert num_traj_groups == 1, "Only one trajectory group is supported."
         device = input_ids.device
 
-        # 1) run autoregressive generation for the VLM
-        max_generation_length = kwargs.get(
-            "max_generation_length", self.config.tokens_per_future_traj
-        )
-        generation_config = self.vlm.generation_config
-        generation_config.top_p = top_p
-        generation_config.temperature = temperature
-        generation_config.do_sample = True
-        generation_config.num_return_sequences = num_traj_samples
-        generation_config.max_new_tokens = max_generation_length
-        generation_config.output_logits = True
-        generation_config.return_dict_in_generate = True
-        generation_config.top_k = top_k
-        generation_config.pad_token_id = self.tokenizer.pad_token_id
-
-        # use custom stopping criteria to stop after EOS token + one more token,
-        # because the KV cache is updated after the next token is generated
-        eos_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
-        stopping_criteria = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_token_id)])
-        logits_processor = LogitsProcessorList(
-            [
-                ExpertLogitsProcessor(
-                    traj_token_offset=self.config.traj_token_start_idx,
-                    traj_vocab_size=self.config.traj_vocab_size,
-                )
-            ]
+        # Fuse trajectory tokens
+        input_ids = self.fuse_traj_tokens(
+            input_ids, {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot}
         )
 
-        prefill_inputs = self._prepare_inputs_for_prefill(input_ids, attention_mask, image_grid_thw, device)
+        # Setup generation
+        max_new_tokens = kwargs.get("max_generation_length", self.config.tokens_per_future_traj)
+        logits_processor = self._build_logits_processor(temperature, top_k, top_p)
 
-        vlm_outputs = self.vlm.generate(
-            input_ids=prefill_inputs['input_ids'],
-            generation_config=generation_config,
-            stopping_criteria=stopping_criteria,
-            logits_processor=logits_processor,
-            past_key_values=self.past_key_values,
-            position_ids=prefill_inputs['position_ids'],
-            cache_position=prefill_inputs['cache_position'],
-            streaming_attention_mask=prefill_inputs['streaming_attention_mask'],
-            attention_mask=prefill_inputs['attention_mask'],
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw
+        if self.is_first_prefill:
+            num_image_tokens = (input_ids == self.vlm.config.image_token_id).sum().item()
+            pruned_image_tokens = int(num_image_tokens * sparsity_ratio)
+            original_seq_len = input_ids.shape[1]
+            new_seq_len = original_seq_len - pruned_image_tokens
+            self.prefill_seq_length = new_seq_len
+            self.max_cache_len = new_seq_len + max_new_tokens + self.num_action_tokens
+
+        # Initialize KV cache on first call
+        if self._past_key_values is None:
+            self._past_key_values = StaticCache(
+                config=self.vlm.config,
+                max_cache_len=self.max_cache_len,
+                max_batch_size=num_samples * batch_size,
+                offloading=False,
+            )
+        
+        if self.is_first_prefill:
+            logger.info("First prefill: caching KV and returning (no streaming logs yet).")
+            self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, batch_size, sparsity_ratio, rope_mode, device)
+            self._update_past_key_values()
+            self.is_first_prefill = False
+            return None, None, None
+
+        # Prepare input_ids for streaming (slice off system prompt for non-first prefill)
+        vision_start_token_id = self.tokenizer.encode("<|vision_start|>")[0]
+        first_vision_start = torch.where(input_ids == vision_start_token_id)[1][0].item()
+        input_ids = input_ids[:, first_vision_start:]
+
+        # ===== Encode =====
+        image_embeds, deepstack_image_embeds, colsums, deepstack_colsums = self._encode(pixel_values, image_grid_thw)
+
+        if sparsity_ratio > 0:
+            colsums = self._merge_colsum(colsums, deepstack_colsums)
+            vision_token_indices = self._prune_tokens(colsums, sparsity_ratio=sparsity_ratio)
+            deepstack_token_indices = []
+            for i in range(len(deepstack_colsums)):
+                deepstack_token_indices.append(self._prune_tokens(deepstack_colsums[i], sparsity_ratio=sparsity_ratio))
+            
+            # Prune image embeddings
+            image_embeds, deepstack_image_embeds = self._prune_embeddings(
+                image_embeds, deepstack_image_embeds, image_grid_thw, vision_token_indices, deepstack_token_indices
+            )
+            if self._cached_keep_mask is None:
+                self._cached_keep_mask = self._get_keep_mask(input_ids, image_grid_thw, vision_token_indices)
+
+            input_ids = input_ids[self._cached_keep_mask].view(batch_size, -1)
+        
+        inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
+
+        # Create cache position and position IDs
+        cache_position = self._create_cache_position().to(device)
+        seq_len = input_ids.shape[1]
+        self._cached_prompt_length = seq_len
+
+        # Get embeddings
+        # inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
+        image_mask = (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        # Create streaming attention mask for non-first prefill
+        if self._cached_streaming_attention_mask is None:
+            streaming_attention_mask = self._get_streaming_attention_mask(
+                cache_position=cache_position,
+                device=device,
+            )
+            self._cached_streaming_attention_mask = streaming_attention_mask
+
+        # ===== Prefill =====
+        logits = self._prefill(
+            inputs_embeds=inputs_embeds,
+            position_ids=self._cached_position_ids,
+            cache_position=cache_position,
+            visual_pos_masks=image_mask[..., 0],
+            deepstack_image_embeds=deepstack_image_embeds,
+            streaming_attention_mask=self._cached_streaming_attention_mask,
         )
-        # vlm_outputs.rope_deltas = self.vlm.model.rope_deltas
 
-        # manually replace padding after EOS token
-        vlm_outputs.sequences = replace_padding_after_eos(
-            token_ids=vlm_outputs.sequences,
-            eos_token_id=eos_token_id,
+        # ===== Decode =====
+        output_ids = input_ids.clone()
+        if num_samples > 1:
+            self._past_key_values.expand_batch()
+            logits = logits.expand(num_samples, -1).contiguous()
+            output_ids = output_ids.expand(num_samples, -1).contiguous()
+        unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
+        cur_pos = cache_position[-1].item() + 1
+
+        for _ in range(max_new_tokens):
+            logits = logits_processor(output_ids, logits)
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+            next_token = torch.where(unfinished, next_token, self.tokenizer.pad_token_id)
+            output_ids = torch.cat([output_ids, next_token.unsqueeze(-1)], dim=-1)
+
+            unfinished = unfinished & (next_token != self.traj_start_token_id)
+            if not unfinished.any():
+                break
+
+            logits = self._decode(
+                input_ids=next_token.unsqueeze(-1),
+                position_ids=self._cached_position_ids,
+                cache_position=torch.tensor([cur_pos], device=device),
+            )
+            cur_pos += 1
+
+        output_ids = replace_padding_after_eos(
+            token_ids=output_ids,
+            eos_token_id=self.traj_start_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
         )
 
-        prefill_output_len = self.past_key_values.get_seq_length()  # past_key_values: [1, 8, seq_len, 128]
+        # Find <traj_future_start> position
+        traj_start_pos = self._find_traj_start_positions(output_ids)
+        streaming_input_len = seq_len
 
-        # find <traj_future_start> token position for each sequence, use last token if not found
-        b_star = vlm_outputs.sequences.shape[0]
-        traj_future_start_mask = vlm_outputs.sequences == eos_token_id
-        # [b_star], True if sequence has <traj_future_start>
-        has_traj_future_start = traj_future_start_mask.any(dim=1)
-        for i in range(b_star):
-            if not has_traj_future_start[i]:
-                logger.warning(
-                    f"No <traj_future_start> token found in the generated sequences for sequence {i}"
-                )
-        # [b_star], first occurrence position
-        traj_future_start_positions = traj_future_start_mask.int().argmax(dim=1)
-        last_token_positions = torch.full(
-            (b_star,), vlm_outputs.sequences.shape[1] - 1, device=device
-        )
-        valid_token_pos_id = torch.where(
-            has_traj_future_start, traj_future_start_positions, last_token_positions
-        )
-        # Calculate offset: the position after <traj_future_start> in KV cache
+        # ===== Action (Diffusion) =====
+        # Note: Action only attends to prompt tokens, NOT reasoning tokens (they are masked out).
+        # This is by design - the expert model conditions only on the original prompt.
+
+        # MODIFIED: Calculate offset for action tokens. In streaming setting, the offset is wrong without the modification due to truncated input length.
+        # But the length of kv cache is always the same.
         if not self.is_first_prefill:
-            # Streaming step: vlm_outputs.sequences only contains streaming input_ids + generated
-            # Need to map position in sequences to actual KV cache position
-            streaming_input_len = prefill_inputs['input_ids'].shape[1]
-            offset = self.prefill_seq_length + (valid_token_pos_id - streaming_input_len) + 1
+            action_start_pos = self.prefill_seq_length + (traj_start_pos - streaming_input_len) + 1
         else:
-            # First prefill: vlm_outputs.sequences contains full input_ids
-            offset = valid_token_pos_id + 1
-
-        # modify the position ids to remove padding tokens
-        n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
-        position_ids = torch.arange(n_diffusion_tokens, device=device)
-        position_ids = einops.repeat(position_ids, "l -> 3 b l", b=b_star).clone()
-        delta = self._cached_rope_deltas + offset[:, None]
-        position_ids += delta.to(position_ids.device)
-
-        # modify the attention_masks to remove padding tokens
-        # Preallocate with max_cache_len (already includes space for diffusion tokens)
-        attention_mask = torch.zeros(
-            (b_star, 1, n_diffusion_tokens, self.max_cache_len),
-            dtype=torch.float32,
-            device=device,
-        )
-        min_val = torch.finfo(attention_mask.dtype).min
-        # Action tokens can see [0, offset[i]) and themselves [prefill_seq_len, prefill_seq_len + n_diffusion_tokens)
-        # Mask [offset[i], prefill_seq_len) - padding after valid content
-        # Mask [prefill_seq_len + n_diffusion_tokens, max_cache_len) - remaining padding
-        for i in range(b_star):
-            attention_mask[i, :, :, offset[i] : prefill_output_len] = min_val
-            attention_mask[i, :, :, prefill_output_len + n_diffusion_tokens :] = min_val
-
-        forward_kwargs = {}
-        if self.config.expert_non_causal_attention:
-            forward_kwargs["is_causal"] = False
-
-        # 2) Define denoising step that consumes noisy action and timestep
-        def step_fn(
-            x: torch.Tensor,
-            t: torch.Tensor,
-        ) -> torch.Tensor:
-            # x: (B*, *action_dim)
-            # t: broadcastable to x leading dims
-            b_star = x.shape[0]
-            # Project noisy action to expert token embeddings for the n future tokens
-            # Expect shape (b*, n_token_per_traj, hidden_size)
-            future_token_embeds = self.action_in_proj(x, t)
-            if future_token_embeds.dim() == 2:
-                future_token_embeds = future_token_embeds.view(b_star, n_diffusion_tokens, -1)
-            future_token_embeds = future_token_embeds.to(torch.bfloat16)
-
-            # Run expert with cached prefill, only on the future tokens
-            expert_out_base = self.expert(
-                inputs_embeds=future_token_embeds,
-                position_ids=position_ids,
-                past_key_values=self.past_key_values,
-                attention_mask=attention_mask,
-                use_cache=True,
-                **forward_kwargs,
-            )
-            # crop the prompt cache to remove the newly added tokens
-            self.crop_static_cache(prefill_output_len)
-            last_hidden = expert_out_base.last_hidden_state  # (b*, Tf, hidden_size)
-            last_hidden = last_hidden[:, -n_diffusion_tokens:]
-            pred = self.action_out_proj(last_hidden).view(
-                -1, *self.action_space.get_action_space_dims()
-            )  # (b*, Tf, C_action) -> noise/vector field
-            return pred
-
-        # 3) Diffusion sampling in action space with multiple samples per input
-        total_batch = B * n_samples_total
-        if diffusion_kwargs is None:
-            diffusion_kwargs = {}
+            action_start_pos = traj_start_pos + 1
         
-        noise = torch.randn(
-            total_batch, *self.action_space.get_action_space_dims(), device=device, dtype=torch.bfloat16
+        # Build position_ids for action tokens
+        # position_ids = torch.arange(self.num_action_tokens, device=device)
+        # position_ids = einops.repeat(position_ids, "t -> 3 b t", b=batch_size).clone()
+        # position_ids += (self._cached_rope_deltas + action_start_pos[:, None]).to(device)
+
+        # Build attention mask: attend to prompt only, mask out reasoning tokens
+        indices = torch.arange(self._past_key_values.max_cache_len, device=device).expand(num_samples, -1)
+        is_prompt = indices < action_start_pos[:, None]
+        is_action = (indices >= cur_pos) & (indices < cur_pos + self.num_action_tokens)
+        attention_mask = torch.where(
+            (is_prompt | is_action)[:, None, None, :], 0.0, torch.finfo(torch.float32).min
         )
-        sampled_action = self.diffusion.sample(
-            noise=noise,
-            batch_size=total_batch,
-            step_fn=step_fn,
+
+        # Cache positions for action tokens
+        cache_position = torch.arange(
+            cur_pos, cur_pos + self.num_action_tokens, device=device
+        )
+
+        sampled_action = self._action(
+            num_action_tokens=self.num_action_tokens,
+            total_samples=batch_size * num_samples,
             device=device,
-            return_all_steps=False,
-            **diffusion_kwargs,
+            cache_position=cache_position,
+            attention_mask=attention_mask,
+            diffusion_kwargs=diffusion_kwargs,
         )
 
-        # Repeat history to align with num_traj_samples
-        hist_xyz_rep = einops.repeat(
-            ego_history_xyz[:, -1], "b ... -> (b n) ...", n=n_samples_total
-        )
-        hist_rot_rep = einops.repeat(
-            ego_history_rot[:, -1], "b ... -> (b n) ...", n=n_samples_total
-        )
-
-        pred_xyz, pred_rot = self.action_space.action_to_traj(
-            sampled_action, hist_xyz_rep, hist_rot_rep
-        )
-
-        # 4) Reshape to (B, num_traj_samples, n_traj, ...)
+        # Convert actions to trajectories
+        hist_xyz = einops.repeat(ego_history_xyz[:, -1], "b ... -> (b n) ...", n=num_samples)
+        hist_rot = einops.repeat(ego_history_rot[:, -1], "b ... -> (b n) ...", n=num_samples)
+        pred_xyz, pred_rot = self.action_space.action_to_traj(sampled_action, hist_xyz, hist_rot)
         pred_xyz = einops.rearrange(
             pred_xyz, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
         )
@@ -562,34 +1143,19 @@ class StreamingAlpamayoR1(ReasoningVLA):
             pred_rot, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
         )
 
-        self.crop_static_cache(self.prefill_seq_length)
+        # Update streaming state
+        # self._crop_static_cache(self.prefill_seq_length)
+        self._update_past_key_values()
 
-        # update the past key values
-        vision_start_end_ids_ranges, image_token_ids_ranges, traj_and_text_ids_range = self._retrieve_streaming_related_inputs(input_ids)
-        if self.vision_start_end_ids_ranges is None:
-            self.vision_start_end_ids_ranges = vision_start_end_ids_ranges
-            self.image_token_ids_ranges = image_token_ids_ranges
-            self.traj_and_text_ids_range = traj_and_text_ids_range
-        
-        self._update_past_key_values(
-            vision_start_end_ids_ranges=self.vision_start_end_ids_ranges,
-            image_token_ids_ranges=self.image_token_ids_ranges,
-            traj_and_text_ids_range=self.traj_and_text_ids_range,
-        )
-
-        self.is_first_prefill = False
-
-        # return the text tokens generated by the VLM
         if kwargs.get("return_extra", False):
-            extra = extract_text_tokens(self.tokenizer, vlm_outputs.sequences)
-            # rearrange text tokens to shape [B, ns, nj] to match trajectory shape
-            for text_tokens in extra.keys():
-                extra[text_tokens] = np.array(extra[text_tokens]).reshape(
-                    [input_ids.shape[0], num_traj_sets, num_traj_samples]
+            extra = extract_text_tokens(self.tokenizer, output_ids)
+            for key in extra:
+                extra[key] = np.array(extra[key]).reshape(
+                    [batch_size, num_traj_sets, num_traj_samples]
                 )
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
-        
-        
+
+
 AutoConfig.register("alpamayo_r1", AlpamayoR1Config)
 AutoModel.register(AlpamayoR1Config, StreamingAlpamayoR1)

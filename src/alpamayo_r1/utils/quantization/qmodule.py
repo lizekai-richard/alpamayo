@@ -11,8 +11,7 @@ _awq_ops_loaded = False
 def _ensure_awq_ops():
     global _awq_ops_loaded
     if not _awq_ops_loaded:
-        import inference_engine.model_executor.modules.gemv_op  # noqa: F401
-        import inference_engine.model_executor.modules.gemm_op  # noqa: F401
+        import paroquant_kernels  # noqa: F401 — registers gemm/gemv ops
         _awq_ops_loaded = True
 
 
