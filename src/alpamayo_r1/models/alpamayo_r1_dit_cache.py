@@ -22,7 +22,7 @@ import hydra.utils as hyu
 import numpy as np
 import torch
 from transformers import AutoConfig, AutoModel
-from alpamayo_r1.models.patches import StaticCache
+from alpamayo_r1.utils.system.patches import StaticCache
 from transformers.generation.logits_process import (
     LogitsProcessor,
     LogitsProcessorList,
@@ -35,7 +35,7 @@ from alpamayo_r1.action_space import ActionSpace
 from alpamayo_r1.models.base_model import ReasoningVLA
 from alpamayo_r1.config import AlpamayoR1Config
 from alpamayo_r1.diffusion.base import BaseDiffusion
-from alpamayo_r1.models.patches import patch_for_torch_compile
+from alpamayo_r1.utils.system.patches import patch_for_torch_compile
 from alpamayo_r1.models.token_utils import (
     extract_text_tokens,
     replace_padding_after_eos,

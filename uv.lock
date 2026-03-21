@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = "==3.12.*"
 
 [[package]]
@@ -56,7 +56,7 @@ requires-dist = [
     { name = "hydra-colorlog", specifier = ">=1.2.0" },
     { name = "hydra-core", specifier = ">=1.3.2" },
     { name = "pandas", specifier = ">=2.3.3" },
-    { name = "physical-ai-av", specifier = ">=0.1.0" },
+    { name = "physical-ai-av", specifier = "==0.2.0" },
     { name = "pillow", specifier = ">=12.0.0" },
     { name = "torch", specifier = "==2.8.0" },
     { name = "torchvision", specifier = ">=0.23.0" },
@@ -849,7 +849,7 @@ wheels = [
 
 [[package]]
 name = "physical-ai-av"
-version = "0.1.0"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "av" },
@@ -860,9 +860,9 @@ dependencies = [
     { name = "scipy" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/25/20/730fab2dc243e720fa107520c187c7a3a928f471c40d367d55980032daac/physical_ai_av-0.1.0.tar.gz", hash = "sha256:4f3ded723c4f5f8243d039c64fce5e60f165a70dc1abaf673baa9cac562a2d6b", size = 13734, upload-time = "2025-11-29T15:53:59.003Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8d/d6/1d413f9a3822c3b8f882d350eee7a1c76d7a0c512a076a7d354c3b5655cc/physical_ai_av-0.2.0.tar.gz", hash = "sha256:cb0b42ef6070f5de36961136ac72f59ca6f1e27a2df9f2ea6d1179abaf2d0619", size = 15800, upload-time = "2026-03-14T02:04:06.179Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bf/3d/02eab50dee2cffb983deb3a72a141da4ced1e71e596fbc98398d8dd63b5b/physical_ai_av-0.1.0-py3-none-any.whl", hash = "sha256:f6e6c3e147032cd4ff5a41436d0bd82f40ab48b06423cc1d6e67b8c81f1c09fc", size = 18382, upload-time = "2025-11-29T15:53:58.051Z" },
+    { url = "https://files.pythonhosted.org/packages/64/93/6596736dbb8938465f480a4603a1c3e803185a4a692e782d9c311859c7cc/physical_ai_av-0.2.0-py3-none-any.whl", hash = "sha256:f9167b425a00b150d675f265116ab75e451d6532460a4d43a52edf5b2600c696", size = 21329, upload-time = "2026-03-14T02:04:07.108Z" },
 ]
 
 [[package]]
