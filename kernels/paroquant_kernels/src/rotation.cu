@@ -582,5 +582,3 @@ TORCH_LIBRARY_IMPL(rotation, CUDA, m) {
     m.impl("rotate", &rotate_dynamic);
     m.impl("rotate_and_quant", &rotate_and_quant_dynamic);
 }
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { }

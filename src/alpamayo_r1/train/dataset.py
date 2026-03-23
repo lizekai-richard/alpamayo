@@ -310,16 +310,19 @@ class StreamingDataset(torch.utils.data.Dataset):
         vision_starts = (ids == self._vision_start_id).nonzero(as_tuple=True)[0]
         vision_ends = (ids == self._vision_end_id).nonzero(as_tuple=True)[0]
 
-        # Build keep mask: start with True everywhere, then zero-out old frames and system tokens
-        keep_mask = torch.ones(input_ids.shape[1], dtype=torch.bool)
-        first_vision_start = vision_starts[0].item()
-        keep_mask[:first_vision_start] = False
+        # Build keep mask: start with all False, then mark only the tokens we need.
+        # For each view, keep from after second-to-last [VE] to last [VE] (inclusive).
+        # In v1 (no text labels) this is just [VS_last..VE_last].
+        # In v1.5 this also includes the frame label text before [VS_last].
+        # Also keep everything after the last overall [VE] (traj tokens, user prompt).
+        keep_mask = torch.zeros(input_ids.shape[1], dtype=torch.bool)
         for view_idx in range(self.num_views):
-            for frame_offset in range(self.num_frames_per_view - 1):  # first 3 frames
-                gidx = view_idx * self.num_frames_per_view + frame_offset
-                start = vision_starts[gidx].item()
-                end = vision_ends[gidx].item()
-                keep_mask[start : end + 1] = False  # vision_start through vision_end inclusive
+            sec_last_gidx = view_idx * self.num_frames_per_view + (self.num_frames_per_view - 2)
+            last_gidx = view_idx * self.num_frames_per_view + (self.num_frames_per_view - 1)
+            start = vision_ends[sec_last_gidx].item() + 1
+            end = vision_ends[last_gidx].item()
+            keep_mask[start : end + 1] = True
+        keep_mask[vision_ends[-1].item() + 1 :] = True
 
         input_ids = input_ids[:, keep_mask]
         attention_mask = attention_mask[:, keep_mask]
@@ -568,16 +571,26 @@ if __name__ == "__main__":
     assert len(dataset) == 1
 
     item = dataset[0]
-    # Reconstruct raw subsequence from the index for verification
-    _clip_id, _start, _seq_len = dataset.data[0]
-    _all_windows = torch.load(os.path.join(data_dir, _clip_id, "sliding_window_inputs.pt"),
-                              map_location="cpu", weights_only=False)
-    raw_subseq = _all_windows[_start : _start + _seq_len]
     num_windows = len(item)
     rollout_steps = num_windows - 1
     assert 3 <= num_windows <= MAX_ROLLOUT_STEPS + 1, \
         f"item has {num_windows} windows, expected 3..{MAX_ROLLOUT_STEPS + 1}"
     print(f"Item has {num_windows} windows (rollout_steps={rollout_steps})")
+
+    # Reconstruct raw subsequence for verification: re-derive start from the
+    # same deterministic rollout logic used by _getitem_impl.
+    _clip_id = dataset.data[dataset._ordered_indices[0]][0]
+    _all_windows = torch.load(os.path.join(data_dir, _clip_id, "sliding_window_inputs.pt"),
+                              map_location="cpu", weights_only=False)
+    # The start position is random; match it via the prefill window's ego_history_xyz
+    _start = None
+    for wi in range(len(_all_windows)):
+        if torch.equal(item[0]["ego_history_xyz"], _all_windows[wi]["ego_history_xyz"].squeeze(0)):
+            _start = wi
+            break
+    assert _start is not None, "Could not find matching start position in raw data"
+    raw_subseq = _all_windows[_start : _start + num_windows]
+    print(f"Matched raw subsequence: start={_start}, len={len(raw_subseq)}")
 
     errors = []
 
@@ -700,13 +713,24 @@ if __name__ == "__main__":
     raw_last = raw_subseq[-1]
     td_last = raw_last["tokenized_data"]
     raw_ids_last = td_last["input_ids"].squeeze(0)
-    raw_output_ids = raw_last["output_token_ids"]
+    raw_output_ids = raw_last["output_token_ids"].clone()
+
+    # _build_window_item replaces trailing <|endoftext|> with <|traj_future_start|>
+    endoftext_id = tokenizer.encode("<|endoftext|>")[0]
+    traj_future_start_id = tokenizer.encode("<|traj_future_start|>")[0]
+    if raw_output_ids[-1].item() == endoftext_id:
+        raw_output_ids[-1] = traj_future_start_id
+    elif raw_output_ids[-1].item() != traj_future_start_id:
+        raw_output_ids = torch.cat([
+            raw_output_ids,
+            torch.tensor([traj_future_start_id], dtype=raw_output_ids.dtype),
+        ])
 
     keep_last = _compute_streaming_keep_mask(raw_ids_last)
     streaming_ids = raw_ids_last[keep_last]
     input_len = streaming_ids.shape[0]
 
-    # input_ids = streaming_input + output_token_ids
+    # input_ids = streaming_input + output_token_ids (with traj_future_start fix)
     expected_full_ids = torch.cat([streaming_ids, raw_output_ids])
     check(torch.equal(wlast["input_ids"], expected_full_ids),
           "input_ids = streaming_input ++ output_token_ids")
@@ -770,10 +794,17 @@ if __name__ == "__main__":
               "expert rollout window has NO ego_future_xyz")
 
     # Expert last window input_ids should NOT include output_token_ids
-    _cid_e, _st_e, _sl_e = dataset_expert.data[0]
+    _cid_e = dataset_expert.data[dataset_expert._ordered_indices[0]][0]
     _raw_e = torch.load(os.path.join(data_dir, _cid_e, "sliding_window_inputs.pt"),
                         map_location="cpu", weights_only=False)
-    raw_last_e = _raw_e[_st_e + _sl_e - 1]
+    # Find matching start position for expert item
+    _st_e = None
+    for wi in range(len(_raw_e)):
+        if torch.equal(item_expert[0]["ego_history_xyz"], _raw_e[wi]["ego_history_xyz"].squeeze(0)):
+            _st_e = wi
+            break
+    assert _st_e is not None, "Could not find matching start position for expert item"
+    raw_last_e = _raw_e[_st_e + len(item_expert) - 1]
     raw_ids_e = raw_last_e["tokenized_data"]["input_ids"].squeeze(0)
     if len(item_expert) > 1:
         keep_e = _compute_streaming_keep_mask(raw_ids_e)
@@ -822,18 +853,18 @@ if __name__ == "__main__":
     check(len(unique_lengths) > 1,
           f"multiple distinct lengths observed: {sorted(unique_lengths)}")
 
-    # Verify no duplicate (clip_id, start, seq_len)
+    # Verify no duplicate (clip_id, sample_idx)
     seen_ids = set()
     for entry in dataset_multi.data:
         check(entry not in seen_ids,
-              f"unique subsequence: clip={entry[0][:8]}..., start={entry[1]}, len={entry[2]}")
+              f"unique sample: clip={entry[0][:8]}..., sample_idx={entry[1]}")
         seen_ids.add(entry)
 
     # ==================================================================
-    # 8. EvalStreamingDataset uses fixed rollout length
+    # 8. EvalStreamingDataset returns full clips
     # ==================================================================
     print("\n" + "=" * 60)
-    print("8. EVAL DATASET — fixed rollout length")
+    print("8. EVAL DATASET — full clip")
     print("=" * 60)
 
     cfg_eval = OmegaConf.create({
@@ -844,9 +875,48 @@ if __name__ == "__main__":
         "samples_per_clip": 5,
     })
     dataset_eval = EvalStreamingDataset(cfg_eval, processor=processor)
-    eval_lengths = [len(dataset_eval[i]) for i in range(len(dataset_eval))]
-    check(all(l == MAX_ROLLOUT_STEPS + 1 for l in eval_lengths),
-          f"all eval items have fixed length {MAX_ROLLOUT_STEPS + 1}: {eval_lengths}")
+    check(len(dataset_eval) == 1, f"eval dataset has 1 clip (got {len(dataset_eval)})")
+    eval_item = dataset_eval[0]
+    check(len(eval_item) == len(raw_windows),
+          f"eval item returns full clip: {len(eval_item)} windows == {len(raw_windows)} raw")
+
+    # ==================================================================
+    # 9. Deterministic rollout_steps across calls
+    # ==================================================================
+    print("\n" + "=" * 60)
+    print("9. DETERMINISTIC ROLLOUT_STEPS")
+    print("=" * 60)
+
+    cfg_det = OmegaConf.create({
+        "data_dir": data_dir,
+        "clip_list": clip_list_path,
+        "min_rollout_steps": MIN_ROLLOUT_STEPS,
+        "max_rollout_steps": MAX_ROLLOUT_STEPS,
+        "samples_per_clip": 10,
+    })
+    ds_a = StreamingDataset(cfg_det, processor=processor, training_stage="vlm", batch_size=2)
+    ds_b = StreamingDataset(cfg_det, processor=processor, training_stage="vlm", batch_size=2)
+
+    # Same (epoch, idx) → same rollout_steps
+    for idx in range(len(ds_a)):
+        rs_a = ds_a._compute_rollout_steps(idx)
+        rs_b = ds_b._compute_rollout_steps(idx)
+        check(rs_a == rs_b,
+              f"idx {idx}: deterministic rollout_steps ({rs_a} == {rs_b})")
+
+    # Same batch → same rollout_steps (batch_size=2)
+    for batch_start in range(0, len(ds_a) - 1, 2):
+        rs_0 = ds_a._compute_rollout_steps(batch_start)
+        rs_1 = ds_a._compute_rollout_steps(batch_start + 1)
+        check(rs_0 == rs_1,
+              f"batch [{batch_start},{batch_start+1}]: same rollout_steps ({rs_0})")
+
+    # Different epoch → different sequence
+    ds_a.set_epoch(0)
+    ds_b.set_epoch(1)
+    seq_a = [ds_a._compute_rollout_steps(i) for i in range(len(ds_a))]
+    seq_b = [ds_b._compute_rollout_steps(i) for i in range(len(ds_b))]
+    check(seq_a != seq_b, "different epochs produce different rollout_steps sequences")
 
     # ==================================================================
     # Summary

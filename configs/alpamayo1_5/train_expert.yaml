@@ -13,8 +13,8 @@ batch_size: 32
 num_workers: 0
 
 # Eval data
-eval_data_dir: /mnt/moosefs/users/zekail/dumped_eval_data
-eval_clip_list: eval_clip_sample_10.json
+eval_data_dir: /mnt/moosefs-1/users/zekail/dumped_eval_data_v1.5
+eval_clip_list: eval_clips_sample_10.json
 
 # Optimization
 lr: 1.0e-5
@@ -34,22 +34,22 @@ gradient_accumulation_steps: 1
 
 # Eval
 eval_every_n_steps: 500
-eval_steps: 10
+eval_steps: 1
 eval_top_p: 0.98
 eval_temperature: 0.6
 eval_num_traj_samples: 6
 eval_max_generation_length: 128
 
 # Checkpointing
-output_dir: /mnt/moosefs/users/zekail/flashdrive/alpamayo1_5
+output_dir: /mnt/moosefs-1/users/zekail/flashdrive/alpamayo1_5
 save_every_n_steps: 1000
-save_total_limit: 5
+save_total_limit: 10
 resume_from_checkpoint: null
 
 # Logging
 log_every_n_steps: 10
 wandb_project: flashdrive-alpamayo
-wandb_run_name: streaming_te_bs32_apmy1_5
+wandb_run_name: train_expert_bs32_apmy1_5
 wandb_entity: null
 
 # Rollout

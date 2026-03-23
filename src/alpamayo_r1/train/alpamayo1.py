@@ -44,7 +44,6 @@ from alpamayo_r1.utils.streaming.streaming_masking_utils import (
     create_streaming_attention_mask_sdpa_training,
 )
 from alpamayo_r1.train.patches import StaticCache
-
 logger = logging.getLogger(__name__)
 
 
@@ -143,6 +142,7 @@ class AlpamayoR1(ReasoningVLA):
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
+        self.keep_frame_labels = True
 
     def reset_streaming_state(self):
         """Reset all streaming state between batches."""
@@ -226,29 +226,48 @@ class AlpamayoR1(ReasoningVLA):
             vision_start_end_ids_ranges[view_idx].append((vision_start.item(), vision_end.item() + 1))
             image_token_ids_ranges[view_idx].append((vision_start.item() + 1, vision_end.item()))
 
+        # Optionally expand last frame's range to start from sec-last VE+1
+        # (includes frame label text in v1.5). In v1 sec_last_VE+1 == last_VS,
+        # so this is a no-op. When keep_frame_labels=False, skip expansion.
+        if self.keep_frame_labels:
+            for view_idx in range(self.num_views):
+                sec_last_end = vision_start_end_ids_ranges[view_idx][-2][1]
+                last_end = vision_start_end_ids_ranges[view_idx][-1][1]
+                vision_start_end_ids_ranges[view_idx][-1] = (sec_last_end, last_end)
+
         last_vision_end_id = all_vision_end_token_ids[-1]
         traj_and_text_ids_range = (last_vision_end_id.item() + 1, self.prefill_seq_length)
 
         return vision_start_end_ids_ranges, image_token_ids_ranges, traj_and_text_ids_range
 
     def _update_past_key_values(self):
-        """Shift KV cache: move frames 2-4 to positions 1-3 for each view."""
+        """Shift KV cache: move vision tokens of frames 1-3 to positions 0-2.
+
+        Only copies [VS..VE+1] ranges per frame (vision tokens), skipping
+        text tokens between frames (e.g. frame labels in v1.5) so they
+        don't get shifted to wrong positions.
+        """
         for layer in self._past_key_values.layers:
             key_cache = layer.keys
             value_cache = layer.values
 
             for i in range(self.num_views):
-                new_kv_start = self.vision_start_end_ids_ranges[i][0][0]
-                new_kv_end = self.vision_start_end_ids_ranges[i][-2][1]
-                old_kv_start = self.vision_start_end_ids_ranges[i][1][0]
-                old_kv_end = self.vision_start_end_ids_ranges[i][-1][1]
+                # Shift frame k+1 → frame k for k in [0, num_frames-2)
+                for k in range(self.num_frames_per_view - 1):
+                    dst_start, dst_end = self.image_token_ids_ranges[i][k]
+                    src_start, src_end = self.image_token_ids_ranges[i][k + 1]
+                    # image_token_ids_ranges stores (VS+1, VE), expand to [VS..VE+1)
+                    dst_start -= 1
+                    dst_end += 1
+                    src_start -= 1
+                    src_end += 1
 
-                key_cache[:, :, new_kv_start:new_kv_end, :].copy_(
-                    key_cache[:, :, old_kv_start:old_kv_end, :].clone()
-                )
-                value_cache[:, :, new_kv_start:new_kv_end, :].copy_(
-                    value_cache[:, :, old_kv_start:old_kv_end, :].clone()
-                )
+                    key_cache[:, :, dst_start:dst_end, :].copy_(
+                        key_cache[:, :, src_start:src_end, :].clone()
+                    )
+                    value_cache[:, :, dst_start:dst_end, :].copy_(
+                        value_cache[:, :, src_start:src_end, :].clone()
+                    )
 
     def _create_cache_position(self) -> torch.Tensor:
         """Create cache positions for streaming prefill."""
@@ -642,7 +661,7 @@ class AlpamayoR1(ReasoningVLA):
         self,
         window: dict[str, Any],
         device: torch.device,
-    ) -> Qwen3VLCausalLMOutputWithPast:
+    ):
         """Compute VLM loss on the last window (with gradient)."""
         input_ids = window["input_ids"].to(device)
         attention_mask = window["attention_mask"].to(device)
@@ -691,7 +710,7 @@ class AlpamayoR1(ReasoningVLA):
         max_generation_length: int,
         temperature: float,
         top_p: float,
-    ) -> torch.Tensor:
+    ):
         """Expert training on the last window: VLM prefill+decode (no grad) + flow matching (with grad)."""
         input_ids = window["input_ids"].to(device)
         pixel_values = window["pixel_values"].to(device)
@@ -826,7 +845,7 @@ class AlpamayoR1(ReasoningVLA):
         return_extra: bool = False,
         *args: Any,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ):
         """Sample trajectories with streaming VLM rollout.
 
         Args:

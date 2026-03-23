@@ -23,7 +23,7 @@ import logging
 import torch
 import time
 import numpy as np
-from alpamayo_r1.models.alpamayo_r1_unified import AlpamayoR1FlashDrive
+from alpamayo_r1.models.alpamayo_r1_flashdrive import AlpamayoR1FlashDrive
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 from alpamayo_r1.utils import setup_dflash_for_model

@@ -4,12 +4,16 @@ import sys
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import alpamayo_r1
+sys.modules["alpamayo1_5"] = alpamayo_r1
+
 import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
 
-from alpamayo_r1.train.alpamayo1 import AlpamayoR1
-from alpamayo_r1.train.alpamayo1_5 import Alpamayo1_5
+from transformers import AutoModel
+from alpamayo_r1.train import alpamayo1 as _alpamayo1  # noqa: F401 — registers AutoConfig/AutoModel
+from alpamayo_r1.train import alpamayo1_5 as _alpamayo1_5  # noqa: F401 — registers AutoConfig/AutoModel
 from alpamayo_r1 import helper
 from alpamayo_r1.train.dataset import StreamingDataset, EvalStreamingDataset, collate_fn, batched_collate_fn, eval_collate_fn
 from alpamayo_r1.train.trainer import Trainer, TrainerConfig
@@ -40,7 +44,7 @@ def train(cfg):
     # Load model to CPU; the Trainer moves to the correct device per rank.
     logger.info("Loading model...")
     path = cfg.resume_from_checkpoint if cfg.resume_from_checkpoint else cfg.model_path
-    model = AlpamayoR1.from_pretrained(path, dtype=torch.bfloat16)
+    model = AutoModel.from_pretrained(path, dtype=torch.bfloat16)
     model.set_training_stage(cfg.training_stage)
     logger.info(f"Model loaded, training_stage={cfg.training_stage}")
 
@@ -105,6 +109,10 @@ def train(cfg):
         rollout_temperature=cfg.rollout_temperature,
         rollout_num_traj_samples=cfg.rollout_num_traj_samples,
         rollout_max_generation_length=cfg.rollout_max_generation_length,
+        eval_top_p=getattr(cfg, "eval_top_p", 0.98),
+        eval_temperature=getattr(cfg, "eval_temperature", 0.6),
+        eval_num_traj_samples=getattr(cfg, "eval_num_traj_samples", 6),
+        eval_max_generation_length=getattr(cfg, "eval_max_generation_length", 256),
         distributed=distributed,
         use_deepspeed=getattr(cfg, "use_deepspeed", False),
         deepspeed=OmegaConf.to_container(cfg.deepspeed, resolve=True) if getattr(cfg, "deepspeed", None) else None,

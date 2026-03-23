@@ -136,6 +136,26 @@ class StaticCache(cache_utils.Cache):
                 layer.expand_batch()
 
 
+class Qwen3VLVisionPatchEmbed(qwen3vl.Qwen3VLVisionPatchEmbed):
+    def __init__(self, config):
+        nn.Module.__init__(self)
+        self.in_features = (
+            config.in_channels * config.temporal_patch_size * config.patch_size**2
+        )
+        self.proj = nn.Linear(self.in_features, config.hidden_size, bias=True)
+
+        # Hook to convert Conv3d weights [out, in, t, h, w] -> Linear [out, in*t*h*w]
+        def convert_conv3d_weights(state_dict, prefix, *args):
+            weight_key = prefix + "weight"
+            if weight_key in state_dict and state_dict[weight_key].ndim == 5:
+                state_dict[weight_key] = state_dict[weight_key].flatten(1).contiguous()
+
+        self.proj._register_load_state_dict_pre_hook(convert_conv3d_weights, with_module=False)
+
+    def forward(self, hidden_states):
+        return self.proj(hidden_states.reshape(-1, self.in_features))
+
+
 def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to a single tensor."""
     cos = cos.unsqueeze(unsqueeze_dim)
@@ -250,10 +270,38 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
         )
 
 _PATCHED_CLASSES = {
+    "Qwen3VLVisionPatchEmbed": Qwen3VLVisionPatchEmbed,
     "Qwen3VLTextModel": Qwen3VLTextModel,
     "Qwen3VLTextAttention": Qwen3VLTextAttention,
 }
 
+def _get_device_dtype(module: nn.Module) -> tuple[torch.device, torch.dtype]:
+    param = next(module.parameters(), None)
+    if param is None:
+        return torch.device("cpu"), torch.float32
+    return param.device, param.dtype
+
+def _replace_module(
+    model: nn.Module,
+    module_path: str,
+    old_module: nn.Module,
+    new_class: type
+) -> None:
+    *parent_parts, name = module_path.split(".")
+    parent = model
+    for part in parent_parts:
+        parent = getattr(parent, part)
+
+    config = getattr(old_module, "config", None) or getattr(parent, "config", None)
+    device, dtype = _get_device_dtype(old_module)
+
+    new_module = new_class(config)
+    new_module.load_state_dict(old_module.state_dict(), assign=True)
+
+    if device.type != "meta":
+        new_module = new_module.to(device=device, dtype=dtype)
+
+    setattr(parent, name, new_module)
 
 def patch_for_training(model: nn.Module) -> None:
     """Patch Qwen3-VL modules with streaming-compatible implementations.
@@ -262,8 +310,11 @@ def patch_for_training(model: nn.Module) -> None:
     (streaming RoPE, streaming attention mask, etc.) are used instead of
     the upstream transformers code.
     """
-    for _path, module in model.named_modules():
+    for module_path, module in model.named_modules():
         class_name = type(module).__name__
         if class_name in _PATCHED_CLASSES:
             if type(module) is not _PATCHED_CLASSES[class_name]:
-                module.__class__ = _PATCHED_CLASSES[class_name]
+                if class_name == "Qwen3VLVisionPatchEmbed":
+                    _replace_module(model, module_path, module, Qwen3VLVisionPatchEmbed)
+                else:
+                    module.__class__ = _PATCHED_CLASSES[class_name]

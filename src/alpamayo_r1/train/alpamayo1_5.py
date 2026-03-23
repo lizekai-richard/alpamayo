@@ -152,6 +152,8 @@ class Alpamayo1_5(ReasoningVLA):
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
+        self.keep_frame_labels = True
+        self.kv_shift_mode = "block"  # "block" or "vision_only"
     
     def reset_streaming_state(self):
         """Reset all streaming state between batches."""
@@ -186,13 +188,29 @@ class Alpamayo1_5(ReasoningVLA):
                     param.requires_grad = True
         else:
             raise ValueError(f"Unknown training stage: {stage!r}. Expected 'vlm' or 'expert'.")
+    
+    # ==================== Properties ====================
+
+    @property
+    def traj_start_token_id(self) -> int:
+        """Token ID for <traj_future_start>."""
+        if not hasattr(self, "_traj_start_token_id"):
+            self._traj_start_token_id = self.tokenizer.convert_tokens_to_ids(
+                to_special_token("traj_future_start")
+            )
+        return self._traj_start_token_id
+
+    @property
+    def num_action_tokens(self) -> int:
+        """Number of action tokens (trajectory length)."""
+        return self.action_space.get_action_space_dims()[0]
 
     @staticmethod
     def _find_eos_offset(
         sequences: torch.Tensor,
         eos_token_id: int,
         device: torch.device,
-        warn: bool = True,
+        warn: bool = False,
     ) -> torch.Tensor:
         """Find the first eos_token_id position in each sequence and return offset = pos + 1.
 
@@ -323,29 +341,62 @@ class Alpamayo1_5(ReasoningVLA):
             vision_start_end_ids_ranges[view_idx].append((vision_start.item(), vision_end.item() + 1))
             image_token_ids_ranges[view_idx].append((vision_start.item() + 1, vision_end.item()))
 
+        # Optionally expand last frame's range to start from sec-last VE+1
+        # (includes frame label text in v1.5). In v1 sec_last_VE+1 == last_VS,
+        # so this is a no-op. When keep_frame_labels=False, skip expansion.
+        if self.keep_frame_labels:
+            for view_idx in range(self.num_views):
+                sec_last_end = vision_start_end_ids_ranges[view_idx][-2][1]
+                last_end = vision_start_end_ids_ranges[view_idx][-1][1]
+                vision_start_end_ids_ranges[view_idx][-1] = (sec_last_end, last_end)
+
         last_vision_end_id = all_vision_end_token_ids[-1]
         traj_and_text_ids_range = (last_vision_end_id.item() + 1, self.prefill_seq_length)
 
         return vision_start_end_ids_ranges, image_token_ids_ranges, traj_and_text_ids_range
 
     def _update_past_key_values(self):
-        """Shift KV cache: move frames 2-4 to positions 1-3 for each view."""
+        """Shift KV cache: move frames 1-3 to positions 0-2.
+
+        Controlled by self.kv_shift_mode:
+        - "block": copy [frame1_start..frame3_end) → [frame0_start..frame2_end),
+          shifting frame labels together with vision tokens as a unit.
+        - "vision_only": per-frame copy of [VS..VE+1] only, skipping text
+          tokens between frames so they stay in place.
+        """
         for layer in self._past_key_values.layers:
             key_cache = layer.keys
             value_cache = layer.values
 
-            for i in range(self.num_views):
-                new_kv_start = self.vision_start_end_ids_ranges[i][0][0]
-                new_kv_end = self.vision_start_end_ids_ranges[i][-2][1]
-                old_kv_start = self.vision_start_end_ids_ranges[i][1][0]
-                old_kv_end = self.vision_start_end_ids_ranges[i][-1][1]
+            if self.kv_shift_mode == "block":
+                for i in range(self.num_views):
+                    new_kv_start = self.vision_start_end_ids_ranges[i][0][0]
+                    new_kv_end = self.vision_start_end_ids_ranges[i][-2][1]
+                    old_kv_start = self.vision_start_end_ids_ranges[i][1][0]
+                    old_kv_end = self.vision_start_end_ids_ranges[i][-1][1]
 
-                key_cache[:, :, new_kv_start:new_kv_end, :].copy_(
-                    key_cache[:, :, old_kv_start:old_kv_end, :].clone()
-                )
-                value_cache[:, :, new_kv_start:new_kv_end, :].copy_(
-                    value_cache[:, :, old_kv_start:old_kv_end, :].clone()
-                )
+                    key_cache[:, :, new_kv_start:new_kv_end, :].copy_(
+                        key_cache[:, :, old_kv_start:old_kv_end, :].clone()
+                    )
+                    value_cache[:, :, new_kv_start:new_kv_end, :].copy_(
+                        value_cache[:, :, old_kv_start:old_kv_end, :].clone()
+                    )
+            else:  # vision_only
+                for i in range(self.num_views):
+                    for k in range(self.num_frames_per_view - 1):
+                        dst_start, dst_end = self.image_token_ids_ranges[i][k]
+                        src_start, src_end = self.image_token_ids_ranges[i][k + 1]
+                        dst_start -= 1
+                        dst_end += 1
+                        src_start -= 1
+                        src_end += 1
+
+                        key_cache[:, :, dst_start:dst_end, :].copy_(
+                            key_cache[:, :, src_start:src_end, :].clone()
+                        )
+                        value_cache[:, :, dst_start:dst_end, :].copy_(
+                            value_cache[:, :, src_start:src_end, :].clone()
+                        )
 
     def _create_cache_position(self) -> torch.Tensor:
         """Create cache positions for streaming prefill."""
@@ -795,7 +846,8 @@ class Alpamayo1_5(ReasoningVLA):
 
             # Compute scalar values needed for expert mask construction
             # traj_start_pos = self._find_traj_start_positions(output_ids)
-            traj_start_pos = self._find_eos_offset(output_ids, self.traj_start_token_id, device)
+            # _find_eos_offset returns pos+1, subtract 1 to get actual position
+            traj_start_pos = self._find_eos_offset(output_ids, self.traj_start_token_id, device) - 1
             action_start_pos = self.prefill_seq_length + (traj_start_pos - seq_len) + 1
             # Save as python ints so they can be used outside inference_mode
             action_start_pos_val = action_start_pos.cpu().tolist()
@@ -848,6 +900,7 @@ class Alpamayo1_5(ReasoningVLA):
         v_pred = self.action_out_proj(hidden).view(batch_size, *action_dims)
         return torch.nn.functional.mse_loss(v_pred, v_target)
     
+    @torch.inference_mode()
     def sample_trajectories_from_data_with_streaming_vlm_rollout(
         self,
         data: dict[str, Any],
@@ -881,12 +934,13 @@ class Alpamayo1_5(ReasoningVLA):
         n_samples_total = num_traj_samples * num_traj_sets
         ego_history_xyz = data["ego_history_xyz"]
         ego_history_rot = data["ego_history_rot"]
-        pixel_values = data["pixel_values"]
-        image_grid_thw = data["image_grid_thw"]
+        tokenized_data = data["tokenized_data"]
+        pixel_values = data.get("pixel_values", tokenized_data.get("pixel_values"))
+        image_grid_thw = data.get("image_grid_thw", tokenized_data.get("image_grid_thw"))
         batch_size, n_traj_group, _, _ = ego_history_xyz.shape
         assert n_traj_group == 1, "Only one trajectory group is supported for inference."
-        tokenized_data = data["tokenized_data"]
         input_ids = tokenized_data.pop("input_ids")
+        attention_mask = tokenized_data.pop("attention_mask")
         traj_data_vlm = {
             "ego_history_xyz": ego_history_xyz,
             "ego_history_rot": ego_history_rot,
@@ -975,7 +1029,8 @@ class Alpamayo1_5(ReasoningVLA):
         )
 
         # Find <traj_future_start> position
-        traj_start_pos = self._find_eos_offset(output_ids, self.traj_start_token_id, device)
+        # _find_eos_offset returns pos+1, so subtract 1 to get the actual position
+        traj_start_pos = self._find_eos_offset(output_ids, self.traj_start_token_id, device) - 1
 
         # MODIFIED: Calculate offset for action tokens. In streaming setting, the offset is wrong without the modification due to truncated input length.
         # But the length of kv cache is always the same.

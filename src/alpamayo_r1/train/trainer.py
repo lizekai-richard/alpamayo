@@ -63,6 +63,12 @@ class TrainerConfig:
     rollout_num_traj_samples: int = 1
     rollout_max_generation_length: int = 256
 
+    # Eval generation
+    eval_top_p: float = 0.98
+    eval_temperature: float = 0.6
+    eval_num_traj_samples: int = 6
+    eval_max_generation_length: int = 256
+
     # Distributed
     distributed: bool = False
 
@@ -225,6 +231,11 @@ class Trainer:
             self._load_checkpoint(self.config.resume_from_checkpoint)
 
         start_epoch = self.epoch
+
+        # Run eval at step 0 as baseline before any training
+        if self.eval_dataloader is not None and self.global_step == 0:
+            eval_metrics = self._evaluate()
+            self._log(eval_metrics, self.global_step)
 
         for epoch in range(start_epoch, self.config.num_epochs):
             self.epoch = epoch
@@ -414,7 +425,7 @@ class Trainer:
                     if i > 0:
                         pred_xyz, pred_rot, extra = results
                         ade_list = _calc_ade(window["ego_future_xyz"].to(device), pred_xyz)
-                        minade_1, minade_6, minade_6_idx = ade_list[0], ade_list.min(), ade_list.argmin()
+                        minade_1, minade_6, minade_6_idx = ade_list[0].item(), ade_list.min().item(), ade_list.argmin().item()
                         best_cot = extra["cot"][0][0][minade_6_idx]
                         total_minade_1 += minade_1
                         total_minade_6 += minade_6
