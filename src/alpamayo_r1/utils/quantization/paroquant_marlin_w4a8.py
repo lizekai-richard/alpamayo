@@ -18,69 +18,12 @@ Usage — as a library:
 from __future__ import annotations
 
 import logging
-import os
-import sys
 from typing import NamedTuple
 
 import torch
 import torch.nn as nn
-from alpamayo_r1.utils.quantization.rotation_linear import RotateLinearInt4
-from alpamayo_r1.utils.quantization.qmodule import WQLinear
-from vllm import _custom_ops as ops
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    awq_to_marlin_zero_points,
-    marlin_act_int8_process_scales,
-    marlin_make_empty_g_idx,
-    marlin_make_workspace_new,
-    marlin_permute_scales,
-)
 
-logger = logging.getLogger(__name__)
-
-
-class BF16RotateLinearWrapper(nn.Module):
-    """Wraps RotateLinearInt4 to accept bfloat16 input.
-
-    The rotation CUDA kernel only supports float16/float32, but the model
-    runs in bfloat16. This wrapper casts bf16→fp16 on input and fp16→bf16
-    on output, keeping the rest of the model numerically stable.
-    """
-
-    def __init__(self, rotate_linear: nn.Module):
-        super().__init__()
-        self.rotate_linear = rotate_linear
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        # Disable autocast so internal ops stay in float16 (rotation kernel
-        # only supports float16/float32; autocast would re-cast to bfloat16).
-        with torch.amp.autocast("cuda", enabled=False):
-            out = self.rotate_linear(x.to(torch.float16))
-        return out.to(input_dtype)
-
-    def __getattr__(self, name: str):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.rotate_linear, name)
-
-
-def _get_alpamayo_layers(
-    model, target="vlm",
-):
-    """Return the transformer layer list for the given component."""
-    if target == "expert":
-        return model.expert.layers
-    return model.vlm.model.language_model.layers
-
-
-def _iter_linears(module, prefix=""):
-    """Yield (full_name, parent_module, child_name, nn.Linear) for all linears."""
-    for name, child in module.named_children():
-        full = f"{prefix}.{name}" if prefix else name
-        if isinstance(child, nn.Linear):
-            yield full, module, name, child
-        yield from _iter_linears(child, full)
+log = logging.getLogger(__name__)
 
 # ────────────────────────────────────────────────────────────
 # 1. WQLinear int16 → raw int4
@@ -267,6 +210,14 @@ class MarlinW4A8Linear(nn.Module):
 
     def load_from_awq(self, awq_qweight, awq_scales, awq_qzeros, bias=None):
         """AWQ int32 buffers → Marlin W4A8 format (on same device as inputs)."""
+        from vllm import _custom_ops as ops
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+            awq_to_marlin_zero_points,
+            marlin_act_int8_process_scales,
+            marlin_make_empty_g_idx,
+            marlin_make_workspace_new,
+            marlin_permute_scales,
+        )
 
         dev = awq_qweight.device
         K, N = self.in_features, self.out_features
@@ -304,6 +255,30 @@ class MarlinW4A8Linear(nn.Module):
             self.register_buffer("bias", bias)
         else:
             self.bias = None
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys, error_msgs):
+        """Override to allow loading Marlin buffers whose shapes differ from
+        the empty(0) placeholders created in __init__."""
+        # Directly assign buffers, bypassing shape checks.
+        # Pop handled keys and temporarily hide the buffer names from
+        # self._buffers so that super()'s default logic doesn't re-check
+        # them and report false missing keys.
+        handled = {}
+        for name in list(self._buffers.keys()):
+            key = prefix + name
+            if key in state_dict:
+                self._buffers[name] = state_dict.pop(key)
+                handled[name] = self._buffers.pop(name)
+            elif strict:
+                missing_keys.append(key)
+        # Let nn.Module handle any remaining (e.g. bias)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata,
+            strict, missing_keys, unexpected_keys, error_msgs,
+        )
+        # Restore handled buffers
+        self._buffers.update(handled)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -347,190 +322,23 @@ def convert_wqlinear_layer(qweight_i16, scales, scaled_zeros,
     return mod, awq
 
 
-def _wrap_rotate_linears(model, target="vlm"):
-    """Wrap all RotateLinearInt4 modules with BF16RotateLinearWrapper."""
-    layers = _get_alpamayo_layers(model, target)
-    for layer in layers:
-        for name, child in layer.named_children():
-            for sub_name, sub_child in child.named_children():
-                if isinstance(sub_child, RotateLinearInt4):
-                    setattr(child, sub_name, BF16RotateLinearWrapper(sub_child))
-
-
-def replace_linears_with_rotate_linear(
-    model,
-    target="vlm",
-    init_only: bool = True,
-    ignore_suffix: tuple[str, ...] = ("lm_head",),
-):
-    """Replace nn.Linear modules in *target* layers with empty RotateLinearInt4 shells.
-
-    The shells are populated later by ``model.load_state_dict()``.
-    """
-    layers = _get_alpamayo_layers(model, target)
-    for layer in layers:
-        for full_name, parent, child_name, linear in list(_iter_linears(layer)):
-            if child_name in ignore_suffix:
-                continue
-            rotate_linear = RotateLinearInt4(
-                in_feat=linear.in_features,
-                out_feat=linear.out_features,
-                bias=linear.bias is not None,
-                dtype=torch.float16,
-            )
-            setattr(parent, child_name, rotate_linear)
-
-
-def _sanitise_channel_scales(model):
-    """Clamp rotation channel_scales to prevent fp16 overflow → NaN.
-
-    Some ParoQuant checkpoints contain INF or near-overflow values in the
-    ``rotation.channel_scales`` buffer.  When multiplied by activations in
-    the fp16 rotation kernel, these produce NaN.  Clamping to a safe range
-    fixes the issue with negligible effect on accuracy.
-    """
-
-    FP16_MAX = 65504.0
-    # Conservative limit — after scaling, the product with activations
-    # (typically < 100) must stay within fp16 range.
-    SAFE_MAX = FP16_MAX / 128.0  # ~512
-
-    n_fixed = 0
-    for name, mod in model.named_modules():
-        if not isinstance(mod, RotateLinearInt4):
-            continue
-        cs = mod.rotation.channel_scales
-        bad_mask = torch.isinf(cs) | torch.isnan(cs) | (cs.abs() > SAFE_MAX)
-        n_bad = bad_mask.sum().item()
-        if n_bad > 0:
-            with torch.no_grad():
-                cs.clamp_(-SAFE_MAX, SAFE_MAX)
-            n_fixed += 1
-            logger.warning(
-                f"  Clamped {n_bad}/{cs.numel()} channel_scales in {name} "
-                f"(had INF/NaN/overflow values)"
-            )
-
-    if n_fixed:
-        logger.warning(f"Sanitised channel_scales in {n_fixed} RotateLinearInt4 modules")
-    else:
-        logger.info("All channel_scales are within safe fp16 range")
-
-
-def load_paroquant_model(
-    model_path: str,
-    paro_checkpoint: str,
-    *,
-    mode: str = "streaming",
-    dtype: torch.dtype = torch.bfloat16,
-    device: str = "cuda"
-):
-    """Load AlpamayoR1 with ParoQuant quantization (no fusion).
-
-    The model runs in bfloat16 for numerical stability. RotateLinearInt4
-    modules are wrapped to cast bf16→fp16 internally (rotation kernel
-    only supports float16).
-
-    Args:
-        model_path: Path to base AlpamayoR1 pretrained model.
-        paro_checkpoint: Path to ParoQuant ``.pt`` state dict checkpoint.
-        mode: Attention mode — ``"streaming"`` or ``"non-streaming"``.
-        quantize_expert: If True, also replace expert linears with RotateLinearInt4.
-        dtype: Model dtype (default bfloat16).
-        use_w4a8: If True, convert WQLinear to QServeW4A8Linear
-                  (INT4×INT8 GEMM with per-group weight quant + per-token act quant).
-
-    Returns:
-        AlpamayoR1 with ParoQuant INT4 weights on CUDA, eval mode.
-    """
-    from alpamayo_r1.models.alpamayo_r1_flashdrive import AlpamayoR1FlashDrive
-
-    model = AlpamayoR1FlashDrive.from_pretrained(model_path, dtype=dtype)
-    model.setup_patch_for_torch_compile(
-        torch_compile="max-autotune",
-        mode=mode,
-        fuse_qkv=False,
-        fuse_gate_up=False,
-    )
-
-    replace_linears_with_rotate_linear(model, target="vlm", init_only=True)
-    paro_sd = torch.load(paro_checkpoint, map_location="cpu", weights_only=True)
-
-    # Diagnostic: compare keys
-    model_keys = set(model.state_dict().keys())
-    ckpt_keys = set(paro_sd.keys())
-    logger.info(f"Model has {len(model_keys)} keys, checkpoint has {len(ckpt_keys)} keys")
-    logger.info(f"Overlap: {len(model_keys & ckpt_keys)} keys")
-
-    missing, unexpected = model.load_state_dict(paro_sd, strict=False)
-    if missing:
-        quant_missing = [k for k in missing if any(
-            s in k for s in ("qlinear", "rotation", "qweight", "scales", "scaled_zeros")
-        )]
-        logger.warning(f"Missing keys ({len(missing)} total, {len(quant_missing)} quant-related)")
-        if quant_missing:
-            logger.warning(f"  CRITICAL quant missing: {quant_missing[:10]}")
-        else:
-            logger.info(f"  Missing (non-quant): {missing[:5]}...")
-    if unexpected:
-        logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:20]}")
-    del paro_sd
-
-    # Diagnostic: check for zero scales (indicates weights not loaded)
-    n_zero_scales = 0
-    for name, param in model.named_parameters():
-        if "scales" in name and param.numel() > 0:
-            if torch.all(param == 0):
-                n_zero_scales += 1
-                if n_zero_scales <= 3:
-                    logger.warning(f"  ZERO scales: {name} shape={param.shape}")
-    for name, buf in model.named_buffers():
-        if "scales" in name and buf.numel() > 0:
-            if torch.all(buf == 0):
-                n_zero_scales += 1
-                if n_zero_scales <= 3:
-                    logger.warning(f"  ZERO scales (buffer): {name} shape={buf.shape}")
-    if n_zero_scales > 0:
-        logger.error(f"CRITICAL: {n_zero_scales} layers have zero scales — checkpoint keys likely mismatched!")
-    else:
-        logger.info("All scales are non-zero (checkpoint loaded correctly)")
-
-    _sanitise_channel_scales(model)
-    _wrap_rotate_linears(model, target="vlm")
-
-    model = model.to(device)
-    model.eval()
-
-    return model
-
-
-def convert_model_to_marlin_w4a8(model):
-    n = 0
-    for name, mod in model.named_modules():
-        if not isinstance(mod, RotateLinearInt4):
-            continue
-        wq = mod.qlinear
-        if not isinstance(wq, WQLinear):
-            continue
-        marlin, _ = convert_wqlinear_layer(
-            wq.qweight.data, wq.scales.data, wq.scaled_zeros.data,
-            wq.out_features, wq.in_features, wq.group_size,
-            bias=wq.bias, device=wq.qweight.device,
-        )
-        mod.qlinear = marlin
-        n += 1
-    logger.info(f"Converted {n} WQLinear -> MarlinW4A8Linear (Marlin W4A8)")
-    return n
-
+# ────────────────────────────────────────────────────────────
+# 7. Save / Load pretrained W4A8 model
+# ────────────────────────────────────────────────────────────
 
 def save_w4a8_pretrained(model: nn.Module, save_path: str) -> None:
-    """Save a fully converted W4A8 model via HuggingFace save_pretrained."""
+    """Save a fully converted W4A8 model via HuggingFace save_pretrained.
+
+    Saves config.json + sharded safetensors containing Marlin-format
+    weights, rotation parameters, and (optionally fused) expert weights.
+    """
     import json as _json
     from pathlib import Path
 
     save_path = str(save_path)
     model.save_pretrained(save_path)
 
+    # Write a small marker so load knows this is W4A8 Marlin format
     meta = {
         "format": "paroquant_marlin_w4a8",
         "num_quantized_layers": sum(
@@ -539,7 +347,7 @@ def save_w4a8_pretrained(model: nn.Module, save_path: str) -> None:
         ),
     }
     Path(save_path, "w4a8_config.json").write_text(_json.dumps(meta, indent=2))
-    logger.info(f"Saved W4A8 model to {save_path}")
+    log.info(f"Saved W4A8 model to {save_path}")
 
 
 def load_w4a8_pretrained(
@@ -550,35 +358,69 @@ def load_w4a8_pretrained(
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
-    """Load a saved W4A8 model."""
+    """Load a saved W4A8 model.
+
+    Reconstructs the exact module tree (RotateLinearInt4 + MarlinW4A8Linear
+    for VLM, unfused nn.Linear for expert), then fills in weights from the
+    saved safetensors via ``load_state_dict``.
+
+    Args:
+        save_path: Directory written by ``save_w4a8_pretrained``.
+        base_model_path: Path to the original AlpamayoR1 pretrained model.
+            Only the *architecture* (config + module layout) is used;
+            the base weights are discarded and replaced by the saved W4A8
+            weights.
+        mode: ``"streaming"`` or ``"non-streaming"``.
+        device: Target device.
+        dtype: Model dtype (default bfloat16).
+    """
+    import sys
     from pathlib import Path
 
-    from alpamayo_r1.models.alpamayo_r1_flashdrive import AlpamayoR1FlashDrive
-    from alpamayo_r1.utils.system.patches import patch_for_torch_compile
+    # ensure paroquant is importable
+    _pq = str(Path(__file__).resolve().parents[4] / "paroquant")
+    if _pq not in sys.path:
+        sys.path.insert(0, _pq)
+
+    from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+    from alpamayo_r1.models.patches import patch_for_torch_compile
+    from alpamayo_r1.models.paroquant_loading import (
+        replace_linears_with_rotate_linear,
+        _wrap_rotate_linears,
+    )
+    from inference_engine.model_executor.modules.rotation_linear import RotateLinearInt4
+    from inference_engine.model_executor.modules.qmodule import WQLinear
     import paroquant_kernels as _pq_kernels  # noqa: F401 — registers rotation ops
 
-    logger.info(f"Creating model architecture from {base_model_path}...")
-    model = AlpamayoR1FlashDrive.from_pretrained(base_model_path, dtype=dtype)
+    # ── 1. Create model architecture from base (weights will be discarded) ──
+    log.info(f"Creating model architecture from {base_model_path}...")
+    model = AlpamayoR1.from_pretrained(base_model_path, dtype=dtype)
 
+    # ── 2. Patch for torch.compile (no fusion — VLM has rotation) ──
     patch_for_torch_compile(model, mode=mode, fuse_qkv=False, fuse_gate_up=False)
 
-    logger.info("Creating RotateLinearInt4 shells...")
+    # ── 3. Replace VLM linears with RotateLinearInt4 shells ──
+    log.info("Creating RotateLinearInt4 shells...")
     replace_linears_with_rotate_linear(model, target="vlm", init_only=True)
 
+    # ── 4. Replace WQLinear inside each RotateLinearInt4 with MarlinW4A8Linear shells ──
     n_marlin = 0
     for _, mod in model.named_modules():
         if isinstance(mod, RotateLinearInt4) and isinstance(mod.qlinear, WQLinear):
             wq = mod.qlinear
             mod.qlinear = MarlinW4A8Linear(wq.in_features, wq.out_features, wq.group_size)
             n_marlin += 1
-    logger.info(f"Created {n_marlin} MarlinW4A8Linear shells")
+    log.info(f"Created {n_marlin} MarlinW4A8Linear shells")
 
+    # ── 5. Wrap RotateLinearInt4 with BF16 casting ──
     _wrap_rotate_linears(model, target="vlm")
     model._patched_for_compile = True
 
-    logger.info(f"Loading weights from {save_path}...")
+    # ── 6. Load saved state_dict ──
+    log.info(f"Loading weights from {save_path}...")
     save_dir = Path(save_path)
     if not save_dir.is_dir():
+        # save_path is a HuggingFace Hub repo ID — download to local cache
         from huggingface_hub import snapshot_download
         save_dir = Path(snapshot_download(save_path))
     safetensor_files = sorted(save_dir.glob("model*.safetensors"))
@@ -593,17 +435,19 @@ def load_w4a8_pretrained(
 
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if missing:
+        # Filter out expected missing (e.g. visual model internals)
         quant_missing = [k for k in missing if "qlinear" in k or "rotation" in k]
         if quant_missing:
-            logger.warning(f"Missing quantization keys ({len(quant_missing)}): {quant_missing[:5]}")
+            log.warning(f"Missing quantization keys ({len(quant_missing)}): {quant_missing[:5]}")
         else:
-            logger.info(f"Missing keys ({len(missing)}, all non-quant — OK)")
+            log.info(f"Missing keys ({len(missing)}, all non-quant — OK)")
     if unexpected:
-        logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+        log.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
     del sd
 
-    logger.info(f"Moving model to {device}...")
+    log.info(f"Moving model to {device}...")
     model = model.to(device)
     model.eval()
-    logger.info("W4A8 model loaded successfully")
+    log.info("W4A8 model loaded successfully")
     return model
+
