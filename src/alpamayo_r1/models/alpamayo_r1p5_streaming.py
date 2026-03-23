@@ -228,9 +228,15 @@ class StreamingAlpamayo1_5(ReasoningVLA):
 
             if self.kv_shift_mode == "block":
                 for i in range(self.num_views):
-                    new_kv_start = self.vision_start_end_ids_ranges[i][0][0]
+                    # Compute frame label length from gap between frame 0 and frame 1
+                    frame0_vs = self.vision_start_end_ids_ranges[i][0][0]
+                    frame0_ve_plus1 = self.vision_start_end_ids_ranges[i][0][1]
+                    label_len = self.vision_start_end_ids_ranges[i][1][0] - frame0_ve_plus1
+
+                    # Extend range to include frame 0's label
+                    new_kv_start = frame0_vs - label_len
                     new_kv_end = self.vision_start_end_ids_ranges[i][-2][1]
-                    old_kv_start = self.vision_start_end_ids_ranges[i][1][0]
+                    old_kv_start = frame0_ve_plus1  # = frame 1's label start
                     old_kv_end = self.vision_start_end_ids_ranges[i][-1][1]
 
                     key_cache[:, :, new_kv_start:new_kv_end, :].copy_(
@@ -540,20 +546,12 @@ class StreamingAlpamayo1_5(ReasoningVLA):
         attention_mask: torch.Tensor,
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
-        batch_size: int,
-        sparsity_ratio: float,
-        rope_mode: str,
         device: torch.device,
     ):
 
         # Launch the first non-streaming prefill
         pixels = pixel_values.type(self.vlm.model.visual.dtype)
-        visual_out = self.vlm.model.visual(pixels, grid_thw=image_grid_thw)
-        if len(visual_out) == 4:
-            image_embeds, deepstack_image_embeds, colsums, deepstack_colsums = visual_out
-        else:
-            image_embeds, deepstack_image_embeds = visual_out
-            colsums, deepstack_colsums = None, None
+        image_embeds, deepstack_image_embeds = self.vlm.model.visual(pixels, grid_thw=image_grid_thw)
 
         position_ids, rope_deltas = self.vlm.model.get_rope_index(
             input_ids, image_grid_thw, None, None
@@ -620,7 +618,6 @@ class StreamingAlpamayo1_5(ReasoningVLA):
         torch_compile: str = "max-autotune",
         fuse_qkv: bool = False,
         fuse_gate_up: bool = False,
-        *args: Any,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample trajectories with streaming VLM rollout.
@@ -685,7 +682,7 @@ class StreamingAlpamayo1_5(ReasoningVLA):
         
         if self.is_first_prefill:
             logger.info("First prefill: caching KV and returning (no streaming logs yet).")
-            self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, batch_size, sparsity_ratio, rope_mode, device)
+            self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, device)
             self._update_past_key_values()
             self.is_first_prefill = False
             return None, None, None

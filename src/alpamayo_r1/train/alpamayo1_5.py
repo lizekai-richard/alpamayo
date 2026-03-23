@@ -370,9 +370,15 @@ class Alpamayo1_5(ReasoningVLA):
 
             if self.kv_shift_mode == "block":
                 for i in range(self.num_views):
-                    new_kv_start = self.vision_start_end_ids_ranges[i][0][0]
+                    # Compute frame label length from gap between frame 0 and frame 1
+                    frame0_vs = self.vision_start_end_ids_ranges[i][0][0]
+                    frame0_ve_plus1 = self.vision_start_end_ids_ranges[i][0][1]
+                    label_len = self.vision_start_end_ids_ranges[i][1][0] - frame0_ve_plus1
+
+                    # Extend range to include frame 0's label
+                    new_kv_start = frame0_vs - label_len
                     new_kv_end = self.vision_start_end_ids_ranges[i][-2][1]
-                    old_kv_start = self.vision_start_end_ids_ranges[i][1][0]
+                    old_kv_start = frame0_ve_plus1  # = frame 1's label start
                     old_kv_end = self.vision_start_end_ids_ranges[i][-1][1]
 
                     key_cache[:, :, new_kv_start:new_kv_end, :].copy_(
