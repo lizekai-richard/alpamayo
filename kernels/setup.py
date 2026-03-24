@@ -19,8 +19,14 @@ def get_compute_capabilities():
             raise RuntimeError(
                 "GPUs with compute capability below 7.0 are not supported."
             )
-        cc_list.add(f"{major}.{minor}")
-        cc_list.add(f"{major}.{minor}a")
+        # Blackwell (sm_120): PTX from CUTLASS NVFP4 paths uses cvt.e2m1x2, which
+        # ptxas rejects for sm_120 but accepts for sm_120a. PyTorch only reports
+        # (12, minor), so skip the plain sm_XXX gencode and use the "a" variant only.
+        if major == 12:
+            cc_list.add(f"{major}.{minor}a")
+        else:
+            cc_list.add(f"{major}.{minor}")
+            cc_list.add(f"{major}.{minor}a")
     return cc_list
 
 
