@@ -192,6 +192,7 @@ class StreamingDataset(torch.utils.data.Dataset):
         self._vision_end_id = tokenizer.encode("<|vision_end|>")[0]
         self._endoftext_id = tokenizer.encode("<|endoftext|>")[0]
         self._traj_future_start_id = tokenizer.encode("<|traj_future_start|>")[0]
+        self.keep_frame_labels = getattr(args, "keep_frame_labels", True)
 
         with open(args.clip_list, "r") as f:
             self.clip_ids = json.load(f)
@@ -304,22 +305,27 @@ class StreamingDataset(torch.utils.data.Dataset):
         from input_ids / attention_mask and extracts only the last frame's
         pixel patches and grid entry.
 
+        Controlled by self.keep_frame_labels:
+        - True (Setting A): keep from sec-last [VE]+1 to last [VE], which
+          includes the frame label text (e.g. "frame 3 ") before [VS_last].
+        - False (Setting B): keep only [VS_last..VE_last], no frame labels.
+
+        Also keeps everything after the last overall [VE] (traj tokens, user prompt).
+
         All inputs have a leading batch dim of 1 (as stored in the dumped data).
         """
         ids = input_ids[0]  # [seq_len]
         vision_starts = (ids == self._vision_start_id).nonzero(as_tuple=True)[0]
         vision_ends = (ids == self._vision_end_id).nonzero(as_tuple=True)[0]
 
-        # Build keep mask: start with all False, then mark only the tokens we need.
-        # For each view, keep from after second-to-last [VE] to last [VE] (inclusive).
-        # In v1 (no text labels) this is just [VS_last..VE_last].
-        # In v1.5 this also includes the frame label text before [VS_last].
-        # Also keep everything after the last overall [VE] (traj tokens, user prompt).
         keep_mask = torch.zeros(input_ids.shape[1], dtype=torch.bool)
         for view_idx in range(self.num_views):
-            sec_last_gidx = view_idx * self.num_frames_per_view + (self.num_frames_per_view - 2)
             last_gidx = view_idx * self.num_frames_per_view + (self.num_frames_per_view - 1)
-            start = vision_ends[sec_last_gidx].item() + 1
+            if self.keep_frame_labels:
+                sec_last_gidx = view_idx * self.num_frames_per_view + (self.num_frames_per_view - 2)
+                start = vision_ends[sec_last_gidx].item() + 1
+            else:
+                start = vision_starts[last_gidx].item()
             end = vision_ends[last_gidx].item()
             keep_mask[start : end + 1] = True
         keep_mask[vision_ends[-1].item() + 1 :] = True
