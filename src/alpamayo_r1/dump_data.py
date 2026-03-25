@@ -74,6 +74,7 @@ def create_sliding_window_inputs(
     t0_us: int = 2_000_000,
     time_step_us: int = 100_000,
     avdi=None,
+    use_camera_indices: bool = False,
 ):
     """
     Create sliding window inputs for streaming inference.
@@ -105,7 +106,7 @@ def create_sliding_window_inputs(
         frames = data["image_frames"].flatten(0, 1)  # (4, 4, C, H, W) -> (16, C, H, W)
         is_prefill = True
 
-        messages = helper.create_message(frames)
+        messages = helper.create_message(frames, camera_indices=data["camera_indices"] if use_camera_indices else None)
         inputs = processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -259,6 +260,7 @@ def dump_data(args, model, processor, device=None):
             clip_id=clip_id,
             t0_us=args.t0_us,
             time_step_us=args.time_step_us,
+            use_camera_indices=args.use_camera_indices,
         )
         if _is_rank0():
             logger.info("Created %s windows", len(sliding_window_inputs))
@@ -310,6 +312,11 @@ if __name__ == "__main__":
         type=str,
         default="/mnt/moosefs-1/users/zekail/dumped_inputs",
         help="Dir to load sliding_window_inputs from (output of dump_sliding_window_inputs.py). Default: MooseFS path.",
+    )
+    parser.add_argument(
+        "--use_camera_indices",
+        action="store_true",
+        help="Use camera indices to create messages.",
     )
     args = parser.parse_args()
 

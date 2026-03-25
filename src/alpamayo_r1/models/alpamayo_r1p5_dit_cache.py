@@ -405,7 +405,7 @@ class Alpamayo1_5(ReasoningVLA):
         """
         self._torch_compile = torch_compile
         if self._torch_compile and not hasattr(self, "_patched_for_compile"):
-            patch_for_torch_compile(self, mode="non-streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+            patch_for_torch_compile(self, mode="non_streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
             self._patched_for_compile = True
 
         # Extract inputs
@@ -434,7 +434,7 @@ class Alpamayo1_5(ReasoningVLA):
         self.prefill_seq_length = input_ids.shape[1]
         self.max_cache_len = self.prefill_seq_length + max_new_tokens + self.num_action_tokens
 
-        # Initialize KV cache on first call
+        # Initialize KV cache on first call, reset on subsequent calls
         if self._past_key_values is None:
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
@@ -442,6 +442,7 @@ class Alpamayo1_5(ReasoningVLA):
                 max_batch_size=num_samples * batch_size,
                 offloading=False,
             )
+        self._past_key_values.reset()
 
         # ===== Encode =====
         image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)

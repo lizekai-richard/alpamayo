@@ -22,6 +22,8 @@ import sys
 
 import torch
 import torch.distributed as dist
+import alpamayo_r1
+sys.modules["alpamayo1_5"] = alpamayo_r1
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,10 +55,11 @@ def main():
     parser = argparse.ArgumentParser(description="Dump sliding_window_inputs for each clip to disk.")
     parser.add_argument("--clip_ids_file", type=str, required=True, help="JSON file with list of clip IDs.")
     parser.add_argument("--output_dir", type=str, required=True, help="Root dir for dumps: output_dir/<clip_id>/sliding_window_inputs.pt")
-    parser.add_argument("--model_path", type=str, default="nvidia/Alpamayo-R1-10B", help="Model path (for processor/tokenizer).")
+    parser.add_argument("--model_path", type=str, default="nvidia/Alpamayo-1.5-10B", help="Model path (for processor/tokenizer).")
     parser.add_argument("--num_steps", type=int, default=120)
     parser.add_argument("--t0_us", type=int, default=1_700_000)
     parser.add_argument("--time_step_us", type=int, default=100_000)
+    parser.add_argument("--use_camera_indices", action="store_true", help="Use camera indices to create messages.")
     args = parser.parse_args()
 
     rank, world_size = setup_distributed()
@@ -96,7 +99,9 @@ def main():
                 t0_us=args.t0_us,
                 time_step_us=args.time_step_us,
                 avdi=avdi,
+                use_camera_indices=args.use_camera_indices,
             )
+            logger.info("Rank %s: input_ids shape: %s", rank, sliding_window_inputs[0]["tokenized_data"]["input_ids"].shape)
             sliding_window_inputs_cpu = _to_cpu(sliding_window_inputs)
             os.makedirs(out_subdir, exist_ok=True)
             torch.save(sliding_window_inputs_cpu, out_file)

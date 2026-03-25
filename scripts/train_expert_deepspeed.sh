@@ -13,8 +13,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ---------- Configurable via env vars ----------
 NUM_GPUS="${NUM_GPUS:-8}"
 MASTER_PORT="${MASTER_PORT:-29501}"
-CONFIG="${CONFIG:-$REPO_ROOT/configs/train_expert.yaml}"
-DATA_DIR="${DATA_DIR:-/mnt/moosefs-1/users/zekail/dumped_inputs}"
+CONFIG="${CONFIG:-$REPO_ROOT/configs/alpamayo1_5/train_expert.yaml}"
+DATA_DIR="${DATA_DIR:-/mnt/moosefs-1/users/zekail/dumped_inputs_v1_5}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/checkpoints_expert}"
 
 # ---------- Setup ----------

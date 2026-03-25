@@ -37,7 +37,7 @@ FEATURES = [
 ]
 
 REPO_ID = 'nvidia/PhysicalAI-Autonomous-Vehicles'
-REVISION = '2ae73f49ffd2b5db43b404201beb7b92889f7afc'
+REVISION = '37a7cc2c868d684d0456b5412a7ec5d18597a96a'
 
 
 def get_chunks_to_download(num_chunks: int) -> list[int]:

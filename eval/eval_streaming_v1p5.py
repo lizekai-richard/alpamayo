@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Streaming evaluation for Alpamayo 1.5.
 
-Compares three streaming configurations:
+Compares two streaming configurations:
   A) keep_frame_labels=True  + kv_shift_mode=block
-  B) keep_frame_labels=True  + kv_shift_mode=vision_only
-  C) keep_frame_labels=False + kv_shift_mode=vision_only
+  B) keep_frame_labels=False + kv_shift_mode=vision_only
 
 Uses pre-dumped sliding window inputs (v1.5 format with camera/frame labels).
 Supports DDP: each GPU evaluates a subset of clips independently.
@@ -14,7 +13,7 @@ After all ranks finish, run with --aggregate to merge results and print summary.
 Usage:
     # Multi-GPU eval (8 GPUs)
     torchrun --nproc_per_node=8 eval/eval_streaming_v1p5.py \
-        --data-dir /path/to/dumped_eval_data_v1.5 --clip-list eval_clips.json
+        --data-dir /path/to/dumped_eval_data_v1p5 --clip-list eval_clips.json
 
     # Aggregate after all ranks finish
     python eval/eval_streaming_v1p5.py --aggregate --output-dir eval_results_v1p5
@@ -33,8 +32,7 @@ import torch
 import alpamayo_r1
 sys.modules["alpamayo1_5"] = alpamayo_r1
 
-from alpamayo_r1.train.alpamayo1_5 import Alpamayo1_5
-from alpamayo_r1.train.patches import patch_for_training
+from alpamayo_r1.models.alpamayo_r1p5_streaming import StreamingAlpamayo1_5
 from alpamayo_r1.helper import convert_to_streaming_window_v1p5, to_device
 
 logging.basicConfig(
@@ -45,9 +43,8 @@ log = logging.getLogger(__name__)
 
 
 CONFIGS = [
-    {"name": "labels+block",          "keep_frame_labels": True,  "kv_shift_mode": "block"},
-    {"name": "labels+vision_only",    "keep_frame_labels": True,  "kv_shift_mode": "vision_only"},
-    {"name": "no_labels+vision_only", "keep_frame_labels": False, "kv_shift_mode": "vision_only"},
+    {"name": "block+labels",          "keep_frame_labels": True,  "kv_shift_mode": "block"},
+    {"name": "vision_only+no_labels", "keep_frame_labels": False, "kv_shift_mode": "vision_only"},
 ]
 
 
@@ -174,7 +171,7 @@ def aggregate(output_dir):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Streaming eval for Alpamayo 1.5 (3 configs)")
+    ap = argparse.ArgumentParser(description="Streaming eval for Alpamayo 1.5 (A/B configs)")
     ap.add_argument("--model-path", default="nvidia/Alpamayo-1.5-10B")
     ap.add_argument("--data-dir", default="", help="Path to dumped v1.5 eval data")
     ap.add_argument("--clip-list", default="", help="JSON file with clip IDs")
@@ -213,8 +210,7 @@ def main():
     # --- Model ---
     if is_main:
         log.info(f"Loading model from {args.model_path}...")
-    model = Alpamayo1_5.from_pretrained(args.model_path, dtype=torch.bfloat16).to("cuda")
-    patch_for_training(model)
+    model = StreamingAlpamayo1_5.from_pretrained(args.model_path, dtype=torch.bfloat16).to("cuda")
     tokenizer = model.tokenizer
     vs_id = tokenizer.encode("<|vision_start|>")[0]
     ve_id = tokenizer.encode("<|vision_end|>")[0]

@@ -17,9 +17,9 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 GPUS_PER_NODE=4
 
 # Model paths
-TARGET_MODEL="~/models/Alpamayo-R1-10B"
-DATA_DIR="~/data/dflash_train/b8"
-OUTPUT_DIR="~/exp"
+TARGET_MODEL="nvidia/Alpamayo-1.5-10B"
+DATA_DIR="/mnt/moosefs-1/users/zekail/dflash_train/b8"
+OUTPUT_DIR="/mnt/moosefs-1/users/zekail/exp"
 
 # Training hyperparameters
 NUM_EPOCHS=15

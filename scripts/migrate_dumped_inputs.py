@@ -28,111 +28,55 @@ Default cameras (from load_physical_aiavdataset defaults, sorted by index):
 
 import argparse
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import torch
 from transformers import AutoTokenizer
 
-CAMERA_DISPLAY_NAMES = {
-    0: "Front left camera",
-    1: "Front camera",
-    2: "Front right camera",
-    3: "Rear left camera",
-    4: "Rear camera",
-    5: "Rear right camera",
-    6: "Front telephoto camera",
-}
-
-# Default camera_indices used during dump (sorted order from load_physical_aiavdataset)
-DEFAULT_CAMERA_INDICES = [0, 1, 2, 6]
-NUM_FRAMES_PER_CAMERA = 4
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from alpamayo_r1.helper import upgrade_window_to_v1p5
 
 
-def upgrade_window(
-    window: dict,
-    tokenizer: AutoTokenizer,
-    camera_indices: list[int],
-    vs_id: int,
-    ve_id: int,
-) -> dict:
-    """Insert camera-name and frame-index tokens into a single window's input_ids."""
-    tokenized = window["tokenized_data"]
-    input_ids = tokenized["input_ids"][0]  # [seq_len]
+_worker_tokenizer = None
 
-    vs_pos = (input_ids == vs_id).nonzero(as_tuple=True)[0].tolist()
-    ve_pos = (input_ids == ve_id).nonzero(as_tuple=True)[0].tolist()
 
-    n_cameras = len(camera_indices)
-    n_frames = NUM_FRAMES_PER_CAMERA
-    expected_images = n_cameras * n_frames
-    assert len(vs_pos) == expected_images, (
-        f"Expected {expected_images} image blocks, got {len(vs_pos)}"
-    )
-
-    prefix = input_ids[: vs_pos[0]].tolist()
-    suffix = input_ids[ve_pos[-1] + 1 :].tolist()
-
-    new_ids: list[int] = list(prefix)
-    for cam_i, cam_id in enumerate(camera_indices):
-        cam_name_ids = tokenizer.encode(
-            f"{CAMERA_DISPLAY_NAMES[cam_id]}: ", add_special_tokens=False
-        )
-        for frame_i in range(n_frames):
-            frame_ids = tokenizer.encode(f"frame {frame_i} ", add_special_tokens=False)
-            if frame_i == 0:
-                new_ids += cam_name_ids
-            new_ids += frame_ids
-            img_idx = cam_i * n_frames + frame_i
-            new_ids += input_ids[vs_pos[img_idx] : ve_pos[img_idx] + 1].tolist()
-    new_ids += suffix
-
-    new_input_ids = torch.tensor(new_ids, dtype=input_ids.dtype).unsqueeze(0)
-    new_attention_mask = torch.ones_like(new_input_ids)
-
-    new_tokenized = dict(tokenized)
-    new_tokenized["input_ids"] = new_input_ids
-    new_tokenized["attention_mask"] = new_attention_mask
-
-    result = {
-        "tokenized_data": new_tokenized,
-        "ego_history_xyz": window["ego_history_xyz"],
-        "ego_history_rot": window["ego_history_rot"],
-        "ego_future_xyz": window["ego_future_xyz"],
-        "ego_future_rot": window["ego_future_rot"],
-        "is_prefill": window["is_prefill"],
-        "timestamp": window["timestamp"],
-    }
-    if "output_token_ids" in window:
-        result["output_token_ids"] = window["output_token_ids"]
-    return result
+def _init_worker(tokenizer_name: str) -> None:
+    """Initializer for each worker process — loads its own tokenizer."""
+    global _worker_tokenizer
+    _worker_tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
 
 
 def migrate_clip(
     src_path: str,
     dst_path: str,
-    tokenizer: AutoTokenizer,
-    camera_indices: list[int],
-    vs_id: int,
-    ve_id: int,
+    tokenizer: AutoTokenizer | None = None,
 ) -> None:
+    if tokenizer is None:
+        tokenizer = _worker_tokenizer
     windows = torch.load(src_path, weights_only=False)
-    upgraded = [
-        upgrade_window(w, tokenizer, camera_indices, vs_id, ve_id) for w in windows
-    ]
+    upgraded = [upgrade_window_to_v1p5(w, tokenizer) for w in windows]
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
     torch.save(upgraded, dst_path)
+
+
+def _process_item(item):
+    """Top-level function so ProcessPoolExecutor can pickle it."""
+    src_path, dst_path, _clip_id = item
+    migrate_clip(src_path, dst_path)
+    return _clip_id
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Migrate v1 → v1.5 dumped inputs")
     parser.add_argument(
         "--src_dir",
-        default="/mnt/moosefs-1/users/zekail/dumped_eval_data",
+        default="/mnt/moosefs/users/zekail/dumped_inputs/",
         help="Source directory containing per-clip subdirectories",
     )
     parser.add_argument(
         "--dst_dir",
-        default="/mnt/moosefs-1/users/zekail/dumped_eval_data_v1.5",
+        default="/mnt/moosefs-1/users/zekail/dumped_inputs_v1_5/",
         help="Destination directory for migrated data",
     )
     parser.add_argument(
@@ -159,8 +103,6 @@ def main() -> None:
 
     print(f"Loading tokenizer: {args.tokenizer}")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-    vs_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
-    ve_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
 
     if args.clip_id:
         clip_ids = [args.clip_id]
@@ -173,7 +115,7 @@ def main() -> None:
     for clip_id in clip_ids:
         src_path = os.path.join(args.src_dir, clip_id, "sliding_window_inputs.pt")
         dst_path = os.path.join(args.dst_dir, clip_id, "sliding_window_inputs.pt")
-        if not os.path.exists(src_path) or os.path.exists(dst_path):
+        if not os.path.exists(src_path):
             skipped += 1
             continue
         tasks.append((src_path, dst_path, clip_id))
@@ -185,9 +127,9 @@ def main() -> None:
 
     ok, failed = 0, 0
     if args.workers <= 1:
-        for i, (src_path, dst_path, clip_id) in enumerate(tasks):
+        for src_path, dst_path, clip_id in tasks:
             try:
-                migrate_clip(src_path, dst_path, tokenizer, DEFAULT_CAMERA_INDICES, vs_id, ve_id)
+                migrate_clip(src_path, dst_path, tokenizer)
                 ok += 1
                 if ok % 50 == 0:
                     print(f"  [{ok}/{len(tasks)}] OK={ok} FAIL={failed}", flush=True)
@@ -195,19 +137,18 @@ def main() -> None:
                 failed += 1
                 print(f"  FAIL {clip_id}: {e}", flush=True)
     else:
-        def _process(item):
-            src_path, dst_path, clip_id = item
-            migrate_clip(src_path, dst_path, tokenizer, DEFAULT_CAMERA_INDICES, vs_id, ve_id)
-            return clip_id
-
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(_process, t): t[2] for t in tasks}
+        with ProcessPoolExecutor(
+            max_workers=args.workers,
+            initializer=_init_worker,
+            initargs=(args.tokenizer,),
+        ) as pool:
+            futures = {pool.submit(_process_item, t): t[2] for t in tasks}
             for future in as_completed(futures):
                 clip_id = futures[future]
                 try:
                     future.result()
                     ok += 1
-                    if ok % 50 == 0:
+                    if ok % 10 == 0:
                         print(f"  OK={ok} FAIL={failed} / {len(tasks)}", flush=True)
                 except Exception as e:
                     failed += 1

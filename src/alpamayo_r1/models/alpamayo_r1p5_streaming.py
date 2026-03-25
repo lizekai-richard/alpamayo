@@ -685,12 +685,7 @@ class StreamingAlpamayo1_5(ReasoningVLA):
             self._first_prefill(input_ids, attention_mask, pixel_values, image_grid_thw, device)
             self._update_past_key_values()
             self.is_first_prefill = False
-            return None, None, None
-
-        # Prepare input_ids for streaming (slice off system prompt for non-first prefill)
-        vision_start_token_id = self.tokenizer.encode("<|vision_start|>")[0]
-        first_vision_start = torch.where(input_ids == vision_start_token_id)[1][0].item()
-        input_ids = input_ids[:, first_vision_start:]
+            return None
 
         # ===== Encode =====
         image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)

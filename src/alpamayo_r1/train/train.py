@@ -41,10 +41,10 @@ def train(cfg):
         dist.init_process_group(backend="nccl", device_id=torch.device("cuda", local_rank))
     logger.info("Distributed setup done" if distributed else "Single-GPU mode")
 
-    # Load model to CPU; the Trainer moves to the correct device per rank.
+    # Always load from model_path (not checkpoint) to get the unpatched model.
+    # Training weights are restored later by Trainer._load_checkpoint.
     logger.info("Loading model...")
-    path = cfg.resume_from_checkpoint if cfg.resume_from_checkpoint else cfg.model_path
-    model = AutoModel.from_pretrained(path, dtype=torch.bfloat16)
+    model = AutoModel.from_pretrained(cfg.model_path, dtype=torch.bfloat16)
     model.set_training_stage(cfg.training_stage)
     logger.info(f"Model loaded, training_stage={cfg.training_stage}")
 

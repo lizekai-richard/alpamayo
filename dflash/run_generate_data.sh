@@ -11,6 +11,7 @@
 #   stride           - Sliding window stride (default: 1)
 #   block_sizes      - Comma-separated block sizes (default: 8,16)
 #   samples_per_clip - Number of t0 samples per clip (default: 3)
+#   context_len      - Number of consecutive hidden states per block (default: 1)
 #
 # Examples:
 #   # Generate at full resolution (default)
@@ -25,12 +26,13 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 START_CHUNK="${1:-0}"
-END_CHUNK="${2:-400}"
-OUTPUT_DIR="${3:-/data/dflash_train_1}"
+END_CHUNK="${2:-600}"
+OUTPUT_DIR="${3:-/mnt/moosefs-1/users/zekail/dflash_train_1}"
 TARGET_LAYERS="${4:-24,30,31,32,34}"
 STRIDE="${5:-1}"
 BLOCK_SIZES="${6:-8,16}"  # Support multiple: "8,16" or single: "16"
 SAMPLES_PER_CLIP="${7:-3}"  # Number of t0 samples per clip
+CONTEXT_LEN="${8:-8}"  # Number of consecutive hidden states per block
 NUM_GPUS=8
 
 TOTAL_CHUNKS=$((END_CHUNK - START_CHUNK))
@@ -53,6 +55,7 @@ echo "Target layers: [${TARGET_LAYERS}]"
 echo "Stride: ${STRIDE}"
 echo "Block sizes: [${BLOCK_SIZES}]"
 echo "Samples per clip: ${SAMPLES_PER_CLIP}"
+echo "Context len: ${CONTEXT_LEN}"
 echo "========================================"
 
 mkdir -p "${OUTPUT_DIR}"
@@ -84,6 +87,7 @@ for rank in {0..7}; do
         --stride ${STRIDE} \
         --block-sizes "${BLOCK_SIZES}" \
         --num-samples-per-clip ${SAMPLES_PER_CLIP} \
+        --context-len ${CONTEXT_LEN} \
         --full-vocab \
         2>&1 | tee "${OUTPUT_DIR}/rank${rank}.log" &
 done

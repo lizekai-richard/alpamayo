@@ -39,15 +39,88 @@ CAMERA_DISPLAY_NAMES = {
 }
 
 
-def create_message(frames: torch.Tensor):
-    """Construct the message using images and cot."""
+def _build_image_content(
+    frames: torch.Tensor,
+    camera_indices: torch.Tensor | None = None,
+    num_frames_per_camera: int = 4,
+) -> list[dict[str, Any]]:
+    """Build the image portion of the user message content.
+
+    When ``camera_indices`` is provided, each image is annotated with
+    a camera display name (on the first frame of each camera group) and
+    a frame index, matching the format used during model training.
+
+    Args:
+        frames: Flattened camera frames, shape ``(N_total, C, H, W)``.
+        camera_indices: Per-camera indices, shape ``(N_cameras,)``.
+            When provided, ``N_total`` must equal
+            ``N_cameras * num_frames_per_camera``.
+        num_frames_per_camera: Number of temporal frames per camera.
+    """
+    if camera_indices is None:
+        return [{"type": "image", "image": frame} for frame in frames]
+
+    expanded_cam_ids = camera_indices.repeat_interleave(num_frames_per_camera)
+    content: list[dict[str, Any]] = []
+    prev_cam_id = None
+    frame_idx = 0
+    for i, frame in enumerate(frames):
+        cam_id = expanded_cam_ids[i].item()
+        if prev_cam_id is not None and cam_id != prev_cam_id:
+            frame_idx = 0
+        if frame_idx == 0:
+            cam_name = CAMERA_DISPLAY_NAMES.get(cam_id, f"Camera {cam_id}")
+            content.append({"type": "text", "text": f"{cam_name}: "})
+        content.append({"type": "text", "text": f"frame {frame_idx} "})
+        content.append({"type": "image", "image": frame})
+        prev_cam_id = cam_id
+        frame_idx += 1
+    return content
+
+
+def create_message(
+    frames: torch.Tensor,
+    camera_indices: torch.Tensor | None = None,
+    num_frames_per_camera: int = 4,
+    nav_text: str | None = None,
+    use_nav_prompt: bool = False,
+):
+    """Construct the chat message for model inference.
+
+    Args:
+        frames: Camera image tensors, shape ``(N_total, C, H, W)``
+            (typically ``data["image_frames"].flatten(0, 1)``).
+        camera_indices: Per-camera indices from the dataset, shape
+            ``(N_cameras,)``. When provided, camera display names and
+            frame numbers are included before each image to match the
+            training format. Pass ``data["camera_indices"]``.
+        num_frames_per_camera: Number of temporal frames per camera
+            (default 4, matching the dataset loader).
+        nav_text: Optional navigation instruction string, e.g.
+            ``"Turn left onto De La Cruz Boulevard in 40m"``.
+            When provided, the model conditions its trajectory prediction
+            on this instruction.
+        use_nav_prompt: When ``True``, use the nav-style prompt
+            (``"output the future trajectory."``) even if ``nav_text``
+            is ``None``. Useful for constructing a fair no-nav baseline
+            in nav-conditioned comparisons.
+    """
     assert frames.ndim == 4, f"{frames.ndim=}, expected (N, C, H, W)"
 
-    # NOTE: we expand the padding tokens to match training, so we can directly apply native processor from VLM.
     num_traj_token = 48
     hist_traj_placeholder = (
         f"<|traj_history_start|>{'<|traj_history|>' * num_traj_token}<|traj_history_end|>"
     )
+
+    route_section = ""
+    if nav_text is not None:
+        route_section = f"<|route_start|>{nav_text}<|route_end|>"
+
+    prompt_text = "output the chain-of-thought reasoning of the driving process, then output the future trajectory."
+
+    user_text = f"{hist_traj_placeholder}{route_section}{prompt_text}"
+
+    image_content = _build_image_content(frames, camera_indices, num_frames_per_camera)
 
     return [
         {
@@ -61,22 +134,56 @@ def create_message(frames: torch.Tensor):
         },
         {
             "role": "user",
-            "content": [{"type": "image", "image": frame} for frame in frames]
-            + [
+            "content": image_content + [{"type": "text", "text": user_text}],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "<|cot_start|>"}],
+        },
+    ]
+
+
+def create_vqa_message(
+    frames: torch.Tensor,
+    question: str,
+    camera_indices: torch.Tensor | None = None,
+    num_frames_per_camera: int = 4,
+):
+    """Construct the chat message for model inference.
+
+    Args:
+        frames: Camera image tensors, shape ``(N_total, C, H, W)``
+            (typically ``data["image_frames"].flatten(0, 1)``).
+        question: The question string.
+        camera_indices: Per-camera indices from the dataset, shape
+            ``(N_cameras,)``. When provided, camera display names and
+            frame numbers are included before each image to match the
+            training format. Pass ``data["camera_indices"]``.
+        num_frames_per_camera: Number of temporal frames per camera
+            (default 4, matching the dataset loader).
+    """
+    assert frames.ndim == 4, f"{frames.ndim=}, expected (N, C, H, W)"
+    user_text = f"<|question_start|>{question}<|question_end|>"
+
+    image_content = _build_image_content(frames, camera_indices, num_frames_per_camera)
+
+    return [
+        {
+            "role": "system",
+            "content": [
                 {
                     "type": "text",
-                    "text": f"{hist_traj_placeholder}output the chain-of-thought reasoning of the driving process, then output the future trajectory.",
+                    "text": "You are a driving assistant that generates safe and accurate actions.",
                 }
             ],
         },
         {
+            "role": "user",
+            "content": image_content + [{"type": "text", "text": user_text}],
+        },
+        {
             "role": "assistant",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "<|cot_start|>",
-                }
-            ],
+            "content": [{"type": "text", "text": "<|answer_start|>"}],
         },
     ]
 
@@ -315,6 +422,38 @@ def create_avdi(cache_dir=None):
         return physical_ai_av.PhysicalAIAVDatasetInterface(cache_dir=cache_dir)
 
 
+def _build_v1p5_label_cache(
+    tokenizer: AutoTokenizer,
+    camera_indices: list[int],
+    num_frames_per_camera: int,
+) -> tuple[list[list[list[int]]], int, int]:
+    """Pre-compute all label token ids and special token ids once."""
+    vs_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    ve_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    # labels[cam_i][frame_i] = list of token ids
+    labels: list[list[list[int]]] = []
+    for cam_id in camera_indices:
+        cam_display = CAMERA_DISPLAY_NAMES.get(cam_id, f"Camera {cam_id}")
+        cam_labels: list[list[int]] = []
+        for frame_i in range(num_frames_per_camera):
+            if frame_i == 0:
+                ids = tokenizer.encode(
+                    f"{cam_display}: frame {frame_i} ",
+                    add_special_tokens=False,
+                )
+            else:
+                ids = tokenizer.encode(
+                    f"frame {frame_i} ", add_special_tokens=False,
+                )
+            cam_labels.append(ids)
+        labels.append(cam_labels)
+    return labels, vs_id, ve_id
+
+
+# Module-level cache: tokenizer id(obj) → (labels, vs_id, ve_id)
+_v1p5_label_cache: dict[int, tuple[list[list[list[int]]], int, int]] = {}
+
+
 def upgrade_window_to_v1p5(
     window: dict,
     tokenizer: AutoTokenizer,
@@ -344,11 +483,15 @@ def upgrade_window_to_v1p5(
     if camera_indices is None:
         camera_indices = [0, 1, 2, 6]
 
+    cache_key = id(tokenizer)
+    if cache_key not in _v1p5_label_cache:
+        _v1p5_label_cache[cache_key] = _build_v1p5_label_cache(
+            tokenizer, camera_indices, num_frames_per_camera,
+        )
+    labels, vs_id, ve_id = _v1p5_label_cache[cache_key]
+
     tokenized = window["tokenized_data"]
     input_ids = tokenized["input_ids"][0]  # [seq_len]
-
-    vs_id = tokenizer.convert_tokens_to_ids("<|vision_start|>")
-    ve_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
 
     vs_pos = (input_ids == vs_id).nonzero(as_tuple=True)[0].tolist()
     ve_pos = (input_ids == ve_id).nonzero(as_tuple=True)[0].tolist()
@@ -362,16 +505,9 @@ def upgrade_window_to_v1p5(
     suffix = input_ids[ve_pos[-1] + 1 :].tolist()
 
     new_ids: list[int] = list(prefix)
-    for cam_i, cam_id in enumerate(camera_indices):
-        cam_name_ids = tokenizer.encode(
-            f"{CAMERA_DISPLAY_NAMES.get(cam_id, f'Camera {cam_id}')}: ",
-            add_special_tokens=False,
-        )
+    for cam_i in range(len(camera_indices)):
         for frame_i in range(num_frames_per_camera):
-            frame_ids = tokenizer.encode(f"frame {frame_i} ", add_special_tokens=False)
-            if frame_i == 0:
-                new_ids += cam_name_ids
-            new_ids += frame_ids
+            new_ids += labels[cam_i][frame_i]
             img_idx = cam_i * num_frames_per_camera + frame_i
             new_ids += input_ids[vs_pos[img_idx] : ve_pos[img_idx] + 1].tolist()
     new_ids += suffix

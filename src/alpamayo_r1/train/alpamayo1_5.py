@@ -153,7 +153,7 @@ class Alpamayo1_5(ReasoningVLA):
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
         self.keep_frame_labels = True
-        self.kv_shift_mode = "block"  # "block" or "vision_only"
+        self.kv_shift_mode = "vision_only"  # "block" or "vision_only"
     
     def reset_streaming_state(self):
         """Reset all streaming state between batches."""

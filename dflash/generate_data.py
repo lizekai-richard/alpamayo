@@ -40,12 +40,16 @@ from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
-from alpamayo_r1.models.patches import patch_for_torch_compile
+from patches import patch_for_torch_compile
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
+from alpamayo_r1.models.token_utils import to_special_token
 import physical_ai_av
+import alpamayo_r1
+sys.modules["alpamayo1_5"] = alpamayo_r1
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,7 +69,7 @@ NUM_DRAFT_LAYERS = 5
 
 # Default target layers: store a superset for flexible layer selection during training
 # Includes early (0), middle (16, 20, 24, 28), and late layers (30, 31, 32, 34, 35)
-DEFAULT_TARGET_LAYER_IDS = [0, 16, 20, 24, 28, 30, 31, 32, 34, 35]
+DEFAULT_TARGET_LAYER_IDS = [24, 30, 31, 32, 34]
 
 # Timing constants (in microseconds)
 HISTORY_DURATION_US = 1_600_000  # 1.6s history required
@@ -154,7 +158,7 @@ def extract_hidden_states_and_tokens(
         input_ids: (seq_len,) - full sequence (input + generated)
         generation_start_idx: int - where generation starts
     """
-    messages = helper.create_message(data["image_frames"].flatten(0, 1))
+    messages = helper.create_message(data["image_frames"].flatten(0, 1), camera_indices=data["camera_indices"])
 
     # Get resolution settings from processor (set by helper.get_processor)
     min_pixels = getattr(processor, '_min_pixels', helper.MIN_PIXELS)
@@ -198,18 +202,22 @@ def extract_hidden_states_and_tokens(
     # Get full input_ids (input + generated CoC + <|cot_end|>)
     # The CoC text is in extra["cot"]
     cot_text = extra["cot"][0][0][0] if extra.get("cot") is not None else ""
-    cot_tokens = model.tokenizer(cot_text, add_special_tokens=False, return_tensors="pt")["input_ids"]
+    cot_tokens = model.tokenizer(cot_text, add_special_tokens=False, return_tensors="pt")["input_ids"] 
 
     # Get <|cot_end|> token ID to append after CoC text
     # This teaches the drafter when to stop generating CoC
     cot_end_token_id = model.tokenizer.convert_tokens_to_ids("<|cot_end|>")
     cot_end_token = torch.tensor([[cot_end_token_id]], dtype=cot_tokens.dtype)
 
-    # Combine input + CoC tokens + <|cot_end|>
+    traj_future_start_token_id = model.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
+    traj_future_start_token = torch.tensor([[traj_future_start_token_id]], dtype=cot_tokens.dtype)
+
+    # Combine input + CoC tokens + <|cot_end|> + <|traj_future_start|>
     full_input_ids = torch.cat([
         inputs["input_ids"].to(device),
         cot_tokens.to(device),
         cot_end_token.to(device),
+        traj_future_start_token.to(device),
     ], dim=-1)
 
     # Use forward hooks to capture hidden states from target layers.
@@ -293,6 +301,7 @@ def create_training_blocks(
     generation_start_idx: int,
     block_size: int,
     stride: int = 1,
+    context_len: int = 1,
     mask_extended_vocab: bool = True,
     keep_token_ids: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -304,11 +313,12 @@ def create_training_blocks(
         generation_start_idx: where generation starts (we want blocks that predict generated tokens)
         block_size: number of future tokens per block
         stride: step size for sliding window
+        context_len: number of consecutive hidden states per block (1 = original behavior)
         mask_extended_vocab: If True, mask trajectory tokens. If False, train on full vocab.
         keep_token_ids: List of token IDs to NOT mask (e.g., special tokens like <|cot_end|>)
 
     Returns:
-        block_hidden: (num_blocks, hidden_dim) - target model hidden states
+        block_hidden: (num_blocks, context_len, hidden_dim) - target model hidden states
         block_tokens: (num_blocks, block_size) - actual token IDs (for noise embedding)
         block_labels: (num_blocks, block_size) - labels (optionally masked)
     """
@@ -322,9 +332,9 @@ def create_training_blocks(
     # Start at generation boundary: future_tokens[0] = first generated token
     # This ensures we only train on generated tokens, not prompt tokens
     # At pos = generation_start_idx - 1:
-    #   - hidden_states[pos] = context from last prompt position
-    #   - future_tokens = input_ids[pos+1 : pos+1+block_size] = all generated tokens
-    start_pos = generation_start_idx - 1
+    #   - hidden_states[pos-context_len+1 : pos+1] = context hidden states
+    #   - future_tokens = input_ids[pos+1 : pos+1+block_size] = generated tokens
+    start_pos = max(generation_start_idx - 1, context_len - 1)
     end_pos = seq_len - block_size
 
     # Pad if sequence too short to create any blocks
@@ -353,7 +363,7 @@ def create_training_blocks(
     block_labels = []
 
     for pos in positions:
-        block_hidden.append(hidden_states[pos])
+        block_hidden.append(hidden_states[pos - context_len + 1 : pos + 1])
         tokens = input_ids[pos + 1 : pos + 1 + block_size]
         block_tokens.append(tokens)
         # Optionally mask extended vocab tokens (trajectory tokens > 151936)
@@ -374,19 +384,19 @@ def main():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="/models/Alpamayo-R1-10B",
+        default="nvidia/Alpamayo-1.5-10B",
         help="Path to Alpamayo model",
     )
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default="/data/physicalai_av/hf_cache",
+        default="/mnt/moosefs-1/users/zekail/physicalai_av/hf_cache",
         help="HuggingFace cache directory with downloaded chunks",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/data/dflash_train",
+        default="/mnt/moosefs-1/users/zekail/dflash_train",
         help="Output directory for distillation data",
     )
     parser.add_argument(
@@ -441,6 +451,12 @@ def main():
         type=str,
         default="8,16",
         help="Comma-separated block sizes to generate (e.g., '8,16')",
+    )
+    parser.add_argument(
+        "--context-len",
+        type=int,
+        default=1,
+        help="Number of consecutive hidden states per training block (default: 1)",
     )
     parser.add_argument(
         "--num-samples-per-clip",
@@ -508,12 +524,13 @@ def main():
     # Get special token IDs to keep (not mask) during training
     # <|cot_end|> must be trained so the model learns when to stop CoC generation
     cot_end_id = model.tokenizer.convert_tokens_to_ids("<|cot_end|>")
-    keep_token_ids = [cot_end_id]
-    logger.info(f"[Rank {args.rank}] Keep token IDs (not masked): {keep_token_ids} (<|cot_end|>={cot_end_id})")
+    traj_future_start_id = model.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
+    keep_token_ids = [cot_end_id, traj_future_start_id]
+    logger.info(f"[Rank {args.rank}] Keep token IDs (not masked): {keep_token_ids} (<|cot_end|>={cot_end_id}, <|traj_future_start|>={traj_future_start_id})")
 
     # Load dataset interface
     # Use specific revision to avoid issues when HuggingFace dataset is updated
-    DATASET_REVISION = "2ae73f49ffd2b5db43b404201beb7b92889f7afc"
+    DATASET_REVISION = "37a7cc2c868d684d0456b5412a7ec5d18597a96a"
     logger.info(f"[Rank {args.rank}] Loading dataset interface (revision: {DATASET_REVISION})...")
     avdi = physical_ai_av.PhysicalAIAVDatasetInterface(
         cache_dir=args.cache_dir,
@@ -536,7 +553,7 @@ def main():
 
     logger.info(f"[Rank {args.rank}] Processing {len(clip_ids)} clips from chunks {list(chunk_range)}")
     logger.info(f"[Rank {args.rank}] Samples per clip: {args.num_samples_per_clip}, Seed: {args.seed}")
-    logger.info(f"[Rank {args.rank}] Block sizes: {block_sizes}, Stride: {args.stride}")
+    logger.info(f"[Rank {args.rank}] Block sizes: {block_sizes}, Stride: {args.stride}, Context len: {args.context_len}")
     logger.info(f"[Rank {args.rank}] Target layers: {target_layer_ids}")
     logger.info(f"[Rank {args.rank}] Full vocab (no masking): {args.full_vocab}")
 
@@ -606,6 +623,7 @@ def main():
                             gen_start,
                             block_size=bs,
                             stride=args.stride,
+                            context_len=args.context_len,
                             mask_extended_vocab=not args.full_vocab,
                             keep_token_ids=keep_token_ids,
                         )
@@ -630,7 +648,7 @@ def main():
 
                 except Exception as e:
                     failed_clips.append({"clip_id": clip_id, "t0_us": t0_us, "sample_idx": sample_idx, "error": str(e)})
-                    logger.warning(f"[Rank {args.rank}] Failed {clip_id} t0={t0_us/1e6:.2f}s: {e}")
+                    logger.warning(f"[Rank {args.rank}] Failed {clip_id} t0={t0_us/1e6:.2f}s: {e}", exc_info=False)
 
             # Update progress bar with total blocks across all configs
             total = sum(acc["total_blocks"] for acc in accumulators.values())
@@ -660,6 +678,7 @@ def main():
             "num_shards": acc["shard_idx"],
             "total_blocks": acc["total_blocks"],
             "block_size": bs,
+            "context_len": args.context_len,
             "stride": args.stride,
             "target_layer_ids": target_layer_ids,
             "num_target_layers": NUM_TARGET_LAYERS,

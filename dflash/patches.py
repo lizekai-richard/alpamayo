@@ -5,11 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformers.models.qwen3_vl.modeling_qwen3_vl as qwen3vl
 import transformers.cache_utils as cache_utils
+from transformers.cache_utils import Cache
 from transformers.utils import is_torchdynamo_compiling
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
-from transformers.models.qwen3_vl.modeling_qwen3_vl import rotate_half, apply_rotary_pos_emb
+from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb, apply_rotary_pos_emb_vision
+from transformers.models.qwen3_vl.modeling_qwen3_vl import rotate_half
 from transformers.integrations.flex_attention import flex_attention_forward
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 import logging
@@ -18,7 +19,10 @@ import gc
 logger = logging.getLogger(__name__)
 
 
+# ==================== Custom StaticCache with batch expansion ====================
+
 class StaticLayer(cache_utils.CacheLayerMixin):
+    """Single layer of static KV cache with batch expansion support."""
 
     def __init__(self, max_cache_len, max_batch_size=1):
         super().__init__()
@@ -26,9 +30,8 @@ class StaticLayer(cache_utils.CacheLayerMixin):
         self._max_batch_size = max_batch_size
 
     def lazy_initialization(self, key_states, value_states):
-
         self.dtype, self.device = key_states.dtype, key_states.device
-        # Use pre-configured max_batch_size (allows pre-allocating for multi-sample decode)
+        # Pre-allocate for max_batch_size (allows multi-sample decode)
         self.max_batch_size = max(self._max_batch_size, key_states.shape[0])
         self.num_heads = key_states.shape[1]
         self.v_head_dim = value_states.shape[-1]
@@ -44,10 +47,7 @@ class StaticLayer(cache_utils.CacheLayerMixin):
             dtype=self.dtype,
             device=self.device,
         )
-        # Note: `mark_static_address` is used to tag the cache as a fixed data pointer, preventing compiled graph
-        # breaks when updating the cache. However, it is not supported when tracing the graph, so we skip it in this case.
-        # As prefill should never be compiled, this is not an issue and it will still be run (except when users compile
-        # prefill explicitly, but this should be avoided!)
+        # Mark as static to prevent graph breaks during cache updates
         if not is_torchdynamo_compiling():
             torch._dynamo.mark_static_address(self.keys)
             torch._dynamo.mark_static_address(self.values)
@@ -64,20 +64,13 @@ class StaticLayer(cache_utils.CacheLayerMixin):
             self.keys[1:].copy_(self.keys[:1].expand(self.max_batch_size - 1, -1, -1, -1))
             self.values[1:].copy_(self.values[:1].expand(self.max_batch_size - 1, -1, -1, -1))
 
-    def update(
-        self,
-        key_states,
-        value_states,
-        cache_kwargs=None,
-    ):
-        """
-        Update the key and value caches in-place.
+    def update(self, key_states, value_states, cache_kwargs=None):
+        """Update the key and value caches in-place.
 
         Handles batch size mismatch:
           - src_batch < dst_batch (prefill batch=1 into multi-batch cache): write batch 0 only
           - src_batch == dst_batch (decode with num_samples): normal update
         """
-        # Lazy initialization
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
 
@@ -86,7 +79,6 @@ class StaticLayer(cache_utils.CacheLayerMixin):
             cache_position if cache_position is not None else torch.arange(key_states.shape[-2], device=self.device)
         )
 
-        # Update the cache
         src_batch_size = key_states.shape[0]
         dst_batch_size = self.keys.shape[0]
 
@@ -102,21 +94,26 @@ class StaticLayer(cache_utils.CacheLayerMixin):
             return self.keys, self.values
 
     def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
-        """Return the length and offset of the cache, used to generate the attention mask"""
-        kv_offset = 0
-        kv_length = self.max_cache_len
-        return kv_length, kv_offset
+        """Return the length and offset of the cache for attention mask generation."""
+        return self.max_cache_len, 0
 
     def get_seq_length(self) -> int:
         """Returns the sequence length of the cached states."""
         return (self.keys[0, 0].any(dim=-1)).sum() if self.is_initialized else 0
 
     def get_max_cache_shape(self) -> int:
-        """Return the maximum cache shape of the cache"""
+        """Return the maximum cache shape."""
         return self.max_cache_len
 
 
 class StaticCache(cache_utils.Cache):
+    """Static KV cache with support for batch expansion (num_traj_samples > 1).
+
+    This cache pre-allocates memory for a fixed max_batch_size and max_cache_len.
+    After prefill with batch=1, call expand_batch() to replicate the KV cache
+    to all batch slots before multi-sample decoding.
+    """
+
     def __init__(
         self,
         config,
@@ -140,6 +137,13 @@ class StaticCache(cache_utils.Cache):
             if layer.is_initialized:
                 layer.expand_batch()
 
+    def reset(self):
+        """Reset the cache by zeroing all KV tensors."""
+        for layer in self.layers:
+            if layer.is_initialized:
+                layer.keys.zero_()
+                layer.values.zero_()
+
 
 class QKVLinear(nn.Module):
     """Fused Query-Key-Value projection for multi-head attention.
@@ -152,11 +156,11 @@ class QKVLinear(nn.Module):
     
     def __init__(
         self,
-        hidden_size,
-        head_size,
-        total_num_heads,
-        total_num_kv_heads=None,
-        bias=False,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int | None = None,
+        bias: bool = False,
     ):
         """Initialize fused QKV projection.
         
@@ -178,13 +182,15 @@ class QKVLinear(nn.Module):
 
         # Output size: Q heads + K heads + V heads
         output_size = (self.num_heads + 2 * self.num_kv_heads) * self.head_size
+        self.in_features = hidden_size
+        self.out_features = output_size
         self.weight = nn.Parameter(torch.empty(output_size, hidden_size))
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
         else:
             self.register_parameter("bias", None)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project input to Q, K, V tensors.
         
         Args:
@@ -228,9 +234,9 @@ class MergedColumnLinear(nn.Module):
     
     def __init__(
         self,
-        input_size,
-        output_sizes,
-        bias=False,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = False,
     ):
         """Initialize merged linear layer.
         
@@ -242,15 +248,17 @@ class MergedColumnLinear(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.output_sizes = list(output_sizes)
-        
+
         output_size = sum(self.output_sizes)
+        self.in_features = input_size
+        self.out_features = output_size
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
         else:
             self.register_parameter("bias", None)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Project and split input.
         
         Args:
@@ -264,7 +272,7 @@ class MergedColumnLinear(nn.Module):
         
 
 class Qwen3VLVisionPatchEmbed(qwen3vl.Qwen3VLVisionPatchEmbed):
-    def __init__(self, config):
+    def __init__(self, config) -> None:
         nn.Module.__init__(self)
         self.in_features = (
             config.in_channels * config.temporal_patch_size * config.patch_size**2
@@ -279,18 +287,18 @@ class Qwen3VLVisionPatchEmbed(qwen3vl.Qwen3VLVisionPatchEmbed):
 
         self.proj._register_load_state_dict_pre_hook(convert_conv3d_weights, with_module=False)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.proj(hidden_states.reshape(-1, self.in_features))
 
 
 class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
     def forward(
         self,
-        hidden_states,
-        cu_seqlens,
-        position_embeddings,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         **kwargs,
-    ):
+    ) -> torch.Tensor:
         seq_len = hidden_states.shape[0]
 
         if not hasattr(self, "_num_chunks"):
@@ -307,34 +315,11 @@ class Qwen3VLVisionAttention(qwen3vl.Qwen3VLVisionAttention):
         value = value.reshape(self._num_chunks, chunk_size, self.num_heads, -1).transpose(1, 2)
 
         output = F.scaled_dot_product_attention(query, key, value, scale=self.scaling)
-        output = self.proj(output.transpose(1, 2).reshape(seq_len, -1))
-
-        return output
-
-
-class Qwen3VLVisionBlock(qwen3vl.Qwen3VLVisionBlock):
-    def forward(
-        self,
-        hidden_states,
-        cu_seqlens,
-        rotary_pos_emb=None,
-        position_embeddings=None,
-        **kwargs,
-    ): 
-        attn_output = self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = hidden_states + attn_output
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
+        return self.proj(output.transpose(1, 2).reshape(seq_len, -1))
 
 
 class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
-    def _init_caches(self, hidden_states, grid_thw):
+    def _init_caches(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> None:
         seq_len = hidden_states.size(0)
 
         self._cached_pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
@@ -347,10 +332,10 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
         cu_seqlens = cu_seqlens.cumsum(dim=0, dtype=torch.int32)
         self._cached_cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-    def forward(self, hidden_states, grid_thw, **kwargs):
+    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
         hidden_states = self.patch_embed(hidden_states)
 
-        if not hasattr(self, "_cached_pos_embeds"):
+        if not hasattr(self, "_cached_pos_embeds") or self._cached_pos_embeds.shape[0] != hidden_states.shape[0]:
             self._init_caches(hidden_states, grid_thw)
 
         hidden_states = (hidden_states + self._cached_pos_embeds).reshape(hidden_states.size(0), -1)
@@ -360,11 +345,12 @@ class Qwen3VLVisionModel(qwen3vl.Qwen3VLVisionModel):
             hidden_states = block(
                 hidden_states,
                 cu_seqlens=self._cached_cu_seqlens,
-                position_embeddings=self._cached_position_embeddings
+                position_embeddings=self._cached_position_embeddings,
             )
             if layer_idx in self.deepstack_visual_indexes:
                 merger_idx = self.deepstack_visual_indexes.index(layer_idx)
                 deepstack_features.append(self.deepstack_merger_list[merger_idx](hidden_states))
+
         return self.merger(hidden_states), deepstack_features
 
 
@@ -379,11 +365,14 @@ def apply_mrope_emb_single(tensor, cos, sin, unsqueeze_dim=1):
 class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
     """Patched Qwen3VL Text Attention with optional fused QKV projection."""
 
-    def __init__(self, config, layer_idx, mode="streaming", fuse_qkv=False):
+    def __init__(self, config, layer_idx: int, mode: str = "streaming", fuse_qkv: bool = False):
         super().__init__(config, layer_idx)
 
-        self.fuse_qkv = fuse_qkv
         self.mode = mode
+        self.fuse_qkv = fuse_qkv
+        # HF Qwen3VL doesn't set these as instance attributes
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
 
         if fuse_qkv:
             # Replace separate q/k/v projections with fused QKVLinear
@@ -436,7 +425,7 @@ class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
                 state_dict[f"{prefix}qkv_proj.bias"] = qkv_bias
 
                 del q_bias, k_bias, v_bias
-            
+
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -453,12 +442,20 @@ class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         if self.fuse_qkv:
-            # QKVLinear returns (q, k, v) each with shape [B, H, L, D]
-            query_states, key_states, value_states = self.qkv_proj(hidden_states)
-
-            # Apply norms: transpose to [B, L, H, D] for norm, then back to [B, H, L, D]
-            query_states = self.q_norm(query_states.transpose(1, 2)).transpose(1, 2)
-            key_states = self.k_norm(key_states.transpose(1, 2)).transpose(1, 2)
+            result = self.qkv_proj(hidden_states)
+            if isinstance(result, tuple):
+                # QKVLinear returns (q, k, v) each with shape [B, H, L, D]
+                query_states, key_states, value_states = result
+                query_states = self.q_norm(query_states.transpose(1, 2)).transpose(1, 2)
+                key_states = self.k_norm(key_states.transpose(1, 2)).transpose(1, 2)
+            else:
+                # WQLinear returns single tensor [B, L, q+k+v], split manually
+                q_size = self.num_heads * self.head_dim
+                kv_size = self.num_kv_heads * self.head_dim
+                q_out, k_out, v_out = result.split([q_size, kv_size, kv_size], dim=-1)
+                query_states = self.q_norm(q_out.view(*input_shape, self.num_heads, self.head_dim)).transpose(1, 2)
+                key_states = self.k_norm(k_out.view(*input_shape, self.num_kv_heads, self.head_dim)).transpose(1, 2)
+                value_states = v_out.view(*input_shape, self.num_kv_heads, self.head_dim).transpose(1, 2)
         else:
             # Original separate q/k/v projections
             query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
@@ -469,8 +466,8 @@ class Qwen3VLTextAttention(qwen3vl.Qwen3VLTextAttention):
 
         if self.mode == "streaming":
             cos_q, sin_q = cos[:, cache_position, :], sin[:, cache_position, :]
-        
-        if self.mode == "non_streaming":
+
+        if self.mode == "non-streaming":
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # Store the un-roped keys and values in cache
@@ -538,7 +535,12 @@ class Qwen3VLTextMLP(qwen3vl.Qwen3VLTextMLP):
 
     def forward(self, x):
         if self.fuse_gate_up:
-            gate, up = self.gate_up_proj(x)
+            result = self.gate_up_proj(x)
+            if isinstance(result, tuple):
+                gate, up = result
+            else:
+                # WQLinear returns single tensor, split manually
+                gate, up = result.split([self.intermediate_size, self.intermediate_size], dim=-1)
         else:
             gate = self.gate_proj(x)
             up = self.up_proj(x)
@@ -547,7 +549,6 @@ class Qwen3VLTextMLP(qwen3vl.Qwen3VLTextMLP):
 
 
 class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
-
     def set_capture_layer_ids(self, layer_ids: list[int] | None):
         """Configure which layer hidden states to capture during forward.
 
@@ -569,18 +570,18 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
 
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        use_cache=None,
-        cache_position=None,
-        visual_pos_masks=None,
-        deepstack_visual_embeds=None,
-        streaming_attention_mask=None,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        visual_pos_masks: Optional[torch.Tensor] = None,
+        deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+        streaming_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ):
+    ) -> Union[tuple, BaseModelOutputWithPast]:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         
@@ -630,18 +631,25 @@ class Qwen3VLTextModel(qwen3vl.Qwen3VLTextModel):
             self._last_captured_hidden_states = tuple(captured)
 
         return BaseModelOutputWithPast(
-            last_hidden_state=self.norm(hidden_states), past_key_values=past_key_values,
+            last_hidden_state=self.norm(hidden_states),
+            past_key_values=past_key_values,
             hidden_states=tuple(captured) if captured else None,
         )
 
-_PATCHED_CLASSES = {
+
+_PATCHED_CLASSES_STREAMING = {
+    "Qwen3VLVisionModel": Qwen3VLVisionModel,
+    "Qwen3VLTextModel": Qwen3VLTextModel,
+    "Qwen3VLVisionPatchEmbed": Qwen3VLVisionPatchEmbed,
+    "Qwen3VLVisionAttention": Qwen3VLVisionAttention,
+    "Qwen3VLTextAttention": Qwen3VLTextAttention,  # Order matters. Replace the parent(Qwen3VLTextModel) first
+}
+
+_PATCHED_CLASSES_NON_STREAMING = {
     "Qwen3VLVisionModel": Qwen3VLVisionModel,
     "Qwen3VLVisionPatchEmbed": Qwen3VLVisionPatchEmbed,
-    "Qwen3VLVisionBlock": Qwen3VLVisionBlock,
     "Qwen3VLVisionAttention": Qwen3VLVisionAttention,
     "Qwen3VLTextModel": Qwen3VLTextModel,
-    "Qwen3VLTextAttention": Qwen3VLTextAttention,
-    "Qwen3VLTextMLP": Qwen3VLTextMLP,
 }
 
 
@@ -650,6 +658,49 @@ def _get_device_dtype(module: nn.Module) -> tuple[torch.device, torch.dtype]:
     if param is None:
         return torch.device("cpu"), torch.float32
     return param.device, param.dtype
+
+
+def _fuse_wqlinears(*linears: nn.Module) -> nn.Module:
+    """Fuse multiple WQLinear modules into one by concatenating along the output dimension.
+
+    Column-parallel fusion: quantization groups run along the input (reduction)
+    dimension, so concatenating along output preserves quantization correctness.
+    Uses ``type(linears[0])`` to construct the fused module, avoiding a hard
+    import of the AWQ WQLinear class.
+    """
+    first = linears[0]
+    cls = type(first)
+    total_out = sum(l.out_features for l in linears)
+
+    fused = cls(
+        w_bit=first.w_bit,
+        group_size=first.group_size,
+        in_features=first.in_features,
+        out_features=total_out,
+        bias=first.bias is not None,
+        dev=first.qweight.device,
+        dtype=first.scales.dtype,
+    )
+
+    fused.qweight = torch.cat([l.qweight for l in linears], dim=0)
+    fused.scales = torch.cat([l.scales for l in linears], dim=1).contiguous()
+    fused.scaled_zeros = torch.cat([l.scaled_zeros for l in linears], dim=1).contiguous()
+
+    if first.bias is not None:
+        fused.bias = torch.cat([l.bias for l in linears], dim=0)
+
+    fused.split_k_iters = first.split_k_iters
+    return fused
+
+
+def _copy_children(dst: nn.Module, src: nn.Module) -> None:
+    """Copy all sub-modules, parameters, and buffers from *src* to *dst*."""
+    for child_name, child in src.named_children():
+        setattr(dst, child_name, child)
+    for pname, param in src.named_parameters(recurse=False):
+        setattr(dst, pname, param)
+    for bname, buf in src.named_buffers(recurse=False):
+        setattr(dst, bname, buf)
 
 
 def _replace_module(
@@ -669,27 +720,48 @@ def _replace_module(
     config = getattr(old_module, "config", None) or getattr(parent, "config", None)
     device, dtype = _get_device_dtype(old_module)
 
+    # Check if old module contains quantized (non-nn.Linear) weight layers
+    _has_quantized = any(
+        hasattr(m, "qweight") for m in old_module.modules()
+    )
+
     if new_class is Qwen3VLTextAttention:
         layer_idx = getattr(old_module, "layer_idx", None)
-        new_module = new_class(config, layer_idx, mode=mode, fuse_qkv=fuse_qkv)
 
-        # offload for fusion
-        old_module = old_module.to("cpu")
-        new_module.load_state_dict(old_module.state_dict(), assign=True)
+        if _has_quantized:
+            # Create without fusion, copy quantized children, then fuse WQLinears
+            new_module = new_class(config, layer_idx, mode=mode, fuse_qkv=False)
+            _copy_children(new_module, old_module)
+
+            if fuse_qkv:
+                new_module.qkv_proj = _fuse_wqlinears(
+                    new_module.q_proj, new_module.k_proj, new_module.v_proj,
+                )
+                delattr(new_module, "q_proj")
+                delattr(new_module, "k_proj")
+                delattr(new_module, "v_proj")
+                new_module.fuse_qkv = True
+        else:
+            new_module = new_class(config, layer_idx, mode=mode, fuse_qkv=fuse_qkv)
+            old_module = old_module.to("cpu")
+            new_module.load_state_dict(old_module.state_dict(), assign=True)
     elif new_class is Qwen3VLTextMLP:
-        new_module = new_class(config, fuse_gate_up=fuse_gate_up)
+        if _has_quantized:
+            new_module = new_class(config, fuse_gate_up=False)
+            _copy_children(new_module, old_module)
 
-        # offload for fusion
-        old_module = old_module.to("cpu")
-        new_module.load_state_dict(old_module.state_dict(), assign=True)
-    elif new_class in (Qwen3VLVisionModel, Qwen3VLVisionBlock, Qwen3VLVisionAttention):
-        # These patched classes only override forward/add methods (no __init__ changes),
-        # so swapping __class__ is sufficient. This also avoids the ordering problem
-        # where replacing a parent (e.g. VisionModel) via new instance would recreate
-        # unpatched children, invalidating collected references to the old children.
-        old_module.__class__ = new_class
-        return
-    else:  # Qwen3VLTextModel
+            if fuse_gate_up:
+                new_module.gate_up_proj = _fuse_wqlinears(
+                    new_module.gate_proj, new_module.up_proj,
+                )
+                delattr(new_module, "gate_proj")
+                delattr(new_module, "up_proj")
+                new_module.fuse_gate_up = True
+        else:
+            new_module = new_class(config, fuse_gate_up=fuse_gate_up)
+            old_module = old_module.to("cpu")
+            new_module.load_state_dict(old_module.state_dict(), assign=True)
+    else:
         new_module = new_class(config)
         new_module.load_state_dict(old_module.state_dict(), assign=True)
 
@@ -713,69 +785,28 @@ def patch_for_torch_compile(
         fuse_qkv: If True, fuse q/k/v projections into a single QKVLinear.
         fuse_gate_up: If True, fuse gate/up projections into a single MergedColumnLinear.
     """
+    assert mode in ["streaming", "non-streaming"], "Invalid mode"
+    
+    if mode == "streaming":
+        patched_classes = _PATCHED_CLASSES_STREAMING.copy()  # Copy to avoid modifying global
+        if fuse_gate_up:
+            patched_classes["Qwen3VLTextMLP"] = Qwen3VLTextMLP
+    else:
+        patched_classes = _PATCHED_CLASSES_NON_STREAMING.copy()
+        if fuse_qkv:
+            patched_classes["Qwen3VLTextAttention"] = Qwen3VLTextAttention
+        if fuse_gate_up:
+            patched_classes["Qwen3VLTextMLP"] = Qwen3VLTextMLP
 
     # Collect modules to replace first (avoid modifying during iteration)
     modules_to_replace = []
     for module_path, module in model.named_modules():
         class_name = type(module).__name__
-        if class_name in _PATCHED_CLASSES:
+        if class_name in patched_classes:
             # Skip if already patched
-            if type(module) is _PATCHED_CLASSES[class_name]:
+            if type(module) is patched_classes[class_name]:
                 continue
-            if not fuse_qkv and class_name == "Qwen3VLTextAttention":
-                continue
-            if not fuse_gate_up and class_name == "Qwen3VLTextMLP":
-                continue
-            modules_to_replace.append((module_path, module, _PATCHED_CLASSES[class_name]))
+            modules_to_replace.append((module_path, module, patched_classes[class_name]))
 
     for module_path, module, patched_class in modules_to_replace:
         _replace_module(model, module_path, module, patched_class, mode=mode, fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
-
-
-def fuse_expert_projections(model, mode: str = "streaming"):
-    n_attn = n_mlp = 0
-    for layer in model.expert.layers:
-        attn = layer.self_attn
-        if hasattr(attn, "q_proj") and not getattr(attn, "fuse_qkv", False):
-            config = attn.config if hasattr(attn, "config") else layer.self_attn.config
-            layer_idx = getattr(attn, "layer_idx", 0)
-            device, dtype = attn.q_proj.weight.device, attn.q_proj.weight.dtype
-            new_attn = Qwen3VLTextAttention(config, layer_idx, mode=mode, fuse_qkv=True)
-            new_attn.o_proj = attn.o_proj
-            if hasattr(attn, "q_norm"): new_attn.q_norm = attn.q_norm
-            if hasattr(attn, "k_norm"): new_attn.k_norm = attn.k_norm
-            with torch.no_grad():
-                q_s, k_s = attn.q_proj.weight.shape[0], attn.k_proj.weight.shape[0]
-                new_attn.qkv_proj.weight[:q_s].copy_(attn.q_proj.weight)
-                new_attn.qkv_proj.weight[q_s:q_s+k_s].copy_(attn.k_proj.weight)
-                new_attn.qkv_proj.weight[q_s+k_s:].copy_(attn.v_proj.weight)
-                if new_attn.qkv_proj.bias is not None:
-                    new_attn.qkv_proj.bias[:q_s].copy_(attn.q_proj.bias)
-                    new_attn.qkv_proj.bias[q_s:q_s+k_s].copy_(attn.k_proj.bias)
-                    new_attn.qkv_proj.bias[q_s+k_s:].copy_(attn.v_proj.bias)
-            layer.self_attn = new_attn.to(device=device, dtype=dtype)
-            n_attn += 1
-
-        mlp = layer.mlp
-        if hasattr(mlp, "gate_proj") and not getattr(mlp, "fuse_gate_up", False):
-            config = mlp.config if hasattr(mlp, "config") else getattr(layer, "config", None)
-            if config is None:
-                from types import SimpleNamespace
-                config = SimpleNamespace(
-                    hidden_size=mlp.gate_proj.in_features,
-                    intermediate_size=mlp.gate_proj.out_features,
-                    hidden_act=getattr(mlp, "hidden_act", "silu"),
-                )
-            device, dtype = mlp.gate_proj.weight.device, mlp.gate_proj.weight.dtype
-            new_mlp = Qwen3VLTextMLP(config, fuse_gate_up=True)
-            new_mlp.down_proj = mlp.down_proj
-            new_mlp.act_fn = mlp.act_fn
-            with torch.no_grad():
-                g_s = mlp.gate_proj.weight.shape[0]
-                new_mlp.gate_up_proj.weight[:g_s].copy_(mlp.gate_proj.weight)
-                new_mlp.gate_up_proj.weight[g_s:].copy_(mlp.up_proj.weight)
-                if new_mlp.gate_up_proj.bias is not None:
-                    new_mlp.gate_up_proj.bias[:g_s].copy_(mlp.gate_proj.bias)
-                    new_mlp.gate_up_proj.bias[g_s:].copy_(mlp.up_proj.bias)
-            layer.mlp = new_mlp.to(device=device, dtype=dtype)
-            n_mlp += 1
