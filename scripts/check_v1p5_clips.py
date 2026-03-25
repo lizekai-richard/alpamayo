@@ -38,11 +38,15 @@ for i, clip_id in enumerate(clips):
             issues.append(f"no_merged_token(f0={f0_label})")
 
         if issues:
-            bad_clips.append((clip_id, ", ".join(issues)))
+            msg = ", ".join(issues)
+            bad_clips.append((clip_id, msg))
+            print(f"  BAD [{i}/{total}] {clip_id}  {msg}", flush=True)
         else:
             ok += 1
     except Exception as e:
-        bad_clips.append((clip_id, f"ERROR: {str(e)[:80]}"))
+        msg = f"ERROR: {str(e)[:80]}"
+        bad_clips.append((clip_id, msg))
+        print(f"  BAD [{i}/{total}] {clip_id}  {msg}", flush=True)
 
 print(f"\nTotal: {total}, OK: {ok}, Bad: {len(bad_clips)}")
 print(f"Pass rate: {100*ok/max(total,1):.1f}%")

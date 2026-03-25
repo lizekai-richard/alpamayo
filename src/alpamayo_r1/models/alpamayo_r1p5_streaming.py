@@ -165,15 +165,20 @@ class StreamingAlpamayo1_5(ReasoningVLA):
 
         if hasattr(self, "_compiled_encode_fn"):
             delattr(self, "_compiled_encode_fn")
-
+        if hasattr(self, "_encode_fn"):
+            delattr(self, "_encode_fn")
         if hasattr(self, "_compiled_prefill_fn"):
             delattr(self, "_compiled_prefill_fn")
-
+        if hasattr(self, "_prefill_fn"):
+            delattr(self, "_prefill_fn")
         if hasattr(self, "_compiled_decode_fn"):
             delattr(self, "_compiled_decode_fn")
-
+        if hasattr(self, "_decode_fn"):
+            delattr(self, "_decode_fn")
         if hasattr(self, "_compiled_action_fn"):
             delattr(self, "_compiled_action_fn")
+        if hasattr(self, "_action_fn"):
+            delattr(self, "_action_fn")
             
     # ==================== Properties ====================
 

@@ -13,13 +13,13 @@
 set -e
 
 # ============== Configuration ==============
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-GPUS_PER_NODE=4
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+GPUS_PER_NODE=8
 
 # Model paths
 TARGET_MODEL="nvidia/Alpamayo-1.5-10B"
 DATA_DIR="/mnt/moosefs-1/users/zekail/dflash_train/b8"
-OUTPUT_DIR="/mnt/moosefs-1/users/zekail/exp"
+OUTPUT_DIR="/mnt/moosefs-1/users/zekail/dflash_train/"
 
 # Training hyperparameters
 NUM_EPOCHS=15

@@ -361,11 +361,12 @@ class OfflineDistillationDataset(Dataset):
         labels = torch.cat(all_labels, dim=0)
 
         # Extract only the selected layers from concatenated hidden states
+        # target_hidden shape: (N, context_len, num_stored_layers * hidden_dim)
         if len(self.target_layer_ids) < len(self.stored_layer_ids):
             # Need to extract subset of layers
             selected_hidden = []
             for start, end in self.layer_indices:
-                selected_hidden.append(target_hidden[:, start:end])
+                selected_hidden.append(target_hidden[..., start:end])
             target_hidden = torch.cat(selected_hidden, dim=-1)
             logger.info(f"[Rank {log_rank}] Extracted {len(self.target_layer_ids)} layers, "
                        f"hidden dim: {target_hidden.shape[-1]}")
@@ -574,18 +575,16 @@ class ScratchTrainer:
                 with torch.no_grad():
                     noise_embedding = self.embed_tokens(masked_input)
 
-            # Expand target_hidden for attention
-            target_hidden_expanded = target_hidden.unsqueeze(1)
-
+            # target_hidden: (batch, context_len, hidden_dim)
             # Position IDs
-            ctx_len = target_hidden_expanded.shape[1]
+            ctx_len = target_hidden.shape[1]
             full_seq_len = ctx_len + self.block_size
             position_ids = torch.arange(full_seq_len, device=self.device).unsqueeze(0).expand(batch_size, -1)
 
             # Forward through DFlash
             draft_hidden = self.draft_model(
                 noise_embedding=noise_embedding,
-                target_hidden=target_hidden_expanded,
+                target_hidden=target_hidden,
                 position_ids=position_ids,
                 is_causal=False,
             )
