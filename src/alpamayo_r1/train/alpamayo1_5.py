@@ -44,7 +44,7 @@ from alpamayo_r1.models.token_utils import (
     to_special_token,
 )
 from alpamayo_r1.utils.streaming.streaming_masking_utils import (
-    create_streaming_attention_mask_sdpa,
+    create_streaming_attention_mask_sdpa_v1p5,
     create_streaming_attention_mask_sdpa_training,
 )
 from alpamayo_r1.train.patches import StaticCache
@@ -438,7 +438,7 @@ class Alpamayo1_5(ReasoningVLA):
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         """Create streaming attention mask for non-first prefill."""
-        return create_streaming_attention_mask_sdpa(
+        return create_streaming_attention_mask_sdpa_v1p5(
             batch_size=1,
             cache_position=cache_position,
             kv_length=self.max_cache_len,
@@ -1076,7 +1076,8 @@ class Alpamayo1_5(ReasoningVLA):
             pred_rot, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
         )
 
-        # Update streaming state
+        # Update streaming state: zero out decode+action tokens before shifting
+        self._crop_static_cache(self.prefill_seq_length)
         self._update_past_key_values()
 
         if kwargs.get("return_extra", False):

@@ -682,7 +682,7 @@ def _replace_module(
         # offload for fusion
         old_module = old_module.to("cpu")
         new_module.load_state_dict(old_module.state_dict(), assign=True)
-    elif new_class in (Qwen3VLVisionModel, Qwen3VLVisionBlock, Qwen3VLVisionAttention):
+    elif new_class in (Qwen3VLVisionModel, Qwen3VLVisionBlock, Qwen3VLVisionAttention, Qwen3VLTextModel):
         # These patched classes only override forward/add methods (no __init__ changes),
         # so swapping __class__ is sufficient. This also avoids the ordering problem
         # where replacing a parent (e.g. VisionModel) via new instance would recreate

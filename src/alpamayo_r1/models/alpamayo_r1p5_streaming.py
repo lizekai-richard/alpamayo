@@ -43,7 +43,7 @@ from alpamayo_r1.models.token_utils import (
     to_special_token,
 )
 from alpamayo_r1.utils.streaming.streaming_masking_utils import (
-    create_streaming_attention_mask_sdpa,
+    create_streaming_attention_mask_sdpa_v1p5,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ class StreamingAlpamayo1_5(ReasoningVLA):
                 setattr(expert_config, key, value)
         self.expert = AutoModel.from_config(expert_config)
         # we don't need the embed_tokens of the expert model
-        del self.expert.embed_tokens
+        # del self.expert.embed_tokens
 
         # Action space and diffusion setup
         self.action_space: ActionSpace = hyu.instantiate(config.action_space_cfg)
@@ -130,27 +130,51 @@ class StreamingAlpamayo1_5(ReasoningVLA):
         self._cached_attention_mask = None
         self._cached_streaming_attention_mask = None
         self._cached_rope_deltas = None
-        self._cached_keep_mask = None
         self.vision_start_end_ids_ranges = None
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
         self.keep_frame_labels = True
         self.kv_shift_mode = "block"  # "block" or "vision_only"
+        assert self.kv_shift_mode in ["block", "vision_only"], "Invalid kv_shift_mode"
 
-    def reset_streaming_state(self):
+    def reset_streaming_state(self, keep_frame_labels: bool = True, kv_shift_mode: str = "block"):
         """Reset all streaming state between clips."""
         self._past_key_values = None
         self._cached_position_ids = None
         self._cached_attention_mask = None
         self._cached_streaming_attention_mask = None
         self._cached_rope_deltas = None
-        self._cached_keep_mask = None
         self.vision_start_end_ids_ranges = None
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
+        self.keep_frame_labels = keep_frame_labels
+        self.kv_shift_mode = kv_shift_mode
+        assert self.kv_shift_mode in ["block", "vision_only"], "Invalid kv_shift_mode"
 
+        if hasattr(self.vlm.model.visual, "_cached_pos_embeds"):
+            delattr(self.vlm.model.visual, "_cached_pos_embeds")
+        
+        for block in self.vlm.model.visual.blocks:
+            if hasattr(block.attn, "_num_chunks"):
+                delattr(block.attn, "_num_chunks")
+        
+        if hasattr(self.vlm.model.language_model, "_cached_deepstack_indices"):
+            delattr(self.vlm.model.language_model, "_cached_deepstack_indices")
+
+        if hasattr(self, "_compiled_encode_fn"):
+            delattr(self, "_compiled_encode_fn")
+
+        if hasattr(self, "_compiled_prefill_fn"):
+            delattr(self, "_compiled_prefill_fn")
+
+        if hasattr(self, "_compiled_decode_fn"):
+            delattr(self, "_compiled_decode_fn")
+
+        if hasattr(self, "_compiled_action_fn"):
+            delattr(self, "_compiled_action_fn")
+            
     # ==================== Properties ====================
 
     @property
@@ -283,7 +307,7 @@ class StreamingAlpamayo1_5(ReasoningVLA):
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         """Create streaming attention mask for non-first prefill."""
-        return create_streaming_attention_mask_sdpa(
+        return create_streaming_attention_mask_sdpa_v1p5(
             batch_size=1,
             cache_position=cache_position,
             kv_length=self.max_cache_len,
@@ -801,8 +825,8 @@ class StreamingAlpamayo1_5(ReasoningVLA):
             pred_rot, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
         )
 
-        # Update streaming state
-        # self._crop_static_cache(self.prefill_seq_length)
+        # Update streaming state: zero out decode+action tokens before shifting
+        self._crop_static_cache(self.prefill_seq_length)
         self._update_past_key_values()
 
         if kwargs.get("return_extra", False):

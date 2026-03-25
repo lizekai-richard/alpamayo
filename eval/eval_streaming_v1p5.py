@@ -43,8 +43,8 @@ log = logging.getLogger(__name__)
 
 
 CONFIGS = [
-    {"name": "block+labels",          "keep_frame_labels": True,  "kv_shift_mode": "block"},
     {"name": "vision_only+no_labels", "keep_frame_labels": False, "kv_shift_mode": "vision_only"},
+    {"name": "block+with_labels", "keep_frame_labels": True, "kv_shift_mode": "block"},
 ]
 
 
@@ -62,9 +62,7 @@ def calc_min_ade(gt_future_xyz, pred_xyz):
 
 def eval_clip(model, windows, ve_id, vs_id, config, num_traj_samples, max_gen_len, diffusion_steps):
     """Run streaming eval on one clip. Returns list of per-step dicts."""
-    model.keep_frame_labels = config["keep_frame_labels"]
-    model.kv_shift_mode = config["kv_shift_mode"]
-    model.reset_streaming_state()
+    model.reset_streaming_state(keep_frame_labels=config["keep_frame_labels"], kv_shift_mode=config["kv_shift_mode"])
 
     results = []
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -82,7 +80,7 @@ def eval_clip(model, windows, ve_id, vs_id, config, num_traj_samples, max_gen_le
                     keep_frame_labels=config["keep_frame_labels"],
                     vision_start_id=vs_id if not config["keep_frame_labels"] else None,
                 )
-
+            log.info(f"Input data shape: {data['tokenized_data']['input_ids'].shape}")
             result = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
                 data=to_device(data, "cuda"),
                 top_p=0.98,
@@ -91,6 +89,9 @@ def eval_clip(model, windows, ve_id, vs_id, config, num_traj_samples, max_gen_le
                 return_extra=True,
                 max_generation_length=max_gen_len,
                 diffusion_kwargs={"inference_step": diffusion_steps},
+                fuse_qkv=True,
+                fuse_gate_up=True,
+                torch_compile="max-autotune",
             )
 
             if result is None:
@@ -173,8 +174,8 @@ def aggregate(output_dir):
 def main():
     ap = argparse.ArgumentParser(description="Streaming eval for Alpamayo 1.5 (A/B configs)")
     ap.add_argument("--model-path", default="nvidia/Alpamayo-1.5-10B")
-    ap.add_argument("--data-dir", default="", help="Path to dumped v1.5 eval data")
-    ap.add_argument("--clip-list", default="", help="JSON file with clip IDs")
+    ap.add_argument("--data-dir", default="/mnt/moosefs/users/zekail/dumped_eval_data_v1p5", help="Path to dumped v1.5 eval data")
+    ap.add_argument("--clip-list", default="./clips.json", help="JSON file with clip IDs")
     ap.add_argument("--num-clips", type=int, default=None, help="Limit number of clips")
     ap.add_argument("--num-traj-samples", type=int, default=6, help="K for minADE_K")
     ap.add_argument("--max-gen-len", type=int, default=128, help="Max CoT tokens")

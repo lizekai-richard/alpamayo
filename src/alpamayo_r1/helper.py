@@ -246,10 +246,11 @@ def convert_to_streaming_window(
     keep_indices = [3, 7, 11, 15]
 
     # Build new input_ids: prefix + kept image blocks + suffix
-    prefix = input_ids[:vs_positions[0]]
+    # no prefix = input_ids[:vs_positions[0]]
     suffix = input_ids[ve_positions[-1] + 1:]
     kept_blocks = [input_ids[vs_positions[i]:ve_positions[i] + 1] for i in keep_indices]
-    new_input_ids = torch.cat([prefix] + kept_blocks + [suffix]).unsqueeze(0)
+    # new_input_ids = torch.cat([prefix] + kept_blocks + [suffix]).unsqueeze(0)
+    new_input_ids = torch.cat(kept_blocks + [suffix]).unsqueeze(0)
 
     # Extract pixel_values for kept images
     patches_per_image = [int(image_grid_thw[i].prod()) for i in range(16)]

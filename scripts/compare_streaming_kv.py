@@ -22,17 +22,17 @@ from alpamayo_r1.models.token_utils import (
     extract_text_tokens,
     replace_padding_after_eos,
 )
+from alpamayo_r1.utils.streaming.streaming_masking_utils import (
+    create_streaming_attention_mask_sdpa_v1p5,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 DATA_DIR = "/mnt/moosefs/users/zekail/dumped_eval_data_v1p5"
 CLIP_IDS = [
+    "c5d6b609-23d6-4092-924f-cfbdb3f46210",
     "2ee1b1cc-4eff-44e8-bb1b-99648ff2b3c0",
-    "6ee3a518-8073-4da2-beda-63e923708fa7",
-    "9ba94e96-2543-4357-89fa-5344af1a183a",
-    "bbbc5d5d-b15e-4601-a639-686dbf1bdfb9",
-    "53baf60a-902f-446d-8e30-5eb7dbc992e7",
 ]
 MODEL_PATH = "nvidia/Alpamayo-1.5-10B"
 NUM_STEPS = 50
@@ -208,8 +208,15 @@ def run_streaming_all(model, windows, keep_frame_labels, kv_shift_mode, device):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if model._cached_streaming_attention_mask is None:
-                model._cached_streaming_attention_mask = model._get_streaming_attention_mask(
-                    cache_position=cache_position, device=device,
+                model._cached_streaming_attention_mask = create_streaming_attention_mask_sdpa_v1p5(
+                    batch_size=1,
+                    cache_position=cache_position,
+                    kv_length=model.max_cache_len,
+                    vision_start_end_ids_ranges=model.vision_start_end_ids_ranges,
+                    traj_and_text_ids_range=model.traj_and_text_ids_range,
+                    valid_length=model.prefill_seq_length,
+                    device=device,
+                    dtype=torch.bfloat16,
                 )
 
             logits = model._prefill(
