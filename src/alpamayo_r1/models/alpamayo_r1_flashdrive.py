@@ -1502,7 +1502,7 @@ class AlpamayoR1FlashDrive(ReasoningVLA):
         """Non-streaming mode: normal non-streaming inference."""
         self._torch_compile = torch_compile
         if torch_compile and not hasattr(self, "_patched_for_compile"):
-            patch_for_torch_compile(self, mode="non-streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+            patch_for_torch_compile(self, mode="non_streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
             self._patched_for_compile = True
 
         # Extract inputs
@@ -1873,6 +1873,10 @@ class AlpamayoR1FlashDrive(ReasoningVLA):
         **kwargs: Any,
     ):
         """Non-streaming mode: resets KV cache each call, processes all frames."""
+        self._torch_compile = torch_compile
+        if torch_compile and not hasattr(self, "_patched_for_compile"):
+            patch_for_torch_compile(self, mode="non_streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+            self._patched_for_compile = True
 
         # Extract inputs
         tokenized = data["tokenized_data"]

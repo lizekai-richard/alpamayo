@@ -130,7 +130,6 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         self.num_image_tokens_per_frame = 180
 
         # Streaming state (will be initialized on first call)
-        self._past_key_values = None
         self._cached_position_ids = None
         self._cached_attention_mask = None
         self._cached_streaming_attention_mask = None
@@ -138,9 +137,6 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         self.vision_start_end_ids_ranges = None
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
-
-        # Compile mode
-        self._torch_compile = "max-autotune"
     
     def setup_patch_for_torch_compile(
         self,
@@ -180,6 +176,30 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         eos_positions = mask.int().argmax(dim=1)  # [b_star], first occurrence
         last_positions = torch.full((b_star,), sequences.shape[1] - 1, device=device)
         return torch.where(has_eos, eos_positions, last_positions) + 1
+    
+    def _find_traj_start_positions(self, output_ids: torch.Tensor) -> torch.Tensor:
+        """Find <traj_future_start> token position for each sequence."""
+        traj_start_mask = output_ids == self.traj_start_token_id
+        has_traj_start = traj_start_mask.any(dim=1)
+
+        if not has_traj_start.all():
+            missing = (~has_traj_start).nonzero(as_tuple=True)[0].tolist()
+            logger.warning(f"No <traj_future_start> token found in sequences: {missing}")
+
+        return torch.where(
+            has_traj_start,
+            traj_start_mask.int().argmax(dim=1),
+            output_ids.shape[1] - 1,
+        )
+
+    @property
+    def traj_start_token_id(self) -> int:
+        """Token ID for <traj_future_start>."""
+        if not hasattr(self, "_traj_start_token_id"):
+            self._traj_start_token_id = self.tokenizer.convert_tokens_to_ids(
+                to_special_token("traj_future_start")
+            )
+        return self._traj_start_token_id
     
     @property
     def num_action_tokens(self) -> int:
@@ -269,6 +289,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         """
         self._draft_model = draft_model
         self._dflash_block_size = getattr(draft_model, "block_size", block_size)
+        self._dflash_context_len = 8  # TODO: read from draft model config
 
         # Determine target layer IDs
         if target_layer_ids is not None:
@@ -607,7 +628,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 )
                 logits = self.vlm.lm_head(output.last_hidden_state[:, -1])
                 # hidden_states is tuple of captured layers (via set_capture_layer_ids)
-                context = torch.cat(output.hidden_states, dim=-1)[:, -1:, :]
+                context = torch.cat(output.hidden_states, dim=-1)[:, -self._dflash_context_len:, :]
                 return logits, context
 
             self._dflash_prefill_fn = dflash_prefill_fn
@@ -639,60 +660,100 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         cache_position: torch.Tensor,
+        mode: str = "streaming",
     ) -> torch.Tensor:
-        """Run decode forward pass for a single token."""
-        if not hasattr(self, "_decode_fn"):
-            self._decode_input_ids = torch.empty_like(input_ids)
-            self._decode_position_ids = torch.empty_like(position_ids)
-            self._decode_cache_position = torch.empty_like(cache_position)
+        """Run decode forward pass for a single token.
+
+        Args:
+            mode: "streaming" or "non_streaming" - determines which set of compiled
+                  functions and static buffers to use.
+        """
+        # Use mode-specific attribute names
+        fn_attr = f"_decode_fn_{mode}"
+        compiled_attr = f"_compiled_decode_fn_{mode}"
+        input_ids_attr = f"_decode_input_ids_{mode}"
+        pos_ids_attr = f"_decode_position_ids_{mode}"
+        cache_pos_attr = f"_decode_cache_position_{mode}"
+
+        if not hasattr(self, fn_attr):
+            # Create mode-specific static buffers
+            setattr(self, input_ids_attr, torch.empty_like(input_ids))
+            setattr(self, pos_ids_attr, torch.empty_like(position_ids))
+            setattr(self, cache_pos_attr, torch.empty_like(cache_position))
+
+            # Capture buffer references for closure
+            decode_input_ids = getattr(self, input_ids_attr)
+            decode_position_ids = getattr(self, pos_ids_attr)
+            decode_cache_position = getattr(self, cache_pos_attr)
 
             def decode_fn():
                 hidden = self.vlm.model.language_model(
-                    input_ids=self._decode_input_ids,
-                    position_ids=self._decode_position_ids,
+                    input_ids=decode_input_ids,
+                    position_ids=decode_position_ids,
                     past_key_values=self._past_key_values,
-                    cache_position=self._decode_cache_position,
+                    cache_position=decode_cache_position,
                     use_cache=True,
                 ).last_hidden_state[:, -1]
                 return self.vlm.lm_head(hidden)
 
-            self._decode_fn = decode_fn
+            setattr(self, fn_attr, decode_fn)
 
-        self._decode_input_ids.copy_(input_ids)
-        self._decode_position_ids.copy_(position_ids)
-        self._decode_cache_position.copy_(cache_position)
+        # Copy input tensors to static buffers
+        getattr(self, input_ids_attr).copy_(input_ids)
+        getattr(self, pos_ids_attr).copy_(position_ids)
+        getattr(self, cache_pos_attr).copy_(cache_position)
 
-        if not hasattr(self, "_compiled_decode_fn"):
-            if self._torch_compile:
-                self._decode_fn()
-                self._compiled_decode_fn = torch.compile(
-                    self._decode_fn, mode=self._torch_compile, fullgraph=True
-                )
-            else:
-                self._compiled_decode_fn = self._decode_fn
+        if not hasattr(self, compiled_attr):
+            getattr(self, fn_attr)()  # Warmup
+            setattr(self, compiled_attr, torch.compile(
+                getattr(self, fn_attr), mode=self._torch_compile, fullgraph=True
+            ))
 
-        if self._torch_compile:
-            torch.compiler.cudagraph_mark_step_begin()
-        return self._compiled_decode_fn()
+        torch.compiler.cudagraph_mark_step_begin()
+        return getattr(self, compiled_attr)()
 
     def _action(
         self,
         num_action_tokens: int,
         total_samples: int,
         device: torch.device,
+        position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         cache_position: torch.Tensor,
+        mode: str = "streaming",
         diffusion_kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor:
-        if not hasattr(self, "_action_fn"):
-            # Initialize static buffers
-            self._action_attention_mask = torch.empty_like(attention_mask)
-            self._action_cache_position = torch.empty_like(cache_position)
-            self._action_noise = torch.empty(
+        """Run diffusion sampling for action prediction.
+
+        Args:
+            mode: "streaming" or "non_streaming" - determines which set of compiled
+                  functions and static buffers to use.
+        """
+        # Use mode-specific attribute names to separate streaming vs non-streaming buffers
+        fn_attr = f"_action_fn_{mode}"
+        compiled_attr = f"_compiled_action_fn_{mode}"
+        pos_ids_attr = f"_action_position_ids_{mode}"
+        attn_mask_attr = f"_action_attention_mask_{mode}"
+        cache_pos_attr = f"_action_cache_position_{mode}"
+        noise_attr = f"_action_noise_{mode}"
+
+        if not hasattr(self, fn_attr):
+            # Create mode-specific static buffers
+            setattr(self, pos_ids_attr, torch.empty_like(position_ids))
+            setattr(self, attn_mask_attr, torch.empty_like(attention_mask))
+            setattr(self, cache_pos_attr, torch.empty_like(cache_position))
+            setattr(self, noise_attr, torch.empty(
                 total_samples, *self.action_space.get_action_space_dims(), device=device, dtype=torch.bfloat16
-            )
+            ))
+
             expert_kwargs = {"is_causal": False} if self.config.expert_non_causal_attention else {}
             action_dims = self.action_space.get_action_space_dims()
+
+            # Capture buffer references for closure
+            action_position_ids = getattr(self, pos_ids_attr)
+            action_attention_mask = getattr(self, attn_mask_attr)
+            action_cache_position = getattr(self, cache_pos_attr)
+            action_noise = getattr(self, noise_attr)
 
             def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
                 action_embeds = self.action_in_proj(x, t)
@@ -701,10 +762,10 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
                 hidden = self.expert(
                     inputs_embeds=action_embeds,
-                    position_ids=self._cached_position_ids,
+                    position_ids=action_position_ids,
                     past_key_values=self._past_key_values,
-                    attention_mask=self._action_attention_mask,
-                    cache_position=self._action_cache_position,
+                    attention_mask=action_attention_mask,
+                    cache_position=action_cache_position,
                     use_cache=True,
                     **expert_kwargs,
                 ).last_hidden_state[:, -num_action_tokens:]
@@ -712,7 +773,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
             def action_fn():
                 return self.diffusion.sample(
-                    noise=self._action_noise,
+                    noise=action_noise,
                     batch_size=total_samples,
                     step_fn=step_fn,
                     device=device,
@@ -720,29 +781,24 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                     **(diffusion_kwargs or {}),
                 )
 
-            self._action_fn = action_fn
+            setattr(self, fn_attr, action_fn)
 
-        # Copy inputs to static buffers
-        # self._action_position_ids.copy_(position_ids)
-        self._action_attention_mask.copy_(attention_mask)
-        self._action_cache_position.copy_(cache_position)
+        # Copy input tensors to static buffers
+        getattr(self, pos_ids_attr).copy_(position_ids)
+        getattr(self, attn_mask_attr).copy_(attention_mask)
+        getattr(self, cache_pos_attr).copy_(cache_position)
 
         # Generate noise outside compiled graph for deterministic RNG
-        self._action_noise.normal_()
+        getattr(self, noise_attr).normal_()
 
-        # Warmup and compile on first call (if enabled)
-        if not hasattr(self, "_compiled_action_fn"):
-            if self._torch_compile:
-                self._action_fn()  # Warmup for compile
-                self._compiled_action_fn = torch.compile(
-                    self._action_fn, mode=self._torch_compile, fullgraph=True
-                )
-            else:
-                self._compiled_action_fn = self._action_fn
+        if not hasattr(self, compiled_attr):
+            getattr(self, fn_attr)()  # Warmup
+            setattr(self, compiled_attr, torch.compile(
+                getattr(self, fn_attr), mode=self._torch_compile, fullgraph=True
+            ))
 
-        if self._torch_compile:
-            torch.compiler.cudagraph_mark_step_begin()
-        return self._compiled_action_fn()
+        torch.compiler.cudagraph_mark_step_begin()
+        return getattr(self, compiled_attr)()
     
     # ==================== DFlash Compiled Functions ====================
 
@@ -1049,7 +1105,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 token is at position num_input_tokens in output_ids.
             cur_seq_len: Current valid length in the StaticCache (positions
                 0..cur_seq_len-1 are valid).
-            target_hidden: (1, 1, D) initial hidden state from prefill.
+            target_hidden: (1, dflash_context_len, D) initial hidden state from prefill.
             rope_deltas: MROPE position offsets, or None.
             max_new_tokens: Maximum tokens to generate.
             temperature: Sampling temperature (0.0 = greedy).
@@ -1075,7 +1131,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
         # Precompute constant tensors
         reset_position_ids = torch.arange(
-            0, 1 + block_size, device=device
+            0, self._dflash_context_len + block_size, device=device
         ).unsqueeze(0).expand(bsz, -1)
         base_block_positions = torch.arange(0, block_size, device=device, dtype=torch.long)
         if rope_deltas is not None:
@@ -1083,6 +1139,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
         start = num_input_tokens  # First known token is at output_ids[:, num_input_tokens]
         current_seq_len = cur_seq_len
+        target_hidden = target_hidden.clone()  # Detach from CUDA graph output
 
         while start < max_length:
             # 1. Prepare block (first token known, rest are masks)
@@ -1099,9 +1156,8 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 block_position_ids = block_positions.unsqueeze(0).expand(3, bsz, -1)
 
             # 3. Draft: embed → draft_model → lm_head
-            current_context = target_hidden[:, -1:, :]
             _draft_hidden, draft_logits = self._dflash_draft(
-                block_output_ids, current_context, reset_position_ids,
+                block_output_ids, target_hidden, reset_position_ids,
             )
 
             # 4. Sample draft tokens
@@ -1192,7 +1248,14 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             if acceptance_length < block_size - 1:
                 self._crop_static_cache(current_seq_len)
 
-            target_hidden = verify_context[:, acceptance_length : acceptance_length + 1, :]
+            # Slide the context buffer: drop oldest, append newly accepted hidden states.
+            # Keeps target_hidden at fixed (1, context_len, D) for _dflash_draft static buffers.
+            n_accepted = acceptance_length + 1
+            accepted_hidden = verify_context[:, :n_accepted, :]
+            target_hidden = torch.cat([
+                target_hidden[:, n_accepted:, :],
+                accepted_hidden,
+            ], dim=1)
 
         # Cleanup output: remove mask tokens, trim to max_length
         output_ids = output_ids[:, :max_length]
@@ -1285,7 +1348,6 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         diffusion_kwargs: dict[str, Any] | None,
         fuse_qkv: bool = False,
         fuse_gate_up: bool = False,
-        sparsity_ratio: float = 0.5,
         **kwargs: Any,
     ):
         """Streaming mode: reuses KV cache, first call is prefill only."""
@@ -1472,7 +1534,6 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         diffusion_kwargs: dict[str, Any] | None,
         fuse_qkv: bool = False,
         fuse_gate_up: bool = False,
-        sparsity_ratio: float = 0.5,
         **kwargs: Any,
     ):
         """Non-streaming mode: normal non-streaming inference."""
@@ -1631,9 +1692,6 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         self,
         data: dict[str, Any],
         torch_compile: str,
-        top_p: float,
-        top_k: int | None,
-        temperature: float,
         max_new_tokens: int,
         num_traj_samples: int,
         num_traj_sets: int,
@@ -1644,6 +1702,10 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
     ):
         """Streaming mode: reuses KV cache, first call is prefill only."""
         self._ensure_dflash_refs()
+        self._torch_compile = torch_compile
+        if torch_compile and not hasattr(self, "_patched_for_compile"):
+            patch_for_torch_compile(self, mode="streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+            self._patched_for_compile = True
 
         # Extract inputs
         tokenized = data["tokenized_data"]
@@ -1741,7 +1803,6 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
         # Run speculative decode loop (stop at <cot_end>, matching external accelerator)
         # cot_end_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("cot_end"))
-        traj_start_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
         dflash_output_ids, dflash_end_pos, dflash_stats, cur_seq_len = self._dflash_decode_loop(
             output_ids=dflash_output_ids,
             num_input_tokens=num_input_tokens,
@@ -1751,7 +1812,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             max_new_tokens=max_new_tokens,
             temperature=0.0,
             # stop_token_ids=[cot_end_token_id],
-            stop_token_ids=[traj_start_token_id],
+            stop_token_ids=[self.traj_start_token_id],
             full_position_ids=self._cached_position_ids,
             mode="streaming",
         )
@@ -1773,7 +1834,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
         output_ids = replace_padding_after_eos(
             token_ids=output_ids,
-            eos_token_id=traj_start_token_id,
+            eos_token_id=self.traj_start_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
         )
 
@@ -1834,399 +1895,190 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 )
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
-
-    def sample_trajectories_from_data_with_vlm_rollout(
+    
+    @torch.inference_mode()
+    def _dflash_non_streaming_rollout(
         self,
         data: dict[str, Any],
-        top_p: float = 0.98,
-        top_k: int | None = None,
-        temperature: float = 0.6,
-        num_traj_samples: int = 6,
-        num_traj_sets: int = 1,
-        diffusion_kwargs: dict[str, Any] | None = None,
-        *args: Any,
+        torch_compile: str,
+        max_new_tokens: int,
+        num_traj_samples: int,
+        num_traj_sets: int,
+        diffusion_kwargs: dict[str, Any] | None,
+        fuse_qkv: bool = False,
+        fuse_gate_up: bool = False,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample trajectories from the data with VLM rollout."""
-        data = copy.deepcopy(data)
-        n_samples_total = num_traj_samples * num_traj_sets
+    ):
+        """Non-streaming mode: resets KV cache each call, processes all frames."""
+        self._torch_compile = torch_compile
+        if torch_compile and not hasattr(self, "_patched_for_compile"):
+            patch_for_torch_compile(self, mode="non_streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+            self._patched_for_compile = True
+        self._ensure_dflash_refs()
+
+        # Extract inputs
+        tokenized = data["tokenized_data"]
+        input_ids = tokenized["input_ids"]
+        pixel_values = tokenized["pixel_values"]
+        image_grid_thw = tokenized["image_grid_thw"]
         ego_history_xyz = data["ego_history_xyz"]
         ego_history_rot = data["ego_history_rot"]
-        B, n_traj_group, _, _ = ego_history_xyz.shape
-        assert n_traj_group == 1, "Only one trajectory group is supported for inference."
-        tokenized_data = data["tokenized_data"]
-        input_ids = tokenized_data.pop("input_ids")
-        traj_data_vlm = {
-            "ego_history_xyz": ego_history_xyz,
-            "ego_history_rot": ego_history_rot,
-        }
-        input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
+
+        batch_size, num_traj_groups, _, _ = ego_history_xyz.shape
+        num_samples = num_traj_samples * num_traj_sets
+        assert num_traj_groups == 1, "Only one trajectory group is supported."
         device = input_ids.device
 
-        # 1) run autoregressive generation for the VLM
-        max_generation_length = kwargs.get(
-            "max_generation_length", self.config.tokens_per_future_traj
+        # Fuse trajectory tokens
+        input_ids = self.fuse_traj_tokens(
+            input_ids, {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot}
         )
-        generation_config = self.vlm.generation_config
-        generation_config.top_p = top_p
-        generation_config.temperature = temperature
-        generation_config.do_sample = True
-        generation_config.num_return_sequences = num_traj_samples
-        generation_config.max_new_tokens = max_generation_length
-        generation_config.output_logits = True
-        generation_config.return_dict_in_generate = True
-        generation_config.top_k = top_k
-        generation_config.pad_token_id = self.tokenizer.pad_token_id
 
-        eos_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
-        stopping_criteria = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_token_id)])
-        logits_processor = LogitsProcessorList(
-            [
-                ExpertLogitsProcessor(
-                    traj_token_offset=self.config.traj_token_start_idx,
-                    traj_vocab_size=self.config.traj_vocab_size,
-                )
-            ]
-        )
-        vlm_outputs = self.vlm.generate(
-            input_ids=input_ids,
-            generation_config=generation_config,
-            stopping_criteria=stopping_criteria,
-            logits_processor=logits_processor,
-            **tokenized_data,
-        )
-        vlm_outputs.rope_deltas = self.vlm.model.rope_deltas
+        # Setup generation
+        block_size = self._dflash_block_size
+        seq_len = input_ids.shape[1]
 
-        # manually replace padding after EOS token
-        vlm_outputs.sequences = replace_padding_after_eos(
-            token_ids=vlm_outputs.sequences,
-            eos_token_id=eos_token_id,
+        # Initialize KV cache (includes space for action tokens)
+        cache_len = seq_len + max_new_tokens + block_size + self.num_action_tokens
+        if not hasattr(self, "_past_key_values"):
+            self._past_key_values = StaticCache(
+                config=self.vlm.config,
+                max_cache_len=cache_len,
+                max_batch_size=num_samples * batch_size,
+            )
+        self._past_key_values.reset()
+
+        # Timing events (async, no pipeline stall)
+        _ev = [torch.cuda.Event(enable_timing=True) for _ in range(7)]
+
+        _ev[0].record()
+        inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
+        position_ids, rope_deltas = self.vlm.model.get_rope_index(
+            input_ids, image_grid_thw, None, None,
+        )
+
+        # ===== Encode =====
+        image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)
+        image_mask = (
+            (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        _ev[1].record()
+
+        # ===== Prefill (no streaming attention mask) =====
+        cache_position = torch.arange(seq_len, device=device)
+        logits, target_hidden = self._dflash_prefill(
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            cache_position=cache_position,
+            visual_pos_masks=image_mask[..., 0],
+            deepstack_image_embeds=deepstack_image_embeds,
+            streaming_attention_mask=None,
+        )
+        
+        # ===== Decode =====
+        _ev[2].record()
+        max_length = seq_len + max_new_tokens
+        dflash_output_ids = torch.full(
+            (batch_size, max_length + block_size),
+            self._dflash_mask_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        dflash_output_ids[:, :seq_len] = input_ids
+
+        # Sample first token from prefill logits
+        first_token_logits = logits.unsqueeze(1)
+        first_token = sample_tokens(first_token_logits, 0.0, self._dflash_logits_processor)
+        dflash_output_ids[:, seq_len : seq_len + 1] = first_token
+        _ev[3].record()
+
+        # Run speculative decode loop (stop at <traj_future_start>, matching streaming path)
+        traj_start_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
+        dflash_output_ids, dflash_end_pos, dflash_stats, cur_seq_len = self._dflash_decode_loop(
+            output_ids=dflash_output_ids,
+            num_input_tokens=seq_len,
+            cur_seq_len=seq_len,
+            target_hidden=target_hidden,
+            rope_deltas=rope_deltas,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+            stop_token_ids=[traj_start_token_id],
+            full_position_ids=None,
+            mode="non_streaming",
+        )
+
+        # Append <traj_future_start> and forward through LLM to populate KV cache.
+        # Without this forward, the StaticCache at traj_start_pos has zeros — the
+        # action decoder attends to these zeros, degrading trajectory quality.
+        # Uses compiled path (_dflash_traj_forward) when torch.compile is active.
+        # traj_token = torch.tensor([[self.traj_start_token_id]], device=device)
+        # traj_position_ids = (
+        #     torch.tensor([[[cur_seq_len]]], device=device, dtype=torch.long).expand(3, 1, 1)
+        #     + rope_deltas.unsqueeze(-1)
+        # )
+        # traj_cache_position = torch.tensor([cur_seq_len], device=device, dtype=torch.long)
+        # self._dflash_traj_forward(
+        #     traj_token, traj_position_ids, traj_cache_position, mode="non_streaming",
+        # )
+        generated_tokens = dflash_output_ids[:, seq_len:]
+        output_ids = torch.cat([input_ids, generated_tokens], dim=-1)
+
+        output_ids = replace_padding_after_eos(
+            token_ids=output_ids,
+            eos_token_id=traj_start_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
         )
-        prompt_cache = vlm_outputs.past_key_values
-        prefill_seq_len = prompt_cache.get_seq_length()
 
-        b_star = vlm_outputs.sequences.shape[0]
-        n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
-        offset = self._find_eos_offset(
-            sequences=vlm_outputs.sequences,
-            eos_token_id=eos_token_id,
-            device=device,
+        # Find <traj_future_start> position
+        traj_start_pos = self._find_traj_start_positions(output_ids)
+
+        _ev[4].record()
+
+        # ===== Action (Diffusion) =====
+        num_samples = num_traj_samples * num_traj_sets
+        # Replicate batch-0 KV and output_ids to all sample slots
+        if num_samples > 1:
+            self._past_key_values.expand_batch()
+        action_start_pos = traj_start_pos + 1
+
+        action_start_pos = traj_start_pos + 1
+        cur_pos = action_start_pos[0].item()
+
+        # Build position_ids for action tokens
+        position_ids = torch.arange(self.num_action_tokens, device=device)
+        position_ids = einops.repeat(position_ids, "t -> 3 b t", b=batch_size * num_samples).clone()
+        position_ids += (rope_deltas + action_start_pos[None, :, None]).to(device)
+
+        # Build attention mask
+        indices = torch.arange(self._past_key_values.max_cache_len, device=device).expand(num_samples, -1)
+        is_prompt = indices < action_start_pos[:, None]
+        is_action = (indices >= cur_pos) & (indices < cur_pos + self.num_action_tokens)
+        attention_mask = torch.where(
+            (is_prompt | is_action)[:, None, None, :], 0.0, torch.finfo(torch.float32).min
         )
-        prefix_mask = tokenized_data.get("attention_mask")
-        if prefix_mask is not None:
-            prefix_mask = torch.repeat_interleave(prefix_mask, n_samples_total, dim=0)
-        position_ids, attention_mask = self._build_expert_pos_ids_and_attn_mask(
-            offset=offset,
-            rope_deltas=vlm_outputs.rope_deltas,
-            kv_cache_seq_len=prefill_seq_len,
-            n_diffusion_tokens=n_diffusion_tokens,
-            b_star=b_star,
-            device=device,
-            prefix_mask=prefix_mask,
-        )
-
-        forward_kwargs = {}
-        if self.config.expert_non_causal_attention:
-            forward_kwargs["is_causal"] = False
-
-        # 2) Define denoising step
-        def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            b_star = x.shape[0]
-            future_token_embeds = self.action_in_proj(x, t)
-            if future_token_embeds.dim() == 2:
-                future_token_embeds = future_token_embeds.view(b_star, n_diffusion_tokens, -1)
-
-            expert_out_base = self.expert(
-                inputs_embeds=future_token_embeds,
-                position_ids=position_ids,
-                past_key_values=prompt_cache,
-                attention_mask=attention_mask,
-                use_cache=True,
-                **forward_kwargs,
-            )
-            prompt_cache.crop(prefill_seq_len)
-            last_hidden = expert_out_base.last_hidden_state[:, -n_diffusion_tokens:]
-            pred = self.action_out_proj(last_hidden).view(
-                -1, *self.action_space.get_action_space_dims()
-            )
-            return pred
-
-        # 3) Diffusion sampling
-        total_batch = B * n_samples_total
-        if diffusion_kwargs is None:
-            diffusion_kwargs = {}
-
-        sampled_action = self.diffusion.sample(
-            batch_size=total_batch,
-            step_fn=step_fn,
-            device=device,
-            return_all_steps=False,
-            **diffusion_kwargs,
-        )
-
-        # Repeat history to align with num_traj_samples
-        hist_xyz_rep = einops.repeat(
-            ego_history_xyz[:, -1], "b ... -> (b n) ...", n=n_samples_total
-        )
-        hist_rot_rep = einops.repeat(
-            ego_history_rot[:, -1], "b ... -> (b n) ...", n=n_samples_total
-        )
-
-        pred_xyz, pred_rot = self.action_space.action_to_traj(
-            sampled_action, hist_xyz_rep, hist_rot_rep
-        )
-
-        # 4) Reshape to (B, num_traj_samples, n_traj, ...)
-        pred_xyz = einops.rearrange(
-            pred_xyz, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
-        )
-        pred_rot = einops.rearrange(
-            pred_rot, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
-        )
-
-        if kwargs.get("return_extra", False):
-            extra = extract_text_tokens(self.tokenizer, vlm_outputs.sequences)
-            for text_tokens in extra.keys():
-                extra[text_tokens] = np.array(extra[text_tokens]).reshape(
-                    [input_ids.shape[0], num_traj_sets, num_traj_samples]
-                )
-            return pred_xyz, pred_rot, extra
-        return pred_xyz, pred_rot
-
-    @torch.no_grad()
-    def sample_trajectories_from_data_with_vlm_rollout_cfg_nav(
-        self,
-        data: dict[str, Any],
-        top_p: float = 0.98,
-        top_k: int | None = None,
-        temperature: float = 0.6,
-        num_traj_samples: int = 6,
-        num_traj_sets: int = 1,
-        diffusion_kwargs: dict[str, Any] | None = None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample trajectories with classifier-free guidance on navigation."""
-        data = copy.deepcopy(data)
-        n_samples_total = num_traj_samples * num_traj_sets
-        ego_history_xyz = data["ego_history_xyz"]
-        ego_history_rot = data["ego_history_rot"]
-        B, n_traj_group, _, _ = ego_history_xyz.shape
-        assert n_traj_group == 1, "Only one trajectory group is supported for inference."
-        tokenized_data = data["tokenized_data"]
-        input_ids = tokenized_data.pop("input_ids")
-        traj_data_vlm = {
-            "ego_history_xyz": ego_history_xyz,
-            "ego_history_rot": ego_history_rot,
-        }
-        input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
-        device = input_ids.device
-
-        max_generation_length = kwargs.get(
-            "max_generation_length", self.config.tokens_per_future_traj
-        )
-        generation_config = self.vlm.generation_config
-        generation_config.top_p = top_p
-        generation_config.temperature = temperature
-        generation_config.do_sample = True
-        generation_config.num_return_sequences = num_traj_samples
-        generation_config.max_new_tokens = max_generation_length
-        generation_config.output_logits = True
-        generation_config.return_dict_in_generate = True
-        generation_config.top_k = top_k
-        generation_config.pad_token_id = self.tokenizer.pad_token_id
-
-        eos_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
-        stopping_criteria = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_token_id)])
-        logits_processor = LogitsProcessorList(
-            [
-                ExpertLogitsProcessor(
-                    traj_token_offset=self.config.traj_token_start_idx,
-                    traj_vocab_size=self.config.traj_vocab_size,
-                )
-            ]
-        )
-        vlm_outputs = self.vlm.generate(
-            input_ids=input_ids,
-            generation_config=generation_config,
-            stopping_criteria=stopping_criteria,
-            logits_processor=logits_processor,
-            **tokenized_data,
-        )
-        del vlm_outputs.logits
-        torch.cuda.empty_cache()
-        vlm_outputs.rope_deltas = self.vlm.model.rope_deltas
-
-        vlm_outputs.sequences = replace_padding_after_eos(
-            token_ids=vlm_outputs.sequences,
-            eos_token_id=eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
-        prompt_cache = vlm_outputs.past_key_values
-
-        b_star = vlm_outputs.sequences.shape[0]
-        n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
-        offset = self._find_eos_offset(
-            sequences=vlm_outputs.sequences,
-            eos_token_id=eos_token_id,
-            device=device,
-        )
-        prefix_mask = tokenized_data.get("attention_mask")
-        if prefix_mask is not None:
-            prefix_mask = torch.repeat_interleave(prefix_mask, n_samples_total, dim=0)
-        position_ids, attention_mask = self._build_expert_pos_ids_and_attn_mask(
-            offset=offset,
-            rope_deltas=vlm_outputs.rope_deltas,
-            kv_cache_seq_len=prompt_cache.get_seq_length(),
-            n_diffusion_tokens=n_diffusion_tokens,
-            b_star=b_star,
-            device=device,
-            prefix_mask=prefix_mask,
-        )
-
-        # Build unguided KV cache
-        unguided_input_ids = []
-        for i in range(input_ids.shape[0]):
-            unguided_input_ids.append(remove_nav_text(input_ids, self.tokenizer, i)[0])
-        unguided_input_ids = torch.nn.utils.rnn.pad_sequence(
-            unguided_input_ids,
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id,
-            padding_side="left",
-        ).to(device)
-        unguided_prefix_mask = unguided_input_ids.ne(self.tokenizer.pad_token_id).long()
-
-        unguided_prefill_outputs = self.vlm(
-            input_ids=unguided_input_ids,
-            attention_mask=unguided_prefix_mask,
-            image_grid_thw=tokenized_data.get("image_grid_thw"),
-            pixel_values=tokenized_data.get("pixel_values"),
-            use_cache=True,
-            logits_to_keep=1,
-        )
-
-        unguided_prompt_cache = unguided_prefill_outputs.past_key_values
-        del unguided_prefill_outputs
-        torch.cuda.empty_cache()
-        unguided_prompt_cache.batch_repeat_interleave(n_samples_total)
-
-        generated_tokens = vlm_outputs.sequences[:, input_ids.shape[1] :]
-        unguided_prefix_len = unguided_input_ids.shape[1]
-        gen_len = generated_tokens.shape[1]
-
-        prefix_mask_repeated = unguided_prefix_mask.repeat_interleave(n_samples_total, dim=0)
-        gen_mask = generated_tokens.ne(self.tokenizer.pad_token_id).long()
-        full_attention_mask = torch.cat([prefix_mask_repeated, gen_mask], dim=1)
 
         cache_position = torch.arange(
-            unguided_prefix_len,
-            unguided_prefix_len + gen_len,
-            device=device,
-            dtype=torch.long,
+            cur_pos, cur_pos + self.num_action_tokens, device=device
         )
+        _ev[5].record()
 
-        unguided_vlm_outputs = self.vlm(
-            input_ids=generated_tokens,
-            attention_mask=full_attention_mask,
-            past_key_values=unguided_prompt_cache,
+        sampled_action = self._action(
+            num_action_tokens=self.num_action_tokens,
+            total_samples=batch_size * num_samples,
+            device=device,
+            position_ids=position_ids,
             cache_position=cache_position,
-            use_cache=True,
-            logits_to_keep=1,
+            attention_mask=attention_mask,
+            mode="non_streaming",
+            diffusion_kwargs=diffusion_kwargs,
         )
-        unguided_prompt_cache = unguided_vlm_outputs.past_key_values
-        del unguided_vlm_outputs.logits
-        torch.cuda.empty_cache()
-
-        full_unguided_tokens = torch.cat(
-            [torch.repeat_interleave(unguided_input_ids, n_samples_total, dim=0), generated_tokens],
-            dim=1,
-        )
-        unguided_offset = self._find_eos_offset(
-            sequences=full_unguided_tokens,
-            eos_token_id=eos_token_id,
-            device=device,
-            warn=False,
-        )
-        unguided_prefix_mask_repeated = torch.repeat_interleave(
-            unguided_prefix_mask, n_samples_total, dim=0
-        )
-        unguided_position_ids, unguided_attention_mask = self._build_expert_pos_ids_and_attn_mask(
-            offset=unguided_offset,
-            rope_deltas=unguided_vlm_outputs.rope_deltas,
-            kv_cache_seq_len=unguided_prompt_cache.get_seq_length(),
-            n_diffusion_tokens=n_diffusion_tokens,
-            b_star=b_star,
-            device=device,
-            prefix_mask=unguided_prefix_mask_repeated,
-        )
-
-        forward_kwargs = {}
-        if self.config.expert_non_causal_attention:
-            forward_kwargs["is_causal"] = False
-
-        def step_fn(
-            x: torch.Tensor,
-            t: torch.Tensor,
-            position_ids: torch.Tensor,
-            past_key_values: torch.Tensor,
-            attention_mask: torch.Tensor,
-        ) -> torch.Tensor:
-            b_star = x.shape[0]
-            future_token_embeds = self.action_in_proj(x, t)
-            if future_token_embeds.dim() == 2:
-                future_token_embeds = future_token_embeds.view(b_star, n_diffusion_tokens, -1)
-
-            prefill_seq_len = past_key_values.get_seq_length()
-            expert_out_base = self.expert(
-                inputs_embeds=future_token_embeds,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                attention_mask=attention_mask,
-                use_cache=True,
-                **forward_kwargs,
-            )
-            past_key_values.crop(prefill_seq_len)
-            last_hidden = expert_out_base.last_hidden_state[:, -n_diffusion_tokens:]
-            pred = self.action_out_proj(last_hidden).view(
-                -1, *self.action_space.get_action_space_dims()
-            )
-            return pred
-
-        total_batch = B * n_samples_total
-        if diffusion_kwargs is None:
-            diffusion_kwargs = {}
-
-        sampled_action = self.diffusion.sample(
-            batch_size=total_batch,
-            step_fn=partial(
-                step_fn,
-                past_key_values=prompt_cache,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            ),
-            unguided_step_fn=partial(
-                step_fn,
-                past_key_values=unguided_prompt_cache,
-                attention_mask=unguided_attention_mask,
-                position_ids=unguided_position_ids,
-            ),
-            device=device,
-            return_all_steps=False,
-            **diffusion_kwargs,
-        )
-
-        hist_xyz_rep = einops.repeat(
-            ego_history_xyz[:, -1], "b ... -> (b n) ...", n=n_samples_total
-        )
-        hist_rot_rep = einops.repeat(
-            ego_history_rot[:, -1], "b ... -> (b n) ...", n=n_samples_total
-        )
-
-        pred_xyz, pred_rot = self.action_space.action_to_traj(
-            sampled_action, hist_xyz_rep, hist_rot_rep
-        )
-
+        _ev[6].record()
+        
+        # Convert actions to trajectories
+        hist_xyz = einops.repeat(ego_history_xyz[:, -1], "b ... -> (b n) ...", n=num_samples)
+        hist_rot = einops.repeat(ego_history_rot[:, -1], "b ... -> (b n) ...", n=num_samples)
+        pred_xyz, pred_rot = self.action_space.action_to_traj(sampled_action, hist_xyz, hist_rot)
         pred_xyz = einops.rearrange(
             pred_xyz, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
         )
@@ -2234,15 +2086,123 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             pred_rot, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
         )
 
+        # No KV cache update in non-streaming mode
+
         if kwargs.get("return_extra", False):
-            extra = extract_text_tokens(self.tokenizer, vlm_outputs.sequences)
-            for text_tokens in extra.keys():
-                extra[text_tokens] = np.array(extra[text_tokens]).reshape(
-                    [input_ids.shape[0], num_traj_sets, num_traj_samples]
-                )
+            extra = extract_text_tokens(self.tokenizer, output_ids)
+            for key in extra:
+                arr = np.array(extra[key])
+                extra[key] = np.broadcast_to(
+                    arr.reshape(batch_size, 1, 1),
+                    [batch_size, num_traj_sets, num_traj_samples],
+                ).copy()
+            extra["dflash_stats"] = {
+                "total_tokens": dflash_stats.total_tokens,
+                "total_iterations": dflash_stats.total_iterations,
+                "acceptance_rate": dflash_stats.acceptance_rate,
+                "mean_acceptance_length": dflash_stats.mean_acceptance_length,
+                "match_rate": dflash_stats.match_rate,
+                "acceptance_lengths": list(dflash_stats.acceptance_lengths),
+            }
+            torch.cuda.synchronize()
+            extra["timing"] = {
+                "encode_time_ms": _ev[0].elapsed_time(_ev[1]),
+                "prefill_time_ms": _ev[1].elapsed_time(_ev[2]),
+                "decode_time_ms": _ev[2].elapsed_time(_ev[4]),
+                "first_token_sample_time_ms": _ev[2].elapsed_time(_ev[3]),
+                "dflash_loop_time_ms": _ev[3].elapsed_time(_ev[4]),
+                "action_time_ms": _ev[5].elapsed_time(_ev[6]),
+                "total_time_ms": _ev[0].elapsed_time(_ev[6]),
+                "num_decode_tokens": dflash_stats.total_tokens,
+            }
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
+    
+    def sample_trajectories_from_flashdrive(
+        self,
+        data: dict[str, Any],
+        torch_compile: str = "max-autotune",
+        streaming: bool = False,
+        dflash: bool = False,
+        top_p: float = 0.98,
+        top_k: int | None = None,
+        max_new_tokens: int = 128,
+        temperature: float = 0.6,
+        num_traj_samples: int = 6,
+        num_traj_sets: int = 1,
+        diffusion_kwargs: dict[str, Any] | None = None,
+        fuse_qkv: bool = False,
+        fuse_gate_up: bool = False,
+        **kwargs: Any,
+    ):
+        """
+        Streaming inference: reuses KV cache across frames.
+
+        First call caches KV state (returns None), subsequent calls reuse cached state.
+        """
+        if streaming:
+            if not dflash:
+                return self._streaming_rollout(
+                    data=data,
+                    torch_compile=torch_compile,
+                    top_p=top_p,
+                    top_k=top_k,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    num_traj_samples=num_traj_samples,
+                    num_traj_sets=num_traj_sets,
+                    diffusion_kwargs=diffusion_kwargs,
+                    fuse_qkv=fuse_qkv,
+                    fuse_gate_up=fuse_gate_up,
+                    **kwargs,
+                )
+            else:
+                return self._dflash_streaming_rollout(
+                    data=data,
+                    torch_compile=torch_compile,
+                    top_p=top_p,
+                    top_k=top_k,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    num_traj_samples=num_traj_samples,
+                    num_traj_sets=num_traj_sets,
+                    diffusion_kwargs=diffusion_kwargs,
+                    fuse_qkv=fuse_qkv,
+                    fuse_gate_up=fuse_gate_up,
+                    **kwargs,
+                )
+        else:
+            if not dflash:
+                return self._non_streaming_rollout(
+                    data=data,
+                    torch_compile=torch_compile,
+                    top_p=top_p,
+                    top_k=top_k,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    num_traj_samples=num_traj_samples,
+                    num_traj_sets=num_traj_sets,
+                    diffusion_kwargs=diffusion_kwargs,
+                    fuse_qkv=fuse_qkv,
+                    fuse_gate_up=fuse_gate_up,
+                    **kwargs,
+                )
+            else:
+                return self._dflash_non_streaming_rollout(
+                    data=data,
+                    torch_compile=torch_compile,
+                    top_p=top_p,
+                    top_k=top_k,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    num_traj_samples=num_traj_samples,
+                    num_traj_sets=num_traj_sets,
+                    diffusion_kwargs=diffusion_kwargs,
+                    fuse_qkv=fuse_qkv,
+                    fuse_gate_up=fuse_gate_up,
+                    **kwargs,
+                )
 
 
 AutoConfig.register("alpamayo1_5", Alpamayo1_5Config)
-AutoModel.register(Alpamayo1_5Config, Alpamayo1_5)
+AutoModel.register(Alpamayo1_5Config, Alpamayo1_5FlashDrive)

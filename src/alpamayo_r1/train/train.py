@@ -46,6 +46,7 @@ def train(cfg):
     logger.info("Loading model...")
     model = AutoModel.from_pretrained(cfg.model_path, dtype=torch.bfloat16)
     model.set_training_stage(cfg.training_stage)
+    model.reset_streaming_state(kv_shift_mode=cfg.kv_shift_mode, keep_frame_labels=cfg.keep_frame_labels)
     logger.info(f"Model loaded, training_stage={cfg.training_stage}")
 
     processor = helper.get_processor(model.tokenizer)

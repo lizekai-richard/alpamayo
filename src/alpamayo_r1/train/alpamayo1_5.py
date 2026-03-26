@@ -152,10 +152,10 @@ class Alpamayo1_5(ReasoningVLA):
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
-        self.keep_frame_labels = True
+        self.keep_frame_labels = False
         self.kv_shift_mode = "vision_only"  # "block" or "vision_only"
     
-    def reset_streaming_state(self):
+    def reset_streaming_state(self, kv_shift_mode: str = "vision_only", keep_frame_labels: bool = False):
         """Reset all streaming state between batches."""
         self._past_key_values = None
         self._cached_position_ids = None
@@ -166,6 +166,10 @@ class Alpamayo1_5(ReasoningVLA):
         self.image_token_ids_ranges = None
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
+        self.keep_frame_labels = keep_frame_labels
+        self.kv_shift_mode = kv_shift_mode
+        assert self.kv_shift_mode in ["block", "vision_only"], "Invalid kv_shift_mode"
+    
     
     def set_training_stage(self, stage: str):
         """Configure which modules are trainable based on training stage.
@@ -190,7 +194,6 @@ class Alpamayo1_5(ReasoningVLA):
             raise ValueError(f"Unknown training stage: {stage!r}. Expected 'vlm' or 'expert'.")
     
     # ==================== Properties ====================
-
     @property
     def traj_start_token_id(self) -> int:
         """Token ID for <traj_future_start>."""

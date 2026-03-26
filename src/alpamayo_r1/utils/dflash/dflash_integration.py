@@ -1323,7 +1323,7 @@ def load_dflash_draft_model(
     draft_model = DFlashDraftModel.from_pretrained(
         draft_model_name_or_path,
         trust_remote_code=True,
-        torch_dtype=dtype,
+        dtype=dtype,
         local_files_only=local_files_only,
     ).to(device).eval()
 
