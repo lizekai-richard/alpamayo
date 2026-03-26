@@ -45,6 +45,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from safetensors import safe_open
 
+import wandb
 from transformers import AutoConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
@@ -661,6 +662,7 @@ class ScratchTrainer:
         epoch: int,
         total_steps: int,
         writer: SummaryWriter | None = None,
+        use_wandb: bool = False,
         log_interval: int = 10,
         max_batches: int | None = None,
     ) -> dict:
@@ -686,12 +688,19 @@ class ScratchTrainer:
                     "lr": f"{lr:.2e}"
                 })
 
-                if writer is not None and self.global_step % log_interval == 0:
-                    writer.add_scalar("train/loss", metrics["loss"], self.global_step)
-                    writer.add_scalar("train/accuracy", metrics["accuracy"], self.global_step)
-                    writer.add_scalar("train/first_token_accuracy", metrics["first_token_acc"], self.global_step)
-                    writer.add_scalar("train/prefix_accuracy", metrics["prefix_acc"], self.global_step)
-                    writer.add_scalar("train/lr", lr, self.global_step)
+                if self.global_step % log_interval == 0:
+                    log_dict = {
+                        "train/loss": metrics["loss"],
+                        "train/accuracy": metrics["accuracy"],
+                        "train/first_token_accuracy": metrics["first_token_acc"],
+                        "train/prefix_accuracy": metrics["prefix_acc"],
+                        "train/lr": lr,
+                    }
+                    if writer is not None:
+                        for k, v in log_dict.items():
+                            writer.add_scalar(k, v, self.global_step)
+                    if use_wandb:
+                        wandb.log(log_dict, step=self.global_step)
 
         avg_loss = total_loss / max(num_batches, 1)
         if self.world_size > 1:
@@ -733,14 +742,13 @@ class ScratchTrainer:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 noise_embedding = self.embed_tokens(masked_input)
 
-                target_hidden_expanded = target_hidden.unsqueeze(1)
-                ctx_len = target_hidden_expanded.shape[1]
+                ctx_len = target_hidden.shape[1]
                 full_seq_len = ctx_len + self.block_size
                 position_ids = torch.arange(full_seq_len, device=self.device).unsqueeze(0).expand(batch_size, -1)
 
                 draft_hidden = self.draft_model(
                     noise_embedding=noise_embedding,
-                    target_hidden=target_hidden_expanded,
+                    target_hidden=target_hidden,
                     position_ids=position_ids,
                     is_causal=False,
                 )
@@ -878,6 +886,15 @@ def main():
     # Performance
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile for faster training (PyTorch 2.0+)")
+    # Logging
+    parser.add_argument("--wandb-project", type=str, default="dflash",
+                        help="Weights & Biases project name (default: dflash)")
+    parser.add_argument("--wandb-run-name", type=str, default=None,
+                        help="Weights & Biases run name (default: auto-generated)")
+    parser.add_argument("--no-wandb", action="store_true",
+                        help="Disable Weights & Biases logging")
+    parser.add_argument("--no-tensorboard", action="store_true",
+                        help="Disable TensorBoard logging")
     args = parser.parse_args()
 
     # Expand ~ in paths
@@ -911,8 +928,18 @@ def main():
 
     # Setup TensorBoard
     writer = None
-    if is_main_process():
+    if is_main_process() and not args.no_tensorboard:
         writer = SummaryWriter(log_dir=str(output_dir / "logs"))
+
+    # Setup wandb
+    use_wandb = not args.no_wandb and is_main_process()
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or exp_name,
+            config=vars(args),
+            dir=str(output_dir),
+        )
 
     if world_size > 1:
         dist.barrier()
@@ -1069,7 +1096,7 @@ def main():
     for epoch in range(1, args.num_epochs + 1):
         train_metrics = trainer.train_epoch(
             train_loader, epoch, total_steps,
-            writer=writer, log_interval=args.log_interval,
+            writer=writer, use_wandb=use_wandb, log_interval=args.log_interval,
             max_batches=max_train_batches,
         )
 
@@ -1084,10 +1111,16 @@ def main():
                 f"val_loss={val_loss:.4f}, val_t1={val_t1:.1%}, val_pfx={val_pfx:.1%}"
             )
 
+            val_log_dict = {
+                "val/loss": val_loss,
+                "val/first_token_accuracy": val_t1,
+                "val/prefix_accuracy": val_pfx,
+            }
             if writer is not None:
-                writer.add_scalar("val/loss", val_loss, epoch)
-                writer.add_scalar("val/first_token_accuracy", val_t1, epoch)
-                writer.add_scalar("val/prefix_accuracy", val_pfx, epoch)
+                for k, v in val_log_dict.items():
+                    writer.add_scalar(k, v, epoch)
+            if use_wandb:
+                wandb.log(val_log_dict, step=trainer.global_step)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -1126,6 +1159,8 @@ def main():
 
         if writer is not None:
             writer.close()
+        if use_wandb:
+            wandb.finish()
 
     cleanup_distributed()
 

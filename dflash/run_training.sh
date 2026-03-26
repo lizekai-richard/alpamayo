@@ -17,9 +17,9 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 GPUS_PER_NODE=8
 
 # Model paths
-TARGET_MODEL="nvidia/Alpamayo-1.5-10B"
-DATA_DIR="/mnt/moosefs-1/users/zekail/dflash_train/b8"
-OUTPUT_DIR="/mnt/moosefs-1/users/zekail/dflash_train/"
+TARGET_MODEL="/mnt/moosefs/users/zekail/Alpamayo-1.5-10B"
+DATA_DIR="/home/zekail/dflash_train/b8"
+OUTPUT_DIR="/home/zekail/dflash_train/"
 
 # Training hyperparameters
 NUM_EPOCHS=15
@@ -38,6 +38,10 @@ PREFIX_WEIGHT_GAMMA=3  # Geometric decay for prefix-weighted CE
 
 # Performance
 USE_COMPILE=true       # Use torch.compile for faster training
+
+# Logging
+WANDB_PROJECT="flashdrive-alpamayo"
+WANDB_RUN_NAME="dflash-training-b8-v1.5"
 
 # ============== Run Training ==============
 echo "=============================================="
@@ -62,6 +66,9 @@ TRAIN_ARGS=(
     --target-layers "$TARGET_LAYERS"
     --prefix-weight-gamma $PREFIX_WEIGHT_GAMMA
     --num-workers 0
+    --wandb-project "$WANDB_PROJECT"
+    --wandb-run-name "$WANDB_RUN_NAME"
+    --no-tensorboard
 )
 
 if [ "$USE_COMPILE" = true ]; then
