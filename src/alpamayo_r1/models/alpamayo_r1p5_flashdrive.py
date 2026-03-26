@@ -1978,17 +1978,23 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         
         # ===== Decode =====
         _ev[2].record()
+        # Expand KV cache and tensors for multi-sample decode
+        if num_samples > 1:
+            self._past_key_values.expand_batch()
+            target_hidden = target_hidden.repeat(num_samples, 1, 1)
+
+        total_batch = batch_size * num_samples
         max_length = seq_len + max_new_tokens
         dflash_output_ids = torch.full(
-            (batch_size, max_length + block_size),
+            (total_batch, max_length + block_size),
             self._dflash_mask_token_id,
             dtype=torch.long,
             device=device,
         )
-        dflash_output_ids[:, :seq_len] = input_ids
+        dflash_output_ids[:, :seq_len] = input_ids.repeat_interleave(num_samples, dim=0)
 
         # Sample first token from prefill logits
-        first_token_logits = logits.unsqueeze(1)
+        first_token_logits = logits.unsqueeze(1).repeat(num_samples, 1, 1)
         first_token = sample_tokens(first_token_logits, 0.0, self._dflash_logits_processor)
         dflash_output_ids[:, seq_len : seq_len + 1] = first_token
         _ev[3].record()
@@ -2036,12 +2042,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         _ev[4].record()
 
         # ===== Action (Diffusion) =====
-        num_samples = num_traj_samples * num_traj_sets
-        # Replicate batch-0 KV and output_ids to all sample slots
-        if num_samples > 1:
-            self._past_key_values.expand_batch()
-        action_start_pos = traj_start_pos + 1
-
+        # KV cache already expanded for multi-sample decode above
         action_start_pos = traj_start_pos + 1
         cur_pos = action_start_pos[0].item()
 
