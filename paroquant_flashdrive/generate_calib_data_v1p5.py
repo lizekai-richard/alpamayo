@@ -224,7 +224,7 @@ def main():
     parser.add_argument(
         "--cache-dir",
         type=str,
-        default="/mnt/moosefs-1/users/zekail/physicalai_av/hf_cache",
+        default="/data/scratch/zekaili/physicalai_av/hf_cache",
         help="PhysicalAI-AV HuggingFace cache directory",
     )
     args = parser.parse_args()

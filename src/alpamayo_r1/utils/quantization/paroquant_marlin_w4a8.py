@@ -341,7 +341,7 @@ def load_paroquant_model(
     device: str = "cuda"
 ):
     from alpamayo_r1.models.alpamayo_r1 import FlashDriveAlpamayoR1
-    from alpamayo_r1.flashdrive.system import patch_for_torch_compile
+    from alpamayo_r1.utils.system import patch_for_torch_compile
 
     model = FlashDriveAlpamayoR1.from_pretrained(model_path, dtype=dtype)
     patch_for_torch_compile(model, mode=mode, fuse_qkv=False, fuse_gate_up=False)
@@ -449,7 +449,7 @@ def load_paroquant_pretrained(
     from pathlib import Path
 
     from alpamayo_r1.models.alpamayo_r1 import FlashDriveAlpamayoR1
-    from alpamayo_r1.flashdrive.system import patch_for_torch_compile
+    from alpamayo_r1.utils.system import patch_for_torch_compile
     from .rotation_linear import RotateLinearInt4
     from .qmodule import WQLinear
     import paroquant_kernels as _pq_kernels  # noqa: F401 — registers rotation ops

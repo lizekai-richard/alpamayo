@@ -309,15 +309,15 @@ def main():
     ap.add_argument("--model-path", default="nvidia/Alpamayo-1.5-10B")
     ap.add_argument("--clip-ids-file", default="./clips.json")
     ap.add_argument("--num-clips", type=int, default=100)
-    ap.add_argument("--num-traj-samples", type=int, default=1,
+    ap.add_argument("--num-traj-samples", type=int, default=6,
                      help="K for minADE_K (default 6)")
     ap.add_argument("--diffusion-steps", type=int, default=8)
     ap.add_argument("--cache-steps", type=int, nargs="+", default=[3, 4, 5, 6])
     ap.add_argument("--warmup-steps", type=int, default=3,
                      help="First N steps excluded from metrics")
-    ap.add_argument("--output-dir", default="./action_cache_results_v1.5")
+    ap.add_argument("--output-dir", default="./action_cache_results_v1p5_8steps")
     ap.add_argument("--cache-dir", default="/data/scratch/zekaili/physicalai_av/hf_cache")
-    ap.add_argument("--dumped-data-dir", default="/data/scratch/zekaili/dumped_eval_data_v1.5")
+    ap.add_argument("--dumped-data-dir", default="/data/scratch/zekaili/dumped_eval_data_v1p5")
     args = ap.parse_args()
 
     for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir", "dumped_data_dir"):
@@ -410,7 +410,7 @@ def main():
                     result = model.sample_trajectories_from_data_with_vlm_rollout(
                         data=helper.to_device(inputs, device),
                         num_traj_samples=args.num_traj_samples,
-                        max_new_tokens=128,
+                        max_generation_length=128,
                         return_extra=True,
                         fuse_qkv=True,
                         fuse_gate_up=True,
@@ -418,7 +418,7 @@ def main():
                             "inference_step": args.diffusion_steps,
                             "cache_steps": args.cache_steps,
                             "int_method": "euler_with_cache"
-                        },
+                        }
                     )
 
                 pred_xyz, pred_rot, extra = result

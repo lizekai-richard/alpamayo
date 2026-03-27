@@ -482,6 +482,13 @@ class Alpamayo1_5(ReasoningVLA):
 
             unfinished = unfinished & (next_token != self.traj_start_token_id)
             if not unfinished.any():
+                # IMPORTANT: We need to populate the kv cache for the <traj_future_start> token.
+                self._decode(
+                    input_ids=next_token.unsqueeze(-1),                                                           
+                    position_ids=(cur_pos + rope_deltas).unsqueeze(0).expand(3, -1, -1),
+                    cache_position=torch.tensor([cur_pos], device=device),                                        
+                )
+                cur_pos += 1
                 break
 
             logits = self._decode(

@@ -760,6 +760,7 @@ class StreamingAlpamayo1_5(ReasoningVLA):
             output_ids = output_ids.expand(num_samples, -1).contiguous()
         unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
         cur_pos = cache_position[-1].item() + 1
+        num_decode_tokens = 0
 
         for _ in range(max_new_tokens):
             logits = logits_processor(output_ids, logits)
@@ -771,6 +772,14 @@ class StreamingAlpamayo1_5(ReasoningVLA):
 
             unfinished = unfinished & (next_token != self.traj_start_token_id)
             if not unfinished.any():
+                # IMPORTANT: We need to populate the kv cache for the <traj_future_start> token.
+                self._decode(
+                    input_ids=next_token.unsqueeze(-1),
+                    position_ids=self._cached_position_ids,
+                    cache_position=torch.tensor([cur_pos], device=device),
+                )
+                cur_pos += 1
+                num_decode_tokens += 1
                 break
 
             logits = self._decode(
@@ -779,13 +788,13 @@ class StreamingAlpamayo1_5(ReasoningVLA):
                 cache_position=torch.tensor([cur_pos], device=device),
             )
             cur_pos += 1
+            num_decode_tokens += 1
 
         output_ids = replace_padding_after_eos(
             token_ids=output_ids,
             eos_token_id=self.traj_start_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
         )
-        num_decode_tokens = output_ids.shape[1] - self.prefill_seq_length
         _ev[4].record()
 
         # Find <traj_future_start> position

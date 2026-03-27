@@ -311,9 +311,9 @@ def main():
                      help="K for minADE_K (default 6)")
     ap.add_argument("--warmup-steps", type=int, default=3,
                      help="First N steps excluded from metrics")
-    ap.add_argument("--output-dir", default="./system_opt_results_v1.5")
+    ap.add_argument("--output-dir", default="./system_opt_results_v1p5")
     ap.add_argument("--cache-dir", default="/data/scratch/zekaili/hf_cache")
-    ap.add_argument("--dumped-data-dir", default="/data/scratch/zekaili/dumped_eval_data_v1.5")
+    ap.add_argument("--dumped-data-dir", default="/data/scratch/zekaili/dumped_eval_data_v1p5")
     args = ap.parse_args()
 
     for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir", "dumped_data_dir"):

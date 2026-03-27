@@ -1452,6 +1452,15 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
             unfinished = unfinished & (next_token != self.traj_start_token_id)
             if not unfinished.any():
+                # IMPORTANT: We need to populate the kv cache for the <traj_future_start> token.
+                self._decode(
+                    input_ids=next_token.unsqueeze(-1),
+                    position_ids=self._cached_position_ids,
+                    cache_position=torch.tensor([cur_pos], device=device),
+                    mode="streaming",
+                )
+                cur_pos += 1
+                num_decode_tokens += 1
                 break
 
             logits = self._decode(
@@ -1621,6 +1630,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
         cur_pos = cache_position[-1].item() + 1
         num_decode_tokens = 0
+        
         for _ in range(max_new_tokens):
             logits = logits_processor(output_ids, logits)
             probs = torch.softmax(logits, dim=-1)
@@ -1631,13 +1641,21 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
             unfinished = unfinished & (next_token != self.traj_start_token_id)
             if not unfinished.any():
+                self._decode(
+                    input_ids=next_token.unsqueeze(-1),                                                           
+                    position_ids=(cur_pos + rope_deltas).unsqueeze(0).expand(3, -1, -1),
+                    cache_position=torch.tensor([cur_pos], device=device),                                        
+                    mode="non-streaming",
+                )
+                cur_pos += 1
+                num_decode_tokens += 1
                 break
 
             logits = self._decode(
                 input_ids=next_token.unsqueeze(-1),
-                position_ids=self._cached_position_ids,
+                position_ids=(cur_pos + rope_deltas).unsqueeze(0).expand(3, -1, -1),
                 cache_position=torch.tensor([cur_pos], device=device),
-                mode="streaming",
+                mode="non-streaming",
             )
             cur_pos += 1
             num_decode_tokens += 1

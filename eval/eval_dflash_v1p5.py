@@ -280,7 +280,7 @@ def aggregate_results_across_ranks(
 def main():
     ap = argparse.ArgumentParser(description="DFlash + system-opt eval (non-streaming, torch.compile + speculative decoding)")
     ap.add_argument("--model-path", default="nvidia/Alpamayo-1.5-10B")
-    ap.add_argument("--draft-model", default="/home/zekail/dflash_train/dflash_train_0326_031200/best",
+    ap.add_argument("--draft-model", default="/home/zekaili/Alpamayo1_5-DFlash",
                      help="Path to DFlash draft model")
     ap.add_argument("--clip-ids-file", default="./clips.json")
     ap.add_argument("--num-clips", type=int, default=100)
@@ -292,8 +292,8 @@ def main():
     ap.add_argument("--warmup-steps", type=int, default=3,
                      help="First N steps excluded from metrics")
     ap.add_argument("--output-dir", default="./eval_dflash_v1p5_results")
-    ap.add_argument("--cache-dir", default="/mnt/moosefs-1/users/zekail/physicalai_av/hf_cache")
-    ap.add_argument("--dumped-data-dir", default="/mnt/moosefs/users/zekail/dumped_eval_data_v1p5/")
+    ap.add_argument("--cache-dir", default="/data/scratch/zekaili/physicalai_av/hf_cache")
+    ap.add_argument("--dumped-data-dir", default="/data/scratch/zekaili/dumped_eval_data_v1p5/")
     args = ap.parse_args()
 
     for attr in ("model_path", "draft_model", "clip_ids_file", "output_dir", "cache_dir", "dumped_data_dir"):
@@ -421,12 +421,12 @@ def main():
                     dflash_str = ""
                     if ds:
                         loop_ms = timing.get("dflash_loop_time_ms", 0)
-                        traj_fwd_ms = timing.get("traj_forward_time_ms", 0)
                         dflash_str = (
-                            f", dflash: loop={loop_ms:.1f}ms traj_fwd={traj_fwd_ms:.1f}ms "
+                            f", dflash: loop={loop_ms:.1f}ms "
                             f"accept={ds['acceptance_rate']:.0%} "
                             f"len={ds['mean_acceptance_length']:.2f} "
                             f"iters={ds['total_iterations']}"
+                            f"blocks={ds['acceptance_lengths']}"
                         )
                     log.info(
                         f"  Step {si}{tag}: {total:.1f}ms "
@@ -507,7 +507,6 @@ def main():
         log.info(f"\n  DFlash decode breakdown:")
         log.info(f"    Avg first_token_sample: {avg('first_token_sample_time_ms'):.1f} ms")
         log.info(f"    Avg dflash_loop:    {avg('dflash_loop_time_ms'):.1f} ms")
-        log.info(f"    Avg traj_forward:   {avg('traj_forward_time_ms'):.1f} ms")
 
     if all_dflash_stats:
         def ds_avg(key):
@@ -553,7 +552,6 @@ def main():
                     "avg_num_tokens": float(np.mean([t.get("num_decode_tokens", 0) for t in all_timing])),
                     "avg_first_token_sample_ms": float(np.mean([t.get("first_token_sample_time_ms", 0) for t in all_timing])),
                     "avg_dflash_loop_ms": float(np.mean([t.get("dflash_loop_time_ms", 0) for t in all_timing])),
-                    "avg_traj_forward_ms": float(np.mean([t.get("traj_forward_time_ms", 0) for t in all_timing])),
                 } if all_timing else {}),
                 **({
                     "avg_acceptance_rate": float(np.mean([d["acceptance_rate"] for d in all_dflash_stats])),

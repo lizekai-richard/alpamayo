@@ -7,7 +7,7 @@ import glob
 random.seed(42)
 np.random.seed(42)
 
-files = sorted(glob.glob("action_10steps/*.pt"))
+files = sorted(glob.glob("action_8steps/*.pt"))
 
 all_cos_sims = []
 
