@@ -1375,6 +1375,8 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             input_ids, {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot}
         )
 
+        _ev = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
+
         # Setup generation
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
 
@@ -1400,6 +1402,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 return None, None, None
             return None, None
 
+        _ev[0].record()
         # ===== Encode =====
         image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)
 
@@ -1411,7 +1414,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         # Create cache position and position IDs
         cache_position = self._create_cache_position().to(device)
         streaming_input_len = input_ids.shape[1]
-
+        _ev[1].record()
         # Create streaming attention mask for non-first prefill
         if self._cached_streaming_attention_mask is None:
             streaming_attention_mask = self._get_streaming_attention_mask(
@@ -1429,7 +1432,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             deepstack_image_embeds=deepstack_image_embeds,
             streaming_attention_mask=self._cached_streaming_attention_mask,
         )
-
+        _ev[2].record()
         # ===== Decode =====
         output_ids = input_ids.clone()
         if num_samples > 1:
@@ -1438,7 +1441,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             output_ids = output_ids.expand(num_samples, -1).contiguous()
         unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
         cur_pos = cache_position[-1].item() + 1
-
+        num_decode_tokens = 0
         for _ in range(max_new_tokens):
             logits = logits_processor(output_ids, logits)
             probs = torch.softmax(logits, dim=-1)
@@ -1458,7 +1461,8 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 mode="streaming",
             )
             cur_pos += 1
-
+            num_decode_tokens += 1
+            
         output_ids = replace_padding_after_eos(
             token_ids=output_ids,
             eos_token_id=self.traj_start_token_id,
@@ -1467,7 +1471,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
         # Find <traj_future_start> position
         traj_start_pos = self._find_traj_start_positions(output_ids)
-
+        _ev[3].record()
         # ===== Action (Diffusion) =====
         num_samples = num_traj_samples * num_traj_sets
 
@@ -1496,7 +1500,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             mode="streaming",
             diffusion_kwargs=diffusion_kwargs,
         )
-
+        _ev[4].record()
         # Convert actions to trajectories
         hist_xyz = einops.repeat(ego_history_xyz[:, -1], "b ... -> (b n) ...", n=num_samples)
         hist_rot = einops.repeat(ego_history_rot[:, -1], "b ... -> (b n) ...", n=num_samples)
@@ -1517,7 +1521,16 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 extra[key] = np.array(extra[key]).reshape(
                     [batch_size, num_traj_sets, num_traj_samples]
                 )
+            extra["timing"] = {
+                "encode_time_ms": _ev[0].elapsed_time(_ev[1]),
+                "prefill_time_ms": _ev[1].elapsed_time(_ev[2]),
+                "decode_time_ms": _ev[2].elapsed_time(_ev[3]),
+                "action_time_ms": _ev[3].elapsed_time(_ev[4]),
+                "total_time_ms": _ev[0].elapsed_time(_ev[4]),
+                "num_decode_tokens": num_decode_tokens,
+            }
             return pred_xyz, pred_rot, extra
+        
         return pred_xyz, pred_rot
     
     @torch.inference_mode()
@@ -1561,6 +1574,8 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             input_ids, {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot}
         )
 
+        _ev = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
+
         # Setup generation
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
         seq_len = input_ids.shape[1]
@@ -1578,7 +1593,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
         # Compute position_ids
         position_ids, rope_deltas = self.vlm.model.get_rope_index(input_ids, image_grid_thw)
-
+        _ev[0].record()
         # Get embeddings
         inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
 
@@ -1586,7 +1601,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)
         image_mask = (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-
+        _ev[1].record()
         # ===== Prefill =====
         cache_position = torch.arange(seq_len, device=device)
         logits = self._prefill(
@@ -1596,7 +1611,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             visual_pos_masks=image_mask[..., 0],
             deepstack_image_embeds=deepstack_image_embeds
         )
-
+        _ev[2].record()
         # ===== Decode =====
         output_ids = input_ids.clone()
         if num_samples > 1:
@@ -1605,7 +1620,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             output_ids = output_ids.expand(num_samples, -1).contiguous()
         unfinished = torch.ones(batch_size * num_samples, dtype=torch.bool, device=device)
         cur_pos = cache_position[-1].item() + 1
-
+        num_decode_tokens = 0
         for _ in range(max_new_tokens):
             logits = logits_processor(output_ids, logits)
             probs = torch.softmax(logits, dim=-1)
@@ -1625,13 +1640,14 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 mode="streaming",
             )
             cur_pos += 1
+            num_decode_tokens += 1
 
         output_ids = replace_padding_after_eos(
             token_ids=output_ids,
             eos_token_id=self.traj_start_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
         )
-
+        _ev[3].record()
         # Find <traj_future_start> position
         traj_start_pos = self._find_traj_start_positions(output_ids)
         action_start_pos = traj_start_pos + 1
@@ -1666,7 +1682,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             mode="non-streaming",
             diffusion_kwargs=diffusion_kwargs,
         )
-
+        _ev[4].record()
         # Convert actions to trajectories
         hist_xyz = einops.repeat(ego_history_xyz[:, -1], "b ... -> (b n) ...", n=num_samples)
         hist_rot = einops.repeat(ego_history_rot[:, -1], "b ... -> (b n) ...", n=num_samples)
@@ -1684,6 +1700,14 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 extra[key] = np.array(extra[key]).reshape(
                     [batch_size, num_traj_sets, num_traj_samples]
                 )
+            extra["timing"] = {
+                "encode_time_ms": _ev[0].elapsed_time(_ev[1]),
+                "prefill_time_ms": _ev[1].elapsed_time(_ev[2]),
+                "decode_time_ms": _ev[2].elapsed_time(_ev[3]),
+                "action_time_ms": _ev[3].elapsed_time(_ev[4]),
+                "total_time_ms": _ev[0].elapsed_time(_ev[4]),
+                "num_decode_tokens": num_decode_tokens,
+            }
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
     
@@ -1726,6 +1750,8 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             input_ids, {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot}
         )
 
+        _ev = [torch.cuda.Event(enable_timing=True) for _ in range(6)]
+
         # Setup generation
         block_size = self._dflash_block_size
 
@@ -1752,6 +1778,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 return None, None, None
             return None, None
 
+        _ev[0].record()
         # Get embeddings
         inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
 
@@ -1759,6 +1786,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)
         image_mask = (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        _ev[1].record()
 
         # Create cache position and position IDs
         cache_position = self._create_cache_position().to(device)
@@ -1781,7 +1809,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             deepstack_image_embeds=deepstack_image_embeds,
             streaming_attention_mask=self._cached_streaming_attention_mask,
         )
-
+        _ev[2].record()
         # ===== DFlash Decode =====
         num_input_tokens = self.prefill_seq_length
 
@@ -1800,9 +1828,10 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         first_token_logits = logits.unsqueeze(1)  # (1, 1, vocab)
         first_token = sample_tokens(first_token_logits, 0.0, self._dflash_logits_processor)
         dflash_output_ids[:, num_input_tokens : num_input_tokens + 1] = first_token
+        _ev[3].record()
 
-        # Run speculative decode loop (stop at <cot_end>, matching external accelerator)
-        # cot_end_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("cot_end"))
+        # Run speculative decode loop (stop at <cot_end>)
+        cot_end_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("cot_end"))
         dflash_output_ids, dflash_end_pos, dflash_stats, cur_seq_len = self._dflash_decode_loop(
             output_ids=dflash_output_ids,
             num_input_tokens=num_input_tokens,
@@ -1811,26 +1840,22 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             rope_deltas=self._cached_rope_deltas,
             max_new_tokens=max_new_tokens,
             temperature=0.0,
-            # stop_token_ids=[cot_end_token_id],
-            stop_token_ids=[self.traj_start_token_id],
+            stop_token_ids=[cot_end_token_id],
             full_position_ids=self._cached_position_ids,
             mode="streaming",
         )
-
         # Forward <traj_future_start> through LLM to populate KV cache entry.
         # Without this, the StaticCache at traj position has zeros — the action
         # decoder attends to these zeros, degrading trajectory quality.
-        # traj_token = torch.tensor([[self.traj_start_token_id]], device=device)
-        # traj_cache_position = torch.tensor([cur_seq_len], device=device, dtype=torch.long)
-        # self._dflash_traj_forward(
-        #     traj_token, self._cached_position_ids, traj_cache_position, mode="streaming",
-        # )
-
-        # Reconstruct output_ids for traj_start_pos finding
-        # We need input_ids (streaming portion) + generated tokens + <traj_future_start>
+        traj_token = torch.tensor([[self.traj_start_token_id]], device=device)
+        traj_cache_position = torch.tensor([cur_seq_len], device=device, dtype=torch.long)
+        self._dflash_traj_forward(
+            traj_token, self._cached_position_ids, traj_cache_position, mode="streaming",
+        )
+        
+        # Reconstruct output_ids: input + generated + <traj_future_start>
         generated_tokens = dflash_output_ids[:, num_input_tokens:]
-        # output_ids = torch.cat([input_ids, generated_tokens, traj_token], dim=-1)
-        output_ids = torch.cat([input_ids, generated_tokens], dim=-1)
+        output_ids = torch.cat([input_ids, generated_tokens, traj_token], dim=-1)
 
         output_ids = replace_padding_after_eos(
             token_ids=output_ids,
@@ -1840,7 +1865,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
         # Find <traj_future_start> position
         traj_start_pos = self._find_traj_start_positions(output_ids)
-
+        _ev[4].record()
         # ===== Action (Diffusion) =====
         num_samples = num_traj_samples * num_traj_sets
         if num_samples > 1:
@@ -1872,7 +1897,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             mode="streaming",
             diffusion_kwargs=diffusion_kwargs,
         )
-
+        _ev[5].record()
         # Convert actions to trajectories
         hist_xyz = einops.repeat(ego_history_xyz[:, -1], "b ... -> (b n) ...", n=num_samples)
         hist_rot = einops.repeat(ego_history_rot[:, -1], "b ... -> (b n) ...", n=num_samples)
@@ -1893,6 +1918,25 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 extra[key] = np.array(extra[key]).reshape(
                     [batch_size, num_traj_sets, num_traj_samples]
                 )
+            extra["dflash_stats"] = {
+                "total_tokens": dflash_stats.total_tokens,
+                "total_iterations": dflash_stats.total_iterations,
+                "acceptance_rate": dflash_stats.acceptance_rate,
+                "mean_acceptance_length": dflash_stats.mean_acceptance_length,
+                "match_rate": dflash_stats.match_rate,
+                "acceptance_lengths": list(dflash_stats.acceptance_lengths),
+            }
+            torch.cuda.synchronize()
+            extra["timing"] = {
+                "encode_time_ms": _ev[0].elapsed_time(_ev[1]),
+                "prefill_time_ms": _ev[1].elapsed_time(_ev[2]),
+                "decode_time_ms": _ev[2].elapsed_time(_ev[4]),
+                "first_token_sample_time_ms": _ev[2].elapsed_time(_ev[3]),
+                "dflash_loop_time_ms": _ev[3].elapsed_time(_ev[4]),
+                "action_time_ms": _ev[4].elapsed_time(_ev[5]),
+                "total_time_ms": _ev[0].elapsed_time(_ev[5]),
+                "num_decode_tokens": dflash_stats.total_tokens + 1,  # +1 for <traj_future_start> token
+            }
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
     
@@ -1951,13 +1995,13 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         # Timing events (async, no pipeline stall)
         _ev = [torch.cuda.Event(enable_timing=True) for _ in range(6)]
 
-        _ev[0].record()
         inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
         position_ids, rope_deltas = self.vlm.model.get_rope_index(
             input_ids, image_grid_thw, None, None,
         )
 
         # ===== Encode =====
+        _ev[0].record()
         image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)
         image_mask = (
             (input_ids == self.vlm.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
@@ -1978,10 +2022,6 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         
         # ===== Decode =====
         _ev[2].record()
-        # Expand KV cache and tensors for multi-sample decode
-            # target_hidden = target_hidden.repeat(num_samples, 1, 1)
-
-        # total_batch = batch_size * num_samples
         max_length = seq_len + max_new_tokens
         dflash_output_ids = torch.full(
             (batch_size, max_length + block_size),
@@ -1989,17 +2029,15 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             dtype=torch.long,
             device=device,
         )
-        # dflash_output_ids[:, :seq_len] = input_ids.repeat_interleave(num_samples, dim=0)
         dflash_output_ids[:, :seq_len] = input_ids
 
         # Sample first token from prefill logits
-        # first_token_logits = logits.unsqueeze(1).repeat(num_samples, 1, 1)
         first_token_logits = logits.unsqueeze(1)
         first_token = sample_tokens(first_token_logits, 0.0, self._dflash_logits_processor)
         dflash_output_ids[:, seq_len : seq_len + 1] = first_token
         _ev[3].record()
 
-        # Run speculative decode loop (stop at <traj_future_start>, matching streaming path)
+        # Run speculative decode loop (stop at <cot_end>, matching streaming path)
         traj_start_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
         cot_end_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("cot_end"))
         dflash_output_ids, dflash_end_pos, dflash_stats, cur_seq_len = self._dflash_decode_loop(
@@ -2010,17 +2048,15 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             rope_deltas=rope_deltas,
             max_new_tokens=max_new_tokens,
             temperature=0.0,
-            # stop_token_ids=[traj_start_token_id],
             stop_token_ids=[cot_end_token_id],
             full_position_ids=None,
             mode="non_streaming",
         )
 
-        # Append <traj_future_start> and forward through LLM to populate KV cache.
-        # Without this forward, the StaticCache at traj_start_pos has zeros — the
-        # action decoder attends to these zeros, degrading trajectory quality.
-        # Uses compiled path (_dflash_traj_forward) when torch.compile is active.
-        traj_token = torch.tensor([[self.traj_start_token_id]], device=device)
+        # Forward <traj_future_start> through LLM to populate KV cache entry.
+        # Without this, the StaticCache at traj position has zeros — the action
+        # decoder attends to these zeros, degrading trajectory quality.
+        traj_token = torch.tensor([[traj_start_token_id]], device=device)
         traj_position_ids = (
             torch.tensor([[[cur_seq_len]]], device=device, dtype=torch.long).expand(3, 1, 1)
             + rope_deltas.unsqueeze(-1)
@@ -2030,10 +2066,9 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             traj_token, traj_position_ids, traj_cache_position, mode="non_streaming",
         )
 
-        # generated_tokens = dflash_output_ids[:, seq_len:]
-        # expanded_input_ids = input_ids.expand(total_batch, -1)
-        # output_ids = torch.cat([expanded_input_ids, generated_tokens], dim=-1)
-        output_ids = torch.cat([dflash_output_ids, traj_token], dim=-1)
+        # Reconstruct output_ids for traj_start_pos finding
+        generated_tokens = dflash_output_ids[:, seq_len:]
+        output_ids = torch.cat([input_ids, generated_tokens, traj_token], dim=-1)
 
         output_ids = replace_padding_after_eos(
             token_ids=output_ids,
@@ -2047,7 +2082,8 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         _ev[4].record()
 
         # ===== Action (Diffusion) =====
-        # KV cache already expanded for multi-sample decode above
+        num_samples = num_traj_samples * num_traj_sets
+        # Replicate batch-0 KV to all sample slots before multi-sample action
         if num_samples > 1:
             self._past_key_values.expand_batch()
         action_start_pos = traj_start_pos + 1
@@ -2098,14 +2134,11 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         if kwargs.get("return_extra", False):
             extra = extract_text_tokens(self.tokenizer, output_ids)
             for key in extra:
-                arr = np.array(extra[key])
+                # CoT is generated once (batch=1), broadcast to match num_traj_samples
                 extra[key] = np.broadcast_to(
-                    arr.reshape(batch_size, 1, 1),
+                    np.array(extra[key]).reshape(batch_size, 1, 1),
                     [batch_size, num_traj_sets, num_traj_samples],
                 ).copy()
-                # extra[key] = np.array(extra[key]).reshape(
-                #     [batch_size, num_traj_sets, num_traj_samples]
-                # )
             extra["dflash_stats"] = {
                 "total_tokens": dflash_stats.total_tokens,
                 "total_iterations": dflash_stats.total_iterations,

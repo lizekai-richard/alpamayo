@@ -276,6 +276,8 @@ class OfflineDistillationDataset(Dataset):
         seed: int = 42,
         target_layer_ids: list[int] | None = None,
         hidden_dim: int = 4096,
+        traj_token_id: int | None = None,
+        traj_pad_count: int = 0,
     ):
         self.data_dir = Path(data_dir)
         self.rank = rank
@@ -404,6 +406,38 @@ class OfflineDistillationDataset(Dataset):
         else:
             self.topk_values = None
             self.topk_indices = None
+
+        # Augment: for rows ending with traj_token_id, create shifted copies
+        # to teach the draft model to predict the stop token at various positions
+        if traj_token_id is not None and traj_pad_count > 0 and split == "train":
+            mask = self.future_tokens[:, -1] == traj_token_id
+            if mask.any():
+                src_hidden = self.target_hidden[mask]
+                src_tokens = self.future_tokens[mask]
+                src_labels = self.labels[mask]
+                M = src_hidden.shape[0]
+                block_size = src_tokens.shape[1]
+                ctx_len = src_hidden.shape[1]
+
+                aug_hidden, aug_tokens, aug_labels = [], [], []
+                for k in range(1, traj_pad_count + 1):
+                    # Shift tokens left by k, fill right with traj_token_id
+                    shifted_tok = torch.full((M, block_size), traj_token_id, dtype=src_tokens.dtype)
+                    shifted_tok[:, :block_size - k] = src_tokens[:, k:]
+                    shifted_lab = torch.full((M, block_size), traj_token_id, dtype=src_labels.dtype)
+                    shifted_lab[:, :block_size - k] = src_labels[:, k:]
+                    # Shift hidden left by k, pad right by repeating last hidden
+                    shifted_h = src_hidden[:, -1:, :].expand(-1, ctx_len, -1).clone()
+                    if ctx_len - k > 0:
+                        shifted_h[:, :ctx_len - k, :] = src_hidden[:, k:, :]
+                    aug_hidden.append(shifted_h)
+                    aug_tokens.append(shifted_tok)
+                    aug_labels.append(shifted_lab)
+
+                self.target_hidden = torch.cat([self.target_hidden] + aug_hidden, dim=0)
+                self.future_tokens = torch.cat([self.future_tokens] + aug_tokens, dim=0)
+                self.labels = torch.cat([self.labels] + aug_labels, dim=0)
+                logger.info(f"[Rank {log_rank}] Augmented {M * traj_pad_count} traj-pad rows (pad={traj_pad_count})")
 
         log_rank = rank if rank >= 0 else 0
         logger.info(f"[Rank {log_rank}] {split}: {len(self)} blocks")
@@ -895,6 +929,11 @@ def main():
                         help="Disable Weights & Biases logging")
     parser.add_argument("--no-tensorboard", action="store_true",
                         help="Disable TensorBoard logging")
+    # Stop token augmentation
+    parser.add_argument("--traj-token-id", type=int, default=155681,
+                        help="Token ID of <traj_future_start> for augmentation")
+    parser.add_argument("--traj-pad-count", type=int, default=0,
+                        help="Number of shifted copies to add per traj row (0=disabled)")
     args = parser.parse_args()
 
     # Expand ~ in paths
@@ -1016,6 +1055,8 @@ def main():
         args.data_dir, rank=rank, world_size=world_size,
         split="train", val_ratio=0.1,
         target_layer_ids=target_layer_ids,
+        traj_token_id=args.traj_token_id,
+        traj_pad_count=args.traj_pad_count,
     )
     val_dataset = OfflineDistillationDataset(
         args.data_dir, rank=rank, world_size=world_size,
