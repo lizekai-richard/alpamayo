@@ -7,7 +7,7 @@ import glob
 random.seed(42)
 np.random.seed(42)
 
-files = sorted(glob.glob("action/all_steps_vs_*.pt"))
+files = sorted(glob.glob("action_10steps/*.pt"))
 
 all_cos_sims = []
 
@@ -18,8 +18,9 @@ for f in files:
 
     for w_idx in indices:
         steps = data[w_idx]
+        n_steps = len(steps)
         cos_sims = []
-        for i in range(7):
+        for i in range(n_steps - 1):
             vi = steps[i].float().flatten()
             vi1 = steps[i + 1].float().flatten()
             cos = torch.nn.functional.cosine_similarity(vi.unsqueeze(0), vi1.unsqueeze(0)).item()
@@ -27,11 +28,12 @@ for f in files:
         all_cos_sims.append(cos_sims)
 
 all_cos_sims = np.array(all_cos_sims)
+n_pairs = all_cos_sims.shape[1]
 
 fig, ax = plt.subplots(figsize=(8, 5))
 
-x = np.arange(7)
-x_labels = [f"{i}\u2192{i+1}" for i in range(7)]
+x = np.arange(n_pairs)
+x_labels = [f"{i}\u2192{i+1}" for i in range(n_pairs)]
 
 for i in range(all_cos_sims.shape[0]):
     ax.plot(x, all_cos_sims[i], color='steelblue', alpha=0.08, linewidth=0.8)

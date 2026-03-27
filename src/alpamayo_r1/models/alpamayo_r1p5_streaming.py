@@ -692,6 +692,8 @@ class StreamingAlpamayo1_5(ReasoningVLA):
             input_ids, {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot}
         )
 
+        _ev = [torch.cuda.Event(enable_timing=True) for _ in range(6)]
+
         # Setup generation
         max_new_tokens = kwargs.get("max_generation_length", self.config.tokens_per_future_traj)
         logits_processor = self._build_logits_processor(temperature, top_k, top_p)
@@ -717,9 +719,10 @@ class StreamingAlpamayo1_5(ReasoningVLA):
             return None
 
         # ===== Encode =====
+        _ev[0].record()
         image_embeds, deepstack_image_embeds = self._encode(pixel_values, image_grid_thw)
         inputs_embeds = self.vlm.model.get_input_embeddings()(input_ids)
-
+        _ev[1].record()
         # Create cache position and position IDs
         cache_position = self._create_cache_position().to(device)
         seq_len = input_ids.shape[1]
@@ -739,6 +742,7 @@ class StreamingAlpamayo1_5(ReasoningVLA):
             self._cached_streaming_attention_mask = streaming_attention_mask
 
         # ===== Prefill =====
+        _ev[2].record()
         logits = self._prefill(
             inputs_embeds=inputs_embeds,
             position_ids=self._cached_position_ids,
@@ -747,7 +751,7 @@ class StreamingAlpamayo1_5(ReasoningVLA):
             deepstack_image_embeds=deepstack_image_embeds,
             streaming_attention_mask=self._cached_streaming_attention_mask,
         )
-
+        _ev[3].record()
         # ===== Decode =====
         output_ids = input_ids.clone()
         if num_samples > 1:
@@ -781,6 +785,8 @@ class StreamingAlpamayo1_5(ReasoningVLA):
             eos_token_id=self.traj_start_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
         )
+        num_decode_tokens = output_ids.shape[1] - self.prefill_seq_length
+        _ev[4].record()
 
         # Find <traj_future_start> position
         traj_start_pos = self._find_traj_start_positions(output_ids)
@@ -818,6 +824,7 @@ class StreamingAlpamayo1_5(ReasoningVLA):
             attention_mask=attention_mask,
             diffusion_kwargs=diffusion_kwargs,
         )
+        _ev[5].record()
 
         # Convert actions to trajectories
         hist_xyz = einops.repeat(ego_history_xyz[:, -1], "b ... -> (b n) ...", n=num_samples)
@@ -840,6 +847,15 @@ class StreamingAlpamayo1_5(ReasoningVLA):
                 extra[key] = np.array(extra[key]).reshape(
                     [batch_size, num_traj_sets, num_traj_samples]
                 )
+            torch.cuda.synchronize()
+            extra["timing"] = {
+                "encode_time_ms": _ev[0].elapsed_time(_ev[1]),
+                "prefill_time_ms": _ev[2].elapsed_time(_ev[3]),
+                "decode_time_ms": _ev[3].elapsed_time(_ev[4]),
+                "action_time_ms": _ev[4].elapsed_time(_ev[5]),
+                "total_time_ms": _ev[0].elapsed_time(_ev[5]),
+                "num_decode_tokens": num_decode_tokens,
+            }
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
 
