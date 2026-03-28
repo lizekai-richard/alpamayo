@@ -1893,6 +1893,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         _ev[3].record()
 
         # Run speculative decode loop (stop at <cot_end>)
+        traj_start_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
         cot_end_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("cot_end"))
         dflash_output_ids, dflash_end_pos, dflash_stats, cur_seq_len = self._dflash_decode_loop(
             output_ids=dflash_output_ids,
@@ -1909,7 +1910,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         # Forward <traj_future_start> through LLM to populate KV cache entry.
         # Without this, the StaticCache at traj position has zeros — the action
         # decoder attends to these zeros, degrading trajectory quality.
-        traj_token = torch.tensor([[self.traj_start_token_id]], device=device)
+        traj_token = torch.tensor([[traj_start_token_id]], device=device)
         traj_cache_position = torch.tensor([cur_seq_len], device=device, dtype=torch.long)
         self._dflash_traj_forward(
             traj_token, self._cached_position_ids, traj_cache_position, mode="streaming",
