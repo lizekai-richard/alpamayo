@@ -1,41 +1,42 @@
 #!/usr/bin/env python3
-"""Streaming evaluation (no DFlash): torch.compile + KV cache reuse across frames.
+"""DFlash + streaming evaluation: streaming mode with torch.compile + speculative decoding.
 
-Uses streaming=True, dflash=False — torch.compile + static cache + autoregressive
-decode + KV cache reuse across frames. No speculative decoding.
+Uses the dev branch AlpamayoR1 with streaming=True, dflash=True — torch.compile + static
+cache + DFlash speculative decoding + KV cache reuse across frames.
 First frame per clip is a prefill (returns None), subsequent frames stream incrementally.
 Runs through clips from 1.7s to 13.6s at 10Hz (120 timesteps).
-Reports minADE_K (default K=6) and per-step timing.
+Reports minADE_K (default K=6), per-step timing, and DFlash acceptance stats.
 
 Usage:
-    python eval/eval_streaming.py
-    python eval/eval_streaming.py --num-clips 10 --diffusion-steps 5
-    python eval/eval_streaming.py --num-traj-samples 1
+    python eval/eval_streaming_dflash_action_v1p5.py
+    python eval/eval_streaming_dflash_action_v1p5.py --num-clips 10 --diffusion-steps 5
+    python eval/eval_streaming_dflash_action_v1p5.py --num-traj-samples 1
 
     # Multi-GPU (using torchrun or similar)
-    torchrun --nproc_per_node=4 eval/eval_streaming_v1p5.py --num-clips 100
+    torchrun --nproc_per_node=4 eval/eval_streaming_dflash_action_v1p5.py --num-clips 100
 
     # Manual multi-GPU (set environment variables)
-    RANK=0 WORLD_SIZE=2 LOCAL_RANK=0 python eval/eval_streaming_v1p5.py --num-clips 100 &
-    RANK=1 WORLD_SIZE=2 LOCAL_RANK=1 python eval/eval_streaming_v1p5.py --num-clips 100 &
+    RANK=0 WORLD_SIZE=2 LOCAL_RANK=0 python eval/eval_streaming_dflash_action_v1p5.py --num-clips 100 &
+    RANK=1 WORLD_SIZE=2 LOCAL_RANK=1 python eval/eval_streaming_dflash_action_v1p5.py --num-clips 100 &
 """
-import sys
+
 import argparse
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
-
 import numpy as np
 import torch
 import alpamayo_r1
 sys.modules["alpamayo1_5"] = alpamayo_r1
 
-from alpamayo_r1.models.alpamayo_r1p5_streaming import StreamingAlpamayo1_5
+from alpamayo_r1.models.alpamayo_r1p5_flashdrive import Alpamayo1_5FlashDrive
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
+from alpamayo_r1.utils.dflash.dflash_integration import setup_dflash_for_model
 
 logging.basicConfig(
     level=logging.INFO,
@@ -157,10 +158,10 @@ def validate_clip(clip_id, avdi):
     return True
 
 
-def reset_clip_state(model):
+def reset_clip_state(model, keep_frame_labels: bool = True, kv_shift_mode: str = "block"):
     """Reset all streaming and compiled state between clips."""
     with torch.inference_mode():
-        model.reset_streaming_state()
+        model.reset_streaming_state(keep_frame_labels=keep_frame_labels, kv_shift_mode=kv_shift_mode)
         if model._past_key_values is not None:
             model._past_key_values.reset()
 
@@ -177,8 +178,8 @@ def reset_clip_state(model):
     attrs_to_clear = [
         attr for attr in list(model.__dict__.keys())
         if attr.startswith("_") and any(pattern in attr for pattern in [
-            "_encode_", "_prefill_", "_dp_",
-            "_compiled_", "_action_", "_decode_",
+            "_encode_", "_prefill_", "_dp_", "_dflash_draft", "_dflash_prefill",
+            "_compiled_", "_action_", "_decode_", "_traj_fwd_",
         ]) and attr not in [
             "_dflash_refs_initialized", "_dflash_embed_tokens", "_dflash_lm_head",
             "_dflash_language_model", "_dflash_target_layer_ids", "_dflash_block_size",
@@ -186,7 +187,8 @@ def reset_clip_state(model):
         ]
     ]
     for attr in attrs_to_clear:
-        delattr(model, attr)
+        if hasattr(model, attr):
+            delattr(model, attr)
     torch._dynamo.reset()
 
 
@@ -222,7 +224,7 @@ def split_clips_for_rank(clip_ids, rank, world_size):
     return [clip_ids[i] for i in range(len(clip_ids)) if i % world_size == rank]
 
 
-def aggregate_results_across_ranks(
+def aggregate_dflash_results_across_ranks(
     run_dir,
     num_traj_samples,
     diffusion_steps,
@@ -231,15 +233,13 @@ def aggregate_results_across_ranks(
     run_started_at_s,
     max_wait_seconds=300,
 ):
-    """Aggregate results from all rank files into a single summary."""
+    """Aggregate DFlash streaming results from all rank files into a single summary."""
     if world_size <= 1:
         return None
 
+    prefix = f"dflash_streaming_K{num_traj_samples}_d{diffusion_steps}_"
     expected_rank_files = {
-        r: Path(run_dir) / (
-            f"streaming_K{num_traj_samples}_d{diffusion_steps}_"
-            f"{expected_rank_clip_counts[r]}clips_rank{r}.json"
-        )
+        r: Path(run_dir) / f"{prefix}{expected_rank_clip_counts[r]}clips_rank{r}.json"
         for r in range(world_size)
     }
 
@@ -271,6 +271,7 @@ def aggregate_results_across_ranks(
     all_ade_k = []
     all_ade_1 = []
     all_timing = []
+    all_dflash_stats = []
     total_steps = 0
 
     for _, rank_file in sorted(rank_files.items()):
@@ -289,6 +290,9 @@ def aggregate_results_across_ranks(
                     all_ade_1.append(s["min_ade_1"])
                 if "total_time_ms" in s:
                     all_timing.append(s)
+                ds = s.get("dflash_stats")
+                if ds:
+                    all_dflash_stats.append(ds)
 
             total_steps += len(samples)
             log.info(f"Loaded results from {rank_file.name}: {len(samples)} samples")
@@ -315,11 +319,22 @@ def aggregate_results_across_ranks(
             "avg_decode_ms": float(np.mean([t.get("decode_time_ms", 0) for t in all_timing])),
             "avg_action_ms": float(np.mean([t.get("action_time_ms", 0) for t in all_timing])),
             "avg_num_tokens": float(np.mean([t.get("num_decode_tokens", 0) for t in all_timing])),
+            "avg_first_token_sample_ms": float(np.mean([t.get("first_token_sample_time_ms", 0) for t in all_timing])),
+            "avg_dflash_loop_ms": float(np.mean([t.get("dflash_loop_time_ms", 0) for t in all_timing])),
+            "avg_traj_forward_ms": float(np.mean([t.get("traj_forward_time_ms", 0) for t in all_timing])),
+        })
+
+    if all_dflash_stats:
+        aggregated_summary.update({
+            "avg_acceptance_rate": float(np.mean([d["acceptance_rate"] for d in all_dflash_stats])),
+            "avg_acceptance_length": float(np.mean([d["mean_acceptance_length"] for d in all_dflash_stats])),
+            "avg_match_rate": float(np.mean([d["match_rate"] for d in all_dflash_stats])),
+            "avg_iterations": float(np.mean([d["total_iterations"] for d in all_dflash_stats])),
         })
 
     aggregated_file = os.path.join(
         run_dir,
-        f"streaming_K{num_traj_samples}_d{diffusion_steps}_{total_steps}steps_aggregated.json",
+        f"dflash_streaming_K{num_traj_samples}_d{diffusion_steps}_{total_steps}steps_aggregated.json",
     )
     with open(aggregated_file, "w") as f:
         json.dump({
@@ -339,30 +354,35 @@ def aggregate_results_across_ranks(
     if all_timing:
         log.info(f"  Aggregated avg total time: {aggregated_summary.get('avg_total_ms', 0):.1f} ms")
         log.info(f"  Aggregated avg decode time: {aggregated_summary.get('avg_decode_ms', 0):.1f} ms")
+    if all_dflash_stats:
+        log.info(f"  Aggregated avg acceptance rate: {aggregated_summary.get('avg_acceptance_rate', 0):.1%}")
 
     return aggregated_file
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Streaming eval (torch.compile + KV reuse, no DFlash)")
+    ap = argparse.ArgumentParser(description="DFlash + streaming eval (torch.compile + speculative decoding + KV reuse)")
     ap.add_argument("--model-path", default="/data/scratch/zekaili/Alpamayo1_5-Finetuned")
+    ap.add_argument("--draft-model", default="/home/zekaili/Alpamayo1_5-DFlash",
+                     help="Path to DFlash draft model")
     ap.add_argument("--clip-ids-file", default="./clips.json")
     ap.add_argument("--num-clips", type=int, default=100)
     ap.add_argument("--num-traj-samples", type=int, default=6,
                      help="K for minADE_K (default 6)")
     ap.add_argument("--max-tokens", type=int, default=128,
                      help="Max CoC tokens to generate")
-    ap.add_argument("--diffusion-steps", type=int, default=10)
+    ap.add_argument("--diffusion-steps", type=int, default=8)
+    ap.add_argument("--cache-steps", type=int, nargs="+", default=[3, 4, 5, 6])
     ap.add_argument("--warmup-steps", type=int, default=3,
                      help="First N streaming steps per clip excluded from metrics (on top of prefill)")
-    ap.add_argument("--output-dir", default="./eval_finetuned_streaming_v1p5_results")
+    ap.add_argument("--output-dir", default="./eval_streaming_dflash_action_v1p5_results")
     ap.add_argument("--cache-dir", default="/data/scratch/zekaili/physicalai_av/hf_cache")
     ap.add_argument("--dumped-data-dir", default="/data/scratch/zekaili/dumped_eval_data_v1p5")
     ap.add_argument("--keep-frame-labels", action="store_true", default=False)
-    ap.add_argument("--kv-shift-mode", type=str, default="vision_only")
+    ap.add_argument("--kv-shift-mode", type=str, default="vision_only", choices=["block", "vision_only"])
     args = ap.parse_args()
 
-    for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir"):
+    for attr in ("model_path", "draft_model", "clip_ids_file", "output_dir", "cache_dir", "dumped_data_dir"):
         setattr(args, attr, os.path.expanduser(getattr(args, attr)))
 
     run_started_at_s = time.time()
@@ -395,24 +415,29 @@ def main():
         r: len(split_clips_for_rank(all_clip_ids, r, world_size))
         for r in range(world_size)
     }
-    log.info(f"Rank {rank}/{world_size-1}: processing {len(clip_ids)}/{len(all_clip_ids)} clips, "
-             f"K={args.num_traj_samples}, diffusion_steps={args.diffusion_steps}")
+    log.info(
+        f"Rank {rank}/{world_size-1}: processing {len(clip_ids)}/{len(all_clip_ids)} clips, "
+        f"K={args.num_traj_samples}, diffusion_steps={args.diffusion_steps}"
+    )
     if not clip_ids:
         log.warning(f"Rank {rank}: no clips assigned, exiting")
         return
 
     # --- model ---
-    model = StreamingAlpamayo1_5.from_pretrained(
+    model = Alpamayo1_5FlashDrive.from_pretrained(
         args.model_path, dtype=torch.bfloat16,
     ).to(device)
     processor = helper.get_processor(model.tokenizer)
-    log.info("Streaming eval (no DFlash)")
+
+    # --- setup DFlash ---
+    setup_dflash_for_model(model, args.draft_model)
+    log.info("DFlash enabled (integrated path, streaming)")
 
     # --- eval loop ---
     num_timesteps = len(list(range(T0_START_US, T0_END_US + 1, STEP_US)))
     log.info(f"Per-clip: {num_timesteps} timesteps ({T0_START_US/1e6:.1f}s – {T0_END_US/1e6:.1f}s)")
 
-    all_timing, all_ade_k, all_ade_1, all_results = [], [], [], []
+    all_timing, all_ade_k, all_ade_1, all_dflash_stats, all_results = [], [], [], [], []
 
     for ci, clip_id in enumerate(clip_ids):
         if not validate_clip(clip_id, avdi):
@@ -422,83 +447,105 @@ def main():
         log.info(f"\n[Rank {rank}] Clip {ci+1}/{len(clip_ids)}: {clip_id}")
 
         # Reset streaming state for each clip
-        reset_clip_state(model)
+        reset_clip_state(model, args.keep_frame_labels, args.kv_shift_mode)
 
-        clip_timing, clip_ade_k, clip_ade_1 = [], [], []
+        clip_timing, clip_ade_k, clip_ade_1, clip_dflash_stats = [], [], [], []
 
         # Create streaming inputs (prefill + streaming windows)
         log.info(f"  Creating streaming inputs...")
         try:
-            streaming_inputs = create_or_load_streaming_inputs(args, model.tokenizer, processor, clip_id, avdi)
+            streaming_inputs = create_or_load_streaming_inputs(
+                args, model.tokenizer, processor, clip_id, avdi
+            )
         except Exception as e:
             log.warning(f"  Error creating inputs: {e}")
             continue
         log.info(f"  Created {len(streaming_inputs)} streaming inputs, starting inference...")
 
-        model.reset_streaming_state(keep_frame_labels=args.keep_frame_labels, kv_shift_mode=args.kv_shift_mode)
         for si, inputs in enumerate(streaming_inputs):
-            try:
-                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    result = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
-                        data=helper.to_device(inputs, device),
-                        torch_compile="max-autotune",
-                        top_p=0.98,
-                        temperature=0.6,
-                        max_generation_length=128,
-                        num_traj_samples=args.num_traj_samples,
-                        return_extra=True,
-                        fuse_qkv=True,
-                        fuse_gate_up=True,
-                    )
+            # try:
+            torch.compiler.cudagraph_mark_step_begin()
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                result = model.sample_trajectories_from_flashdrive(
+                    data=helper.to_device(inputs, device),
+                    streaming=True,
+                    dflash=True,
+                    num_traj_samples=args.num_traj_samples,
+                    max_new_tokens=128,
+                    return_extra=True,
+                    torch_compile="max-autotune",
+                    fuse_qkv=True,
+                    fuse_gate_up=True,
+                    diffusion_kwargs={
+                        "inference_step": args.diffusion_steps,
+                        "cache_steps": args.cache_steps,
+                        "int_method": "euler_with_cache"
+                    },
+                )
 
-                if result is None or result[0] is None:
-                    # Prefill returns None
-                    log.info(f"  Step {si}: prefill (no output)")
-                    continue
-
-                pred_xyz, pred_rot, extra = result
-                min_ade_k, min_ade_1 = calc_min_ade(inputs["ego_future_xyz"], pred_xyz)
-                timing = extra.get("timing") if extra else None
-
-                # First N streaming steps per clip are warmup (step 0 is prefill → None)
-                is_warmup = si <= args.warmup_steps
-                tag = " [W]" if is_warmup else ""
-
-                if timing:
-                    enc = timing.get("encode_time_ms", 0)
-                    pf = timing.get("prefill_time_ms", 0)
-                    dec = timing.get("decode_time_ms", 0)
-                    act = timing.get("action_time_ms", 0)
-                    total = timing.get("total_time_ms", 0)
-                    ntok = timing.get("num_decode_tokens", 0)
-                    tps = ntok / (dec / 1000) if dec > 0 else 0
-                    log.info(
-                        f"  Step {si}{tag}: {total:.1f}ms "
-                        f"(enc={enc:.1f} pf={pf:.1f} dec={dec:.1f} act={act:.1f}) "
-                        f"{ntok}tok {tps:.1f}tok/s, "
-                        f"minADE_{args.num_traj_samples}={min_ade_k:.3f}m, "
-                        f"minADE_1={min_ade_1:.3f}m"
-                    )
-
-                if not is_warmup:
-                    clip_ade_k.append(min_ade_k)
-                    clip_ade_1.append(min_ade_1)
-                    if timing:
-                        clip_timing.append(timing)
-                    all_results.append({
-                        "clip_id": clip_id,
-                        "step": si,
-                        f"min_ade_{args.num_traj_samples}": min_ade_k,
-                        "min_ade_1": min_ade_1,
-                        **(timing or {}),
-                    })
-
-            except Exception as e:
-                log.warning(f"  Step {si} error: {e}")
-                if "CUDA" in str(e) or "device-side assert" in str(e):
-                    log.error("CUDA error detected, exiting to avoid GPU hang")
-                    raise SystemExit(1)
+            if result is None or result[0] is None:
+                # Prefill returns None
+                log.info(f"  Step {si}: prefill (no output)")
                 continue
+
+            pred_xyz, pred_rot, extra = result
+            min_ade_k, min_ade_1 = calc_min_ade(inputs["ego_future_xyz"], pred_xyz)
+            timing = extra.get("timing") if extra else None
+            ds = extra.get("dflash_stats") if extra else None
+
+            # First N streaming steps per clip are warmup (step 0 is prefill → None)
+            is_warmup = si <= args.warmup_steps
+            tag = " [W]" if is_warmup else ""
+
+            if timing:
+                enc = timing.get("encode_time_ms", 0)
+                pf = timing.get("prefill_time_ms", 0)
+                dec = timing.get("decode_time_ms", 0)
+                act = timing.get("action_time_ms", 0)
+                total = timing.get("total_time_ms", 0)
+                ntok = timing.get("num_decode_tokens", 0)
+                tps = ntok / (dec / 1000) if dec > 0 else 0
+                dflash_str = ""
+                if ds:
+                    loop_ms = timing.get("dflash_loop_time_ms", 0)
+                    traj_fwd_ms = timing.get("traj_forward_time_ms", 0)
+                    dflash_str = (
+                        f", dflash: loop={loop_ms:.1f}ms traj_fwd={traj_fwd_ms:.1f}ms "
+                        f"accept={ds['acceptance_rate']:.0%} "
+                        f"len={ds['mean_acceptance_length']:.2f} "
+                        f"iters={ds['total_iterations']}"
+                    )
+                log.info(
+                    f"  Step {si}{tag}: {total:.1f}ms "
+                    f"(enc={enc:.1f} pf={pf:.1f} dec={dec:.1f} act={act:.1f}) "
+                    f"{ntok}tok {tps:.1f}tok/s, "
+                    f"minADE_{args.num_traj_samples}={min_ade_k:.3f}m, "
+                    f"minADE_1={min_ade_1:.3f}m"
+                    f"{dflash_str}"
+                )
+
+            if not is_warmup:
+                clip_ade_k.append(min_ade_k)
+                clip_ade_1.append(min_ade_1)
+                if timing:
+                    clip_timing.append(timing)
+                if ds:
+                    clip_dflash_stats.append(ds)
+                all_results.append({
+                    "clip_id": clip_id,
+                    "step": si,
+                    f"min_ade_{args.num_traj_samples}": min_ade_k,
+                    "min_ade_1": min_ade_1,
+                    **(timing or {}),
+                    **({"dflash_stats": ds} if ds else {}),
+                })
+
+            # except Exception as e:
+            #     log.warning(f"  Step {si} error: {e}")
+            #     if "CUDA" in str(e) or "device-side assert" in str(e):
+            #         log.error("CUDA error detected, exiting to avoid GPU hang", exc_info=True)
+            #         raise SystemExit(1)
+            #     continue
 
         if clip_ade_k:
             ct = clip_timing
@@ -506,21 +553,31 @@ def main():
             avg_dec = np.mean([t.get("decode_time_ms", 0) for t in ct]) if ct else 0
             avg_tok = np.mean([t.get("num_decode_tokens", 0) for t in ct]) if ct else 0
             avg_tps = avg_tok / (avg_dec / 1000) if avg_dec > 0 else 0
+            dflash_str = ""
+            if clip_dflash_stats:
+                avg_accept = np.mean([d["acceptance_rate"] for d in clip_dflash_stats])
+                avg_accept_len = np.mean([d["mean_acceptance_length"] for d in clip_dflash_stats])
+                avg_iters = np.mean([d["total_iterations"] for d in clip_dflash_stats])
+                dflash_str = f", accept={avg_accept:.0%}, len={avg_accept_len:.2f}, iters={avg_iters:.1f}"
             log.info(
                 f"  Clip avg: {avg_total:.1f}ms total, {avg_dec:.1f}ms decode, "
                 f"{avg_tok:.0f}tok, {avg_tps:.1f}tok/s, "
                 f"minADE_{args.num_traj_samples}={np.mean(clip_ade_k):.3f}m, "
-                f"minADE_1={np.mean(clip_ade_1):.3f}m "
+                f"minADE_1={np.mean(clip_ade_1):.3f}m{dflash_str} "
                 f"({len(clip_ade_k)} steps)"
             )
             all_ade_k.extend(clip_ade_k)
             all_ade_1.extend(clip_ade_1)
             all_timing.extend(clip_timing)
+            all_dflash_stats.extend(clip_dflash_stats)
 
     # --- summary ---
     n = len(all_timing)
     log.info(f"\n{'='*60}")
-    log.info(f"[Rank {rank}] AGGREGATE RESULTS — Streaming (torch.compile + KV reuse, no DFlash) ({n} steps)")
+    log.info(
+        f"[Rank {rank}] AGGREGATE RESULTS — DFlash + Streaming "
+        f"(torch.compile + speculative decoding + KV reuse) ({n} steps)"
+    )
     log.info("=" * 60)
     if all_timing:
         def avg(key):
@@ -539,6 +596,21 @@ def main():
         log.info(f"  Avg tokens/sec:      {avg_tps:.1f}")
         log.info(f"  Avg action (diff):   {avg('action_time_ms'):.1f} ms")
 
+        log.info(f"\n  DFlash decode breakdown:")
+        log.info(f"    Avg first_token_sample: {avg('first_token_sample_time_ms'):.1f} ms")
+        log.info(f"    Avg dflash_loop:    {avg('dflash_loop_time_ms'):.1f} ms")
+        log.info(f"    Avg traj_forward:   {avg('traj_forward_time_ms'):.1f} ms")
+
+    if all_dflash_stats:
+        def ds_avg(key):
+            vals = [d[key] for d in all_dflash_stats if d.get(key) is not None]
+            return np.mean(vals) if vals else 0
+
+        log.info(f"  Avg acceptance rate:   {ds_avg('acceptance_rate'):.1%}")
+        log.info(f"  Avg acceptance length: {ds_avg('mean_acceptance_length'):.2f}")
+        log.info(f"  Avg match rate:        {ds_avg('match_rate'):.1%}")
+        log.info(f"  Avg iterations:        {ds_avg('total_iterations'):.1f}")
+
     if all_ade_k:
         log.info(f"  Avg minADE_{args.num_traj_samples}:       {np.mean(all_ade_k):.3f} m")
         log.info(f"  Avg minADE_1:        {np.mean(all_ade_1):.3f} m")
@@ -547,7 +619,7 @@ def main():
     rank_suffix = f"_rank{rank}" if world_size > 1 else ""
     out_file = os.path.join(
         run_dir,
-        f"streaming_K{args.num_traj_samples}_d{args.diffusion_steps}_{len(clip_ids)}clips{rank_suffix}.json",
+        f"dflash_streaming_K{args.num_traj_samples}_d{args.diffusion_steps}_{len(clip_ids)}clips{rank_suffix}.json",
     )
     with open(out_file, "w") as f:
         json.dump({
@@ -571,7 +643,16 @@ def main():
                     "avg_decode_ms": float(np.mean([t.get("decode_time_ms", 0) for t in all_timing])),
                     "avg_action_ms": float(np.mean([t.get("action_time_ms", 0) for t in all_timing])),
                     "avg_num_tokens": float(np.mean([t.get("num_decode_tokens", 0) for t in all_timing])),
+                    "avg_first_token_sample_ms": float(np.mean([t.get("first_token_sample_time_ms", 0) for t in all_timing])),
+                    "avg_dflash_loop_ms": float(np.mean([t.get("dflash_loop_time_ms", 0) for t in all_timing])),
+                    "avg_traj_forward_ms": float(np.mean([t.get("traj_forward_time_ms", 0) for t in all_timing])),
                 } if all_timing else {}),
+                **({
+                    "avg_acceptance_rate": float(np.mean([d["acceptance_rate"] for d in all_dflash_stats])),
+                    "avg_acceptance_length": float(np.mean([d["mean_acceptance_length"] for d in all_dflash_stats])),
+                    "avg_match_rate": float(np.mean([d["match_rate"] for d in all_dflash_stats])),
+                    "avg_iterations": float(np.mean([d["total_iterations"] for d in all_dflash_stats])),
+                } if all_dflash_stats else {}),
             },
             "samples": all_results,
         }, f, indent=2)
@@ -582,7 +663,7 @@ def main():
         log.info(f"\n{'='*60}")
         log.info(f"Aggregating results across {world_size} ranks...")
         log.info("=" * 60)
-        aggregated_file = aggregate_results_across_ranks(
+        aggregated_file = aggregate_dflash_results_across_ranks(
             run_dir,
             args.num_traj_samples,
             args.diffusion_steps,

@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
-"""Streaming evaluation (no DFlash): torch.compile + KV cache reuse across frames.
+"""System-optimization-only evaluation: non-streaming mode with torch.compile.
 
-Uses streaming=True, dflash=False — torch.compile + static cache + autoregressive
-decode + KV cache reuse across frames. No speculative decoding.
-First frame per clip is a prefill (returns None), subsequent frames stream incrementally.
+Uses the dev branch AlpamayoR1 with streaming=False — torch.compile + static
+cache + manual decode loop, but NO KV cache reuse across frames.
 Runs through clips from 1.7s to 13.6s at 10Hz (120 timesteps).
 Reports minADE_K (default K=6) and per-step timing.
 
 Usage:
-    python eval/eval_streaming.py
-    python eval/eval_streaming.py --num-clips 10 --diffusion-steps 5
-    python eval/eval_streaming.py --num-traj-samples 1
+    # Single GPU
+    python eval/eval_system_opt.py
+    python eval/eval_system_opt.py --num-clips 10 --diffusion-steps 5
+    python eval/eval_system_opt.py --num-traj-samples 1
 
     # Multi-GPU (using torchrun or similar)
-    torchrun --nproc_per_node=4 eval/eval_streaming_v1p5.py --num-clips 100
+    torchrun --nproc_per_node=4 eval/eval_system_opt.py --num-clips 100
 
     # Manual multi-GPU (set environment variables)
-    RANK=0 WORLD_SIZE=2 LOCAL_RANK=0 python eval/eval_streaming_v1p5.py --num-clips 100 &
-    RANK=1 WORLD_SIZE=2 LOCAL_RANK=1 python eval/eval_streaming_v1p5.py --num-clips 100 &
+    RANK=0 WORLD_SIZE=2 LOCAL_RANK=0 python eval/eval_system_opt.py --num-clips 100 &
+    RANK=1 WORLD_SIZE=2 LOCAL_RANK=1 python eval/eval_system_opt.py --num-clips 100 &
 """
-import sys
+
 import argparse
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -33,7 +34,9 @@ import torch
 import alpamayo_r1
 sys.modules["alpamayo1_5"] = alpamayo_r1
 
-from alpamayo_r1.models.alpamayo_r1p5_streaming import StreamingAlpamayo1_5
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from alpamayo_r1.models.alpamayo_r1p5 import Alpamayo1_5
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
@@ -57,7 +60,7 @@ def load_clip_ids(path, num_clips):
     return list(dict.fromkeys(ids))[:num_clips]
 
 
-def prepare_inputs(data, processor, is_prefill=False):
+def prepare_inputs(data, processor):
     frames = data["image_frames"].flatten(0, 1)
     messages = helper.create_message(frames)
     tok = processor.apply_chat_template(
@@ -74,54 +77,7 @@ def prepare_inputs(data, processor, is_prefill=False):
         "ego_history_rot": data["ego_history_rot"],
         "ego_future_xyz": data["ego_future_xyz"],
         "ego_future_rot": data["ego_future_rot"],
-        "is_prefill": is_prefill,
     }
-
-
-def create_or_load_streaming_inputs(args, tokenizer, processor, clip_id, avdi):
-    """Create sliding-window streaming inputs for one clip.
-
-    Window 0 (prefill): 4 cameras x 4 frames = 16 frames
-    Window 1+ (streaming): 4 cameras x 1 new frame = 4 frames
-    """
-    if args.dumped_data_dir:
-        windows = helper.load_dumped_inputs(args.dumped_data_dir, clip_id)
-        vs_id = tokenizer.encode("<|vision_start|>")[0]
-        ve_id = tokenizer.encode("<|vision_end|>")[0]
-        streaming_inputs = []
-        for i, w in enumerate(windows):
-            if i == 0:
-                data = {
-                    "tokenized_data": w["tokenized_data"],
-                    "ego_history_xyz": w["ego_history_xyz"],
-                    "ego_history_rot": w["ego_history_rot"],
-                    "is_prefill": True,
-                }
-            else:
-                data = helper.convert_to_streaming_window_v1p5(
-                    w, ve_id,
-                    keep_frame_labels=args.keep_frame_labels,
-                    vision_start_id=vs_id if not args.keep_frame_labels else None,
-                )
-            streaming_inputs.append(data)
-        log.info(f"Streaming input data shape: {streaming_inputs[1]['tokenized_data']['input_ids'].shape}")
-
-    else:
-        all_t0s = list(range(T0_START_US, T0_END_US + 1, STEP_US))
-        streaming_inputs = []
-
-        for i, t0 in enumerate(all_t0s):
-            if i == 0:
-                data = load_physical_aiavdataset(clip_id, t0_us=t0, num_frames=4, avdi=avdi)
-                inputs = prepare_inputs(data, processor, is_prefill=True)
-                seq_len = inputs["tokenized_data"]["input_ids"].shape[-1]
-                log.info(f"  Prefill input: {seq_len} tokens")
-            else:
-                data = load_physical_aiavdataset(clip_id, t0_us=t0, num_frames=1, avdi=avdi)
-                inputs = prepare_inputs(data, processor, is_prefill=False)
-            streaming_inputs.append(inputs)
-
-    return streaming_inputs
 
 
 def calc_min_ade(gt_future_xy, pred_xyz):
@@ -133,17 +89,14 @@ def calc_min_ade(gt_future_xy, pred_xyz):
 
     Returns:
         (minADE_K, minADE_1) where K = number of trajectory samples.
+        minADE_1 is the ADE of a single sample (sample index 0).
     """
-    try:
-        gt_xy = gt_future_xy.cpu()[0, 0, :, :2].T.numpy()
-        pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2]
-        pred_xy = pred_xy.transpose(0, 2, 1)
-        diff = np.linalg.norm(pred_xy - gt_xy[None], axis=1)
-        ade_per_sample = diff.mean(axis=-1)
-        return float(ade_per_sample.min()), float(ade_per_sample[0])
-    except Exception as e:
-        log.warning(f"calc_min_ade error: {e}")
-        return float("inf"), float("inf")
+    gt_xy = gt_future_xy.cpu()[0, 0, :, :2].T.numpy()          # (2, T)
+    pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2]            # (samples, T, 2)
+    pred_xy = pred_xy.transpose(0, 2, 1)                        # (samples, 2, T)
+    diff = np.linalg.norm(pred_xy - gt_xy[None], axis=1)        # (samples, T)
+    ade_per_sample = diff.mean(axis=-1)                          # (samples,)
+    return float(ade_per_sample.min()), float(ade_per_sample[0])  # minADE_K, minADE_1
 
 
 def validate_clip(clip_id, avdi):
@@ -152,42 +105,10 @@ def validate_clip(clip_id, avdi):
         clip_id, avdi.features.LABELS.EGOMOTION, maybe_stream=True,
     )
     ego_end = int(ego.timestamps[-1])
+    # Need 6.4s of future after T0_END
     if ego_end <= T0_END_US + 6_400_000:
         return False
     return True
-
-
-def reset_clip_state(model):
-    """Reset all streaming and compiled state between clips."""
-    with torch.inference_mode():
-        model.reset_streaming_state()
-        if model._past_key_values is not None:
-            model._past_key_values.reset()
-
-    # Clear VLM internal cached embeddings (shape mismatch between clips)
-    for attr in (
-        "_cached_pos_embeds", "_cached_position_embeddings", "_cached_cu_seqlens",
-    ):
-        if hasattr(model.vlm.model.visual, attr):
-            delattr(model.vlm.model.visual, attr)
-    if hasattr(model.vlm.model.language_model, "_cached_deepstack_indices"):
-        delattr(model.vlm.model.language_model, "_cached_deepstack_indices")
-
-    # Clear compiled functions and buffers to avoid CUDAGraph tensor reference issues
-    attrs_to_clear = [
-        attr for attr in list(model.__dict__.keys())
-        if attr.startswith("_") and any(pattern in attr for pattern in [
-            "_encode_", "_prefill_", "_dp_",
-            "_compiled_", "_action_", "_decode_",
-        ]) and attr not in [
-            "_dflash_refs_initialized", "_dflash_embed_tokens", "_dflash_lm_head",
-            "_dflash_language_model", "_dflash_target_layer_ids", "_dflash_block_size",
-            "_dflash_mask_token_id", "_dflash_logits_processor",
-        ]
-    ]
-    for attr in attrs_to_clear:
-        delattr(model, attr)
-    torch._dynamo.reset()
 
 
 def setup_distributed():
@@ -197,6 +118,7 @@ def setup_distributed():
         (rank, local_rank, world_size, device)
         If not distributed, returns (0, 0, 1, "cuda:0")
     """
+    # Check for torch.distributed environment variables
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         rank = int(os.environ["RANK"])
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
@@ -205,6 +127,7 @@ def setup_distributed():
         torch.cuda.set_device(local_rank)
         return rank, local_rank, world_size, device
 
+    # Fallback: use number of GPUs and manual rank/world_size
     num_gpus = torch.cuda.device_count()
     if num_gpus > 1:
         rank = int(os.environ.get("RANK", 0))
@@ -214,30 +137,61 @@ def setup_distributed():
         torch.cuda.set_device(local_rank)
         return rank, local_rank, world_size, device
 
+    # Single GPU
     return 0, 0, 1, "cuda:0"
 
 
 def split_clips_for_rank(clip_ids, rank, world_size):
-    """Split clips across ranks using round-robin assignment."""
+    """Split clips across ranks using round-robin assignment.
+
+    Args:
+        clip_ids: List of all clip IDs
+        rank: Current rank (0 to world_size-1)
+        world_size: Total number of ranks
+
+    Returns:
+        List of clip IDs assigned to this rank
+    """
     return [clip_ids[i] for i in range(len(clip_ids)) if i % world_size == rank]
+
+
+def load_inputs(clip_id, dumped_data_dir):
+    """Load dumped inputs or create them from scratch."""
+    num_steps = 120
+    log.info("Loading dumped inputs from %s for clip %s", dumped_data_dir, clip_id)
+    windows = helper.load_dumped_inputs(dumped_data_dir, clip_id)
+    windows = windows[:num_steps]
+    return windows
 
 
 def aggregate_results_across_ranks(
     run_dir,
     num_traj_samples,
-    diffusion_steps,
     world_size,
     expected_rank_clip_counts,
     run_started_at_s,
     max_wait_seconds=300,
 ):
-    """Aggregate results from all rank files into a single summary."""
+    """Aggregate results from all rank files into a single summary.
+
+    Args:
+        run_dir: Output directory containing rank result files
+        num_traj_samples: Number of trajectory samples (for filename)
+        world_size: Total number of ranks
+        expected_rank_clip_counts: Dict rank -> number of clips assigned to that rank
+        run_started_at_s: Unix timestamp when this run started (used to ignore stale files)
+        max_wait_seconds: Maximum time to wait for all rank files to appear
+
+    Returns:
+        Path to aggregated results file, or None if aggregation failed
+    """
     if world_size <= 1:
         return None
 
+    # Wait for expected rank files from this run.
     expected_rank_files = {
         r: Path(run_dir) / (
-            f"streaming_K{num_traj_samples}_d{diffusion_steps}_"
+            f"system_opt_K{num_traj_samples}_"
             f"{expected_rank_clip_counts[r]}clips_rank{r}.json"
         )
         for r in range(world_size)
@@ -250,6 +204,7 @@ def aggregate_results_across_ranks(
         for r, rank_file in expected_rank_files.items():
             if not rank_file.exists():
                 continue
+            # Ignore stale files from previous runs.
             if rank_file.stat().st_mtime + 1 < run_started_at_s:
                 continue
             rank_files[r] = rank_file
@@ -267,6 +222,7 @@ def aggregate_results_across_ranks(
         log.warning("No rank files found for aggregation")
         return None
 
+    # Load all rank results.
     all_samples = []
     all_ade_k = []
     all_ade_1 = []
@@ -300,6 +256,7 @@ def aggregate_results_across_ranks(
         log.warning("No samples found in rank files")
         return None
 
+    # Compute aggregated summary
     aggregated_summary = {
         f"min_ade_{num_traj_samples}": float(np.mean(all_ade_k)) if all_ade_k else None,
         "min_ade_1": float(np.mean(all_ade_1)) if all_ade_1 else None,
@@ -317,10 +274,12 @@ def aggregate_results_across_ranks(
             "avg_num_tokens": float(np.mean([t.get("num_decode_tokens", 0) for t in all_timing])),
         })
 
+    # Save aggregated results
     aggregated_file = os.path.join(
         run_dir,
-        f"streaming_K{num_traj_samples}_d{diffusion_steps}_{total_steps}steps_aggregated.json",
+        f"system_opt_K{num_traj_samples}_{total_steps}steps_aggregated.json",
     )
+
     with open(aggregated_file, "w") as f:
         json.dump({
             "timestamp": datetime.now().isoformat(),
@@ -344,37 +303,38 @@ def aggregate_results_across_ranks(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Streaming eval (torch.compile + KV reuse, no DFlash)")
-    ap.add_argument("--model-path", default="/data/scratch/zekaili/Alpamayo1_5-Finetuned")
+    ap = argparse.ArgumentParser(description="System-opt eval (non-streaming, torch.compile)")
+    ap.add_argument("--model-path", default="nvidia/Alpamayo-1.5-10B")
     ap.add_argument("--clip-ids-file", default="./clips.json")
     ap.add_argument("--num-clips", type=int, default=100)
     ap.add_argument("--num-traj-samples", type=int, default=6,
                      help="K for minADE_K (default 6)")
-    ap.add_argument("--max-tokens", type=int, default=128,
-                     help="Max CoC tokens to generate")
-    ap.add_argument("--diffusion-steps", type=int, default=10)
     ap.add_argument("--warmup-steps", type=int, default=3,
-                     help="First N streaming steps per clip excluded from metrics (on top of prefill)")
-    ap.add_argument("--output-dir", default="./eval_finetuned_streaming_v1p5_results")
-    ap.add_argument("--cache-dir", default="/data/scratch/zekaili/physicalai_av/hf_cache")
+                     help="First N steps excluded from metrics")
+    ap.add_argument("--output-dir", default="./eval_baseline_results_v1p5")
+    ap.add_argument("--cache-dir", default="/data/scratch/zekaili/hf_cache")
     ap.add_argument("--dumped-data-dir", default="/data/scratch/zekaili/dumped_eval_data_v1p5")
-    ap.add_argument("--keep-frame-labels", action="store_true", default=False)
-    ap.add_argument("--kv-shift-mode", type=str, default="vision_only")
     args = ap.parse_args()
 
-    for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir"):
+    for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir", "dumped_data_dir"):
         setattr(args, attr, os.path.expanduser(getattr(args, attr)))
 
     run_started_at_s = time.time()
 
     # --- setup distributed ---
     rank, local_rank, world_size, device = setup_distributed()
+
+    # Only rank 0 emits logs to avoid duplicated multi-GPU output.
     if rank != 0:
         logging.getLogger().setLevel(logging.CRITICAL)
         log.setLevel(logging.CRITICAL)
 
+    log.info(f"Distributed setup: rank={rank}, local_rank={local_rank}, world_size={world_size}, device={device}")
+
     run_dir = args.output_dir
     os.makedirs(run_dir, exist_ok=True)
+
+    # Save config with distributed info
     config = vars(args).copy()
     config.update({
         "rank": rank,
@@ -389,30 +349,33 @@ def main():
     import physical_ai_av
     avdi = physical_ai_av.PhysicalAIAVDatasetInterface(cache_dir=args.cache_dir)
 
+    # Load all clips and split across ranks
     all_clip_ids = load_clip_ids(args.clip_ids_file, args.num_clips)
     clip_ids = split_clips_for_rank(all_clip_ids, rank, world_size)
     expected_rank_clip_counts = {
         r: len(split_clips_for_rank(all_clip_ids, r, world_size))
         for r in range(world_size)
     }
-    log.info(f"Rank {rank}/{world_size-1}: processing {len(clip_ids)}/{len(all_clip_ids)} clips, "
-             f"K={args.num_traj_samples}, diffusion_steps={args.diffusion_steps}")
+
+    log.info(f"Rank {rank}/{world_size-1}: Processing {len(clip_ids)}/{len(all_clip_ids)} clips "
+             f"(K={args.num_traj_samples})")
+
     if not clip_ids:
-        log.warning(f"Rank {rank}: no clips assigned, exiting")
+        log.warning(f"Rank {rank}: No clips assigned, exiting")
         return
 
-    # --- model ---
-    model = StreamingAlpamayo1_5.from_pretrained(
+    # --- model (dev branch: torch.compile + static cache, non-streaming) ---
+    model = Alpamayo1_5.from_pretrained(
         args.model_path, dtype=torch.bfloat16,
     ).to(device)
     processor = helper.get_processor(model.tokenizer)
-    log.info("Streaming eval (no DFlash)")
 
     # --- eval loop ---
-    num_timesteps = len(list(range(T0_START_US, T0_END_US + 1, STEP_US)))
-    log.info(f"Per-clip: {num_timesteps} timesteps ({T0_START_US/1e6:.1f}s – {T0_END_US/1e6:.1f}s)")
+    t0s = list(range(T0_START_US, T0_END_US + 1, STEP_US))
+    log.info(f"Per-clip: {len(t0s)} timesteps ({T0_START_US/1e6:.1f}s – {T0_END_US/1e6:.1f}s)")
 
     all_timing, all_ade_k, all_ade_1, all_results = [], [], [], []
+    warmup_left = args.warmup_steps
 
     for ci, clip_id in enumerate(clip_ids):
         if not validate_clip(clip_id, avdi):
@@ -420,48 +383,38 @@ def main():
             continue
 
         log.info(f"\n[Rank {rank}] Clip {ci+1}/{len(clip_ids)}: {clip_id}")
-
-        # Reset streaming state for each clip
-        reset_clip_state(model)
-
         clip_timing, clip_ade_k, clip_ade_1 = [], [], []
 
-        # Create streaming inputs (prefill + streaming windows)
-        log.info(f"  Creating streaming inputs...")
+        # Pre-create all inputs for this clip
+        log.info(f"  Creating inputs for {len(t0s)} timesteps...")
+        clip_inputs = []
         try:
-            streaming_inputs = create_or_load_streaming_inputs(args, model.tokenizer, processor, clip_id, avdi)
+            clip_inputs = load_inputs(clip_id, args.dumped_data_dir)
         except Exception as e:
             log.warning(f"  Error creating inputs: {e}")
             continue
-        log.info(f"  Created {len(streaming_inputs)} streaming inputs, starting inference...")
+        log.info(f"  Created {len(clip_inputs)} inputs, starting inference...")
 
-        model.reset_streaming_state(keep_frame_labels=args.keep_frame_labels, kv_shift_mode=args.kv_shift_mode)
-        for si, inputs in enumerate(streaming_inputs):
+        for si, (t0, inputs) in enumerate(zip(t0s, clip_inputs)):
             try:
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    result = model.sample_trajectories_from_data_with_streaming_vlm_rollout(
+                    result = model.sample_trajectories_from_data_with_vlm_rollout(
                         data=helper.to_device(inputs, device),
-                        torch_compile="max-autotune",
-                        top_p=0.98,
-                        temperature=0.6,
-                        max_generation_length=128,
                         num_traj_samples=args.num_traj_samples,
+                        max_generation_length=128,
                         return_extra=True,
-                        fuse_qkv=True,
-                        fuse_gate_up=True,
                     )
 
-                if result is None or result[0] is None:
-                    # Prefill returns None
-                    log.info(f"  Step {si}: prefill (no output)")
+                pred_xyz, pred_rot, extra = result
+                if pred_xyz is None:
                     continue
 
-                pred_xyz, pred_rot, extra = result
                 min_ade_k, min_ade_1 = calc_min_ade(inputs["ego_future_xyz"], pred_xyz)
                 timing = extra.get("timing") if extra else None
 
-                # First N streaming steps per clip are warmup (step 0 is prefill → None)
-                is_warmup = si <= args.warmup_steps
+                is_warmup = warmup_left > 0
+                if is_warmup:
+                    warmup_left -= 1
                 tag = " [W]" if is_warmup else ""
 
                 if timing:
@@ -487,7 +440,7 @@ def main():
                         clip_timing.append(timing)
                     all_results.append({
                         "clip_id": clip_id,
-                        "step": si,
+                        "t0_us": t0,
                         f"min_ade_{args.num_traj_samples}": min_ade_k,
                         "min_ade_1": min_ade_1,
                         **(timing or {}),
@@ -495,10 +448,8 @@ def main():
 
             except Exception as e:
                 log.warning(f"  Step {si} error: {e}")
-                if "CUDA" in str(e) or "device-side assert" in str(e):
-                    log.error("CUDA error detected, exiting to avoid GPU hang")
+                if "CUDA" in str(e):
                     raise SystemExit(1)
-                continue
 
         if clip_ade_k:
             ct = clip_timing
@@ -520,7 +471,7 @@ def main():
     # --- summary ---
     n = len(all_timing)
     log.info(f"\n{'='*60}")
-    log.info(f"[Rank {rank}] AGGREGATE RESULTS — Streaming (torch.compile + KV reuse, no DFlash) ({n} steps)")
+    log.info(f"[Rank {rank}] AGGREGATE RESULTS — System-opt (non-streaming, torch.compile) ({n} steps)")
     log.info("=" * 60)
     if all_timing:
         def avg(key):
@@ -538,16 +489,16 @@ def main():
         log.info(f"  Avg tokens:          {avg_tokens:.1f}")
         log.info(f"  Avg tokens/sec:      {avg_tps:.1f}")
         log.info(f"  Avg action (diff):   {avg('action_time_ms'):.1f} ms")
-
     if all_ade_k:
         log.info(f"  Avg minADE_{args.num_traj_samples}:       {np.mean(all_ade_k):.3f} m")
         log.info(f"  Avg minADE_1:        {np.mean(all_ade_1):.3f} m")
 
     # --- save ---
+    # Include rank in filename for distributed runs
     rank_suffix = f"_rank{rank}" if world_size > 1 else ""
     out_file = os.path.join(
         run_dir,
-        f"streaming_K{args.num_traj_samples}_d{args.diffusion_steps}_{len(clip_ids)}clips{rank_suffix}.json",
+        f"system_opt_K{args.num_traj_samples}_{len(clip_ids)}clips{rank_suffix}.json",
     )
     with open(out_file, "w") as f:
         json.dump({
@@ -563,15 +514,14 @@ def main():
                 f"min_ade_{args.num_traj_samples}": float(np.mean(all_ade_k)) if all_ade_k else None,
                 "min_ade_1": float(np.mean(all_ade_1)) if all_ade_1 else None,
                 "num_steps": len(all_ade_k),
-                "num_clips": len(clip_ids),
-                **({
-                    "avg_total_ms": float(np.mean([t["total_time_ms"] for t in all_timing])),
+                "num_clips": len(all_results),
+                **({"avg_total_ms": float(np.mean([t["total_time_ms"] for t in all_timing])),
                     "avg_encode_ms": float(np.mean([t.get("encode_time_ms", 0) for t in all_timing])),
                     "avg_prefill_ms": float(np.mean([t.get("prefill_time_ms", 0) for t in all_timing])),
                     "avg_decode_ms": float(np.mean([t.get("decode_time_ms", 0) for t in all_timing])),
                     "avg_action_ms": float(np.mean([t.get("action_time_ms", 0) for t in all_timing])),
                     "avg_num_tokens": float(np.mean([t.get("num_decode_tokens", 0) for t in all_timing])),
-                } if all_timing else {}),
+                   } if all_timing else {}),
             },
             "samples": all_results,
         }, f, indent=2)
@@ -585,7 +535,6 @@ def main():
         aggregated_file = aggregate_results_across_ranks(
             run_dir,
             args.num_traj_samples,
-            args.diffusion_steps,
             world_size,
             expected_rank_clip_counts,
             run_started_at_s,

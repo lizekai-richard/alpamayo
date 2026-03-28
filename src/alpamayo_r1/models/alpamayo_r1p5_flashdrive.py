@@ -48,7 +48,7 @@ from alpamayo_r1.models.token_utils import (
 )
 from alpamayo_r1.nav_utils import remove_nav_text
 from alpamayo_r1.utils import patch_for_torch_compile
-from alpamayo_r1.utils import create_streaming_attention_mask_sdpa
+from alpamayo_r1.utils.streaming.streaming_masking_utils import create_streaming_attention_mask_sdpa_v1p5
 from alpamayo_r1.utils import (
     build_target_layer_ids,
     sample_tokens,
@@ -137,6 +137,48 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         self.vision_start_end_ids_ranges = None
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
+    
+    def reset_streaming_state(self, keep_frame_labels: bool = True, kv_shift_mode: str = "block"):
+        """Reset all streaming state between clips."""
+        self._past_key_values = None
+        self._cached_position_ids = None
+        self._cached_attention_mask = None
+        self._cached_streaming_attention_mask = None
+        self._cached_rope_deltas = None
+        self.vision_start_end_ids_ranges = None
+        self.image_token_ids_ranges = None
+        self.traj_and_text_ids_range = None
+        self.is_first_prefill = True
+        self.keep_frame_labels = keep_frame_labels
+        self.kv_shift_mode = kv_shift_mode
+        assert self.kv_shift_mode in ["block", "vision_only"], "Invalid kv_shift_mode"
+
+        if hasattr(self.vlm.model.visual, "_cached_pos_embeds"):
+            delattr(self.vlm.model.visual, "_cached_pos_embeds")
+        
+        for block in self.vlm.model.visual.blocks:
+            if hasattr(block.attn, "_num_chunks"):
+                delattr(block.attn, "_num_chunks")
+        
+        if hasattr(self.vlm.model.language_model, "_cached_deepstack_indices"):
+            delattr(self.vlm.model.language_model, "_cached_deepstack_indices")
+
+        if hasattr(self, "_compiled_encode_fn"):
+            delattr(self, "_compiled_encode_fn")
+        if hasattr(self, "_encode_fn"):
+            delattr(self, "_encode_fn")
+        if hasattr(self, "_compiled_prefill_fn"):
+            delattr(self, "_compiled_prefill_fn")
+        if hasattr(self, "_prefill_fn"):
+            delattr(self, "_prefill_fn")
+        if hasattr(self, "_compiled_decode_fn"):
+            delattr(self, "_compiled_decode_fn")
+        if hasattr(self, "_decode_fn"):
+            delattr(self, "_decode_fn")
+        if hasattr(self, "_compiled_action_fn"):
+            delattr(self, "_compiled_action_fn")
+        if hasattr(self, "_action_fn"):
+            delattr(self, "_action_fn")
     
     def setup_patch_for_torch_compile(
         self,
@@ -459,7 +501,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         """Create streaming attention mask for non-first prefill."""
-        return create_streaming_attention_mask_sdpa(
+        return create_streaming_attention_mask_sdpa_v1p5(
             batch_size=1,
             cache_position=cache_position,
             kv_length=self.max_cache_len,
@@ -1302,13 +1344,14 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             position_ids = torch.cat([position_ids, padding_pos], dim=-1)
         
         # Cache all streaming related inputs
-        vision_start_end_ids_ranges, traj_and_text_ids_range = self._retrieve_streaming_related_inputs(input_ids[:1])
+        vision_start_end_ids_ranges, image_token_ids_ranges, traj_and_text_ids_range = self._retrieve_streaming_related_inputs(input_ids[:1])
         cache_position = self._create_cache_position().to(device)
 
         self._cached_position_ids = position_ids
         self._cached_rope_deltas = rope_deltas
         self._cached_attention_mask = attention_mask
         self.vision_start_end_ids_ranges = vision_start_end_ids_ranges
+        self.image_token_ids_ranges = image_token_ids_ranges
         self.traj_and_text_ids_range = traj_and_text_ids_range
 
         _ = self.vlm.model.language_model(
@@ -1743,11 +1786,12 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         **kwargs: Any,
     ):
         """Streaming mode: reuses KV cache, first call is prefill only."""
-        self._ensure_dflash_refs()
         self._torch_compile = torch_compile
         if torch_compile and not hasattr(self, "_patched_for_compile"):
             patch_for_torch_compile(self, mode="streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
             self._patched_for_compile = True
+        
+        self._ensure_dflash_refs()
 
         # Extract inputs
         tokenized = data["tokenized_data"]
@@ -1776,9 +1820,9 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         if self.is_first_prefill:
             self.prefill_seq_length = input_ids.shape[1]
             logger.info(f"DFlash Streaming: prefill_seq_length set to {self.prefill_seq_length}")
+            # Initialize KV cache on first call
+            self.max_cache_len = self.prefill_seq_length + max_new_tokens + block_size + self.num_action_tokens
 
-        # Initialize KV cache on first call
-        self.max_cache_len = self.prefill_seq_length + max_new_tokens + block_size + self.num_action_tokens
         if self._past_key_values is None:
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
@@ -1933,9 +1977,10 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         if kwargs.get("return_extra", False):
             extra = extract_text_tokens(self.tokenizer, output_ids)
             for key in extra:
-                extra[key] = np.array(extra[key]).reshape(
-                    [batch_size, num_traj_sets, num_traj_samples]
-                )
+                extra[key] = np.broadcast_to(
+                    np.array(extra[key]).reshape(batch_size, 1, 1),
+                    [batch_size, num_traj_sets, num_traj_samples],
+                ).copy()
             extra["dflash_stats"] = {
                 "total_tokens": dflash_stats.total_tokens,
                 "total_iterations": dflash_stats.total_iterations,

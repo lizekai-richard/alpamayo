@@ -41,6 +41,7 @@ from alpamayo_r1.models.token_utils import (
     to_special_token,
 )
 from alpamayo_r1.nav_utils import remove_nav_text
+from alpamayo_r1.utils import patch_for_baseline
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,7 @@ class Alpamayo1_5(ReasoningVLA):
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample trajectories from the data with VLM rollout."""
+        patch_for_baseline(self)
         data = copy.deepcopy(data)
         n_samples_total = num_traj_samples * num_traj_sets
         ego_history_xyz = data["ego_history_xyz"]
@@ -217,6 +219,34 @@ class Alpamayo1_5(ReasoningVLA):
         generation_config.top_k = top_k
         generation_config.pad_token_id = self.tokenizer.pad_token_id
 
+        # Timing events:
+        #   _ev[0]: encode start
+        #   _ev[1]: encode end / prefill start
+        #   _ev[2]: prefill end / decode start
+        #   _ev[3]: decode end / action start
+        #   _ev[4]: action end
+        _ev = [torch.cuda.Event(enable_timing=True) for _ in range(5)]
+
+        # Register hooks to split encode / prefill / decode inside vlm.generate()
+        _vlm_fwd_count = [0]
+
+        def _visual_pre_hook(module, args):
+            _ev[0].record()
+
+        def _visual_post_hook(module, args, output):
+            _ev[1].record()
+
+        def _vlm_post_hook(module, args, output):
+            _vlm_fwd_count[0] += 1
+            if _vlm_fwd_count[0] == 1:
+                _ev[2].record()  # first forward = prefill done
+
+        _hooks = [
+            self.vlm.model.visual.register_forward_pre_hook(_visual_pre_hook),
+            self.vlm.model.visual.register_forward_hook(_visual_post_hook),
+            self.vlm.register_forward_hook(_vlm_post_hook),
+        ]
+
         eos_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
         stopping_criteria = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_token_id)])
         logits_processor = LogitsProcessorList(
@@ -235,6 +265,11 @@ class Alpamayo1_5(ReasoningVLA):
             **tokenized_data,
         )
         vlm_outputs.rope_deltas = self.vlm.model.rope_deltas
+        _ev[3].record()  # decode end
+        # Clean up hooks
+        for h in _hooks:
+            h.remove()
+        num_decode_tokens = vlm_outputs.sequences.shape[1] - input_ids.shape[1]
 
         # manually replace padding after EOS token
         vlm_outputs.sequences = replace_padding_after_eos(
@@ -296,7 +331,12 @@ class Alpamayo1_5(ReasoningVLA):
         if diffusion_kwargs is None:
             diffusion_kwargs = {}
 
+        action_noise = torch.randn(
+            total_batch, *self.action_space.get_action_space_dims(), device=device, dtype=torch.bfloat16
+        )
+
         sampled_action = self.diffusion.sample(
+            noise=action_noise,
             batch_size=total_batch,
             step_fn=step_fn,
             device=device,
@@ -316,6 +356,8 @@ class Alpamayo1_5(ReasoningVLA):
             sampled_action, hist_xyz_rep, hist_rot_rep
         )
 
+        _ev[4].record()  # action end
+
         # 4) Reshape to (B, num_traj_samples, n_traj, ...)
         pred_xyz = einops.rearrange(
             pred_xyz, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
@@ -330,6 +372,15 @@ class Alpamayo1_5(ReasoningVLA):
                 extra[text_tokens] = np.array(extra[text_tokens]).reshape(
                     [input_ids.shape[0], num_traj_sets, num_traj_samples]
                 )
+            torch.cuda.synchronize()
+            extra["timing"] = {
+                "encode_time_ms": _ev[0].elapsed_time(_ev[1]),
+                "prefill_time_ms": _ev[1].elapsed_time(_ev[2]),
+                "decode_time_ms": _ev[2].elapsed_time(_ev[3]),
+                "action_time_ms": _ev[3].elapsed_time(_ev[4]),
+                "total_time_ms": _ev[0].elapsed_time(_ev[4]),
+                "num_decode_tokens": num_decode_tokens,
+            }
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
 

@@ -779,3 +779,29 @@ def fuse_expert_projections(model, mode: str = "streaming"):
                     new_mlp.gate_up_proj.bias[g_s:].copy_(mlp.up_proj.bias)
             layer.mlp = new_mlp.to(device=device, dtype=dtype)
             n_mlp += 1
+
+
+def patch_for_baseline(model: nn.Module) -> None:
+    """Patch model for baseline inference."""
+    _PATCHED_CLASSES = {
+        "Qwen3VLVisionPatchEmbed": Qwen3VLVisionPatchEmbed,
+    }
+
+    modules_to_replace = []
+    for module_path, module in model.named_modules():
+        class_name = type(module).__name__
+        if class_name in _PATCHED_CLASSES:
+            # Skip if already patched
+            if type(module) is _PATCHED_CLASSES[class_name]:
+                continue
+            modules_to_replace.append((module_path, module, _PATCHED_CLASSES[class_name]))
+
+    for module_path, module, patched_class in modules_to_replace:
+        _replace_module(model, module_path, module, patched_class)
+
+
+# Apply at import time: replace Conv3d-based patch_embed with Linear version globally.
+# This ensures from_pretrained works with finetuned checkpoints (which store 2D Linear
+# weights after patch_for_* was applied during training). The convert_conv3d_weights
+# hook in Qwen3VLVisionPatchEmbed handles both 5D (old base) and 2D (finetuned) ckpts.
+qwen3vl.Qwen3VLVisionPatchEmbed = Qwen3VLVisionPatchEmbed
