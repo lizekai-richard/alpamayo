@@ -391,6 +391,65 @@ def load_paroquant_model(
     return model
 
 
+def load_paroquant_model_v1p5(
+    model_path: str,
+    paro_checkpoint: str,
+    *,
+    mode: str = "streaming",
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda"
+):
+    from alpamayo_r1.models.alpamayo_r1p5_flashdrive import Alpamayo1_5FlashDrive
+    from alpamayo_r1.utils import patch_for_torch_compile
+
+    model = Alpamayo1_5FlashDrive.from_pretrained(model_path, dtype=dtype)
+    patch_for_torch_compile(model, mode=mode, fuse_qkv=False, fuse_gate_up=False)
+    model._patched_for_compile = True
+
+    replace_linears_with_rotate_linear(model, target="vlm", init_only=True)
+    paro_sd = torch.load(paro_checkpoint, map_location="cpu", weights_only=True)
+
+    missing, unexpected = model.load_state_dict(paro_sd, strict=False)
+    if missing:
+        quant_missing = [k for k in missing if any(
+            s in k for s in ("qlinear", "rotation", "qweight", "scales", "scaled_zeros")
+        )]
+        logger.warning(f"Missing keys ({len(missing)} total, {len(quant_missing)} quant-related)")
+        if quant_missing:
+            logger.warning(f"  CRITICAL quant missing: {quant_missing[:10]}")
+        else:
+            logger.info(f"  Missing (non-quant): {missing[:5]}...")
+    if unexpected:
+        logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:20]}")
+    del paro_sd
+
+    n_zero_scales = 0
+    for name, param in model.named_parameters():
+        if "scales" in name and param.numel() > 0:
+            if torch.all(param == 0):
+                n_zero_scales += 1
+                if n_zero_scales <= 3:
+                    logger.warning(f"  ZERO scales: {name} shape={param.shape}")
+    for name, buf in model.named_buffers():
+        if "scales" in name and buf.numel() > 0:
+            if torch.all(buf == 0):
+                n_zero_scales += 1
+                if n_zero_scales <= 3:
+                    logger.warning(f"  ZERO scales (buffer): {name} shape={buf.shape}")
+    if n_zero_scales > 0:
+        logger.error(f"CRITICAL: {n_zero_scales} layers have zero scales — checkpoint keys likely mismatched!")
+    else:
+        logger.info("All scales are non-zero (checkpoint loaded correctly)")
+
+    _sanitise_channel_scales(model)
+    _wrap_rotate_linears(model, target="vlm")
+
+    model = model.to(device)
+    model.eval()
+
+    return model
+
+
 def convert_model_to_marlin_w4a8(model):
     n = 0
     for name, mod in model.named_modules():
@@ -455,6 +514,70 @@ def load_paroquant_pretrained(
     import paroquant_kernels as _pq_kernels  # noqa: F401 — registers rotation ops
 
     model = FlashDriveAlpamayoR1.from_pretrained(base_model_path, dtype=dtype)
+    patch_for_torch_compile(model, mode=mode, fuse_qkv=False, fuse_gate_up=False)
+    replace_linears_with_rotate_linear(model, target="vlm", init_only=True)
+
+    n_marlin = 0
+    for _, mod in model.named_modules():
+        if isinstance(mod, RotateLinearInt4) and isinstance(mod.qlinear, WQLinear):
+            wq = mod.qlinear
+            mod.qlinear = MarlinW4A8Linear(wq.in_features, wq.out_features, wq.group_size)
+            n_marlin += 1
+
+    _wrap_rotate_linears(model, target="vlm")
+    model._patched_for_compile = True
+
+    save_dir = Path(save_path)
+    if not save_dir.is_dir():
+        from huggingface_hub import snapshot_download
+        save_dir = Path(snapshot_download(save_path))
+    safetensor_files = sorted(save_dir.glob("model*.safetensors"))
+    if safetensor_files:
+        from safetensors.torch import load_file
+        sd = {}
+        for f in safetensor_files:
+            sd.update(load_file(str(f), device="cpu"))
+    else:
+        pt_file = save_dir / "pytorch_model.bin"
+        sd = torch.load(str(pt_file), map_location="cpu", weights_only=True)
+
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing:
+        quant_missing = [k for k in missing if "qlinear" in k or "rotation" in k]
+        if quant_missing:
+            logger.warning(f"Missing quantization keys ({len(quant_missing)}): {quant_missing[:5]}")
+        else:
+            logger.info(f"Missing keys ({len(missing)}, all non-quant — OK)")
+    if unexpected:
+        logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+    del sd
+
+    model = model.to(device)
+    model.eval()
+    return model
+
+
+def load_paroquant_pretrained_v1p5(
+    save_path: str,
+    base_model_path: str,
+    *,
+    mode: str = "streaming",
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> nn.Module:
+    """Load a saved W4A8 model (Alpamayo v1.5).
+
+    Same as load_paroquant_pretrained but uses Alpamayo1_5FlashDrive.
+    """
+    from pathlib import Path
+
+    from alpamayo_r1.models.alpamayo_r1p5_flashdrive import Alpamayo1_5FlashDrive
+    from alpamayo_r1.utils import patch_for_torch_compile
+    from .rotation_linear import RotateLinearInt4
+    from .qmodule import WQLinear
+    import paroquant_kernels as _pq_kernels  # noqa: F401 — registers rotation ops
+
+    model = Alpamayo1_5FlashDrive.from_pretrained(base_model_path, dtype=dtype)
     patch_for_torch_compile(model, mode=mode, fuse_qkv=False, fuse_gate_up=False)
     replace_linears_with_rotate_linear(model, target="vlm", init_only=True)
 

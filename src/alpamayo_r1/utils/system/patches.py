@@ -722,10 +722,6 @@ def patch_for_torch_compile(
             # Skip if already patched
             if type(module) is _PATCHED_CLASSES[class_name]:
                 continue
-            if not fuse_qkv and class_name == "Qwen3VLTextAttention":
-                continue
-            if not fuse_gate_up and class_name == "Qwen3VLTextMLP":
-                continue
             modules_to_replace.append((module_path, module, _PATCHED_CLASSES[class_name]))
 
     for module_path, module, patched_class in modules_to_replace:

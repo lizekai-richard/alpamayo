@@ -9,11 +9,6 @@ def _fake_kernel(x, idx_ij, theta, scales, group_size):
     return torch.empty_like(x)
 
 
-@torch.library.register_fake("rotation::cute_rotate")
-def _fake_cute_kernel(x, rotate_params, scales, krot):
-    return torch.empty_like(x)
-
-
 @torch.library.register_fake("rotation::rotate_and_quant")
 def _fake_fused_kernel(x, idx_ij, theta, scales, sf_scale, group_size):
     # Calculate output dimensions for quantized data

@@ -1,4 +1,5 @@
 import torch, torch.nn as nn
+import paroquant_kernels # noqa: F401
 from .qmodule import WQLinear
 from .rotation_utils import rotate_tensor, quantizer
 from .quantization_utils import pseudo_quantize_tensor

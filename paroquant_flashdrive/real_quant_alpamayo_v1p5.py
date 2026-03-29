@@ -27,6 +27,8 @@ import sys
 from pathlib import Path
 
 import torch
+import alpamayo_r1
+sys.modules["alpamayo1_5"] = alpamayo_r1
 
 # paroquant-ref/ contains the upstream ParoQuant library
 sys.path.append(str(Path(__file__).resolve().parent.parent / "paroquant"))
@@ -53,10 +55,10 @@ def main():
                         help="Output .pt checkpoint path")
     args = parser.parse_args()
 
-    from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+    from alpamayo_r1.models.alpamayo_r1p5 import Alpamayo1_5
 
-    log.info(f"Loading base AlpamayoR1 from {args.model}...")
-    model = AlpamayoR1.from_pretrained(args.model, dtype=torch.float16)
+    log.info(f"Loading base Alpamayo1_5 from {args.model}...")
+    model = Alpamayo1_5.from_pretrained(args.model, dtype=torch.float16)
 
     # Replace VLM language model linears
     log.info(f"Replacing VLM linears from {args.vlm_result_dir}...")
