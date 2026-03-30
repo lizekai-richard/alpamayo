@@ -173,7 +173,7 @@ class MarlinW4A8Linear(nn.Module):
         self.register_buffer("g_idx", torch.empty(0, dtype=torch.int32))
         self.register_buffer("g_idx_sort_indices", torch.empty(0, dtype=torch.int32))
         self.register_buffer("input_global_scale", torch.ones(1, dtype=torch.float32))
-        self.bias = None
+        self.register_buffer("bias", None)
 
     def load_from_awq(self, awq_qweight, awq_scales, awq_qzeros, bias=None):
         """AWQ int32 buffers → Marlin W4A8 format (on same device as inputs)."""

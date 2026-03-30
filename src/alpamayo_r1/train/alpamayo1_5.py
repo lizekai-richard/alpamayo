@@ -839,7 +839,14 @@ class Alpamayo1_5(ReasoningVLA):
                 output_ids = torch.cat([output_ids, next_token.unsqueeze(-1)], dim=-1)
                 unfinished = unfinished & (next_token != self.traj_start_token_id)
                 if not unfinished.any():
+                    self._decode(
+                        input_ids=next_token.unsqueeze(-1),
+                        position_ids=self._cached_position_ids,
+                        cache_position=torch.tensor([cur_pos], device=device),
+                    )
+                    cur_pos += 1
                     break
+                
                 logits = self._decode(
                     input_ids=next_token.unsqueeze(-1),
                     position_ids=self._cached_position_ids,
@@ -1022,6 +1029,12 @@ class Alpamayo1_5(ReasoningVLA):
 
             unfinished = unfinished & (next_token != self.traj_start_token_id)
             if not unfinished.any():
+                self._decode(
+                    input_ids=next_token.unsqueeze(-1),
+                    position_ids=self._cached_position_ids,
+                    cache_position=torch.tensor([cur_pos], device=device),
+                )
+                cur_pos += 1
                 break
 
             logits = self._decode(
