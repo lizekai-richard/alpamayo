@@ -1276,8 +1276,8 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             # Keeps target_hidden at fixed (1, context_len, D) for _dflash_draft static buffers.
             context_len = target_hidden.shape[1]
             n_accepted = acceptance_length + 1
-            accepted_hidden = verify_context[:, :n_accepted, :]
-            if n_accepted >= context_len:
+            accepted_hidden = verify_context[:, :n_accepted, :].clone()
+            if n_accepted > context_len:
                 # Accepted more tokens than context window — just take the last context_len
                 target_hidden = accepted_hidden[:, -context_len:, :]
             else:

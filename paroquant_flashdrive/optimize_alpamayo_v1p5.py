@@ -47,6 +47,10 @@ from pathlib import Path
 import json
 from typing import Literal, Optional
 import sys
+import types
+# Block paroquant_kernels from loading — its rotation TORCH_LIBRARY conflicts
+# with the paroquant package's own rotation ops used during optimization.
+sys.modules["paroquant_kernels"] = types.ModuleType("paroquant_kernels")
 import alpamayo_r1
 sys.modules["alpamayo1_5"] = alpamayo_r1
 
