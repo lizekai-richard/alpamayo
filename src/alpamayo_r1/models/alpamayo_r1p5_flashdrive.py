@@ -138,7 +138,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         self.traj_and_text_ids_range = None
         self.is_first_prefill = True
     
-    def reset_streaming_state(self, keep_frame_labels: bool = True, kv_shift_mode: str = "block"):
+    def reset_streaming_state(self, keep_frame_labels: bool = False, kv_shift_mode: str = "vision_only"):
         """Reset all streaming state between clips."""
         self._past_key_values = None
         self._cached_position_ids = None
@@ -151,7 +151,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         self.is_first_prefill = True
         self.keep_frame_labels = keep_frame_labels
         self.kv_shift_mode = kv_shift_mode
-        assert self.kv_shift_mode in ["block", "vision_only"], "Invalid kv_shift_mode"
+        assert self.kv_shift_mode in ["vision_only", "block"], "Invalid kv_shift_mode"
 
         if hasattr(self.vlm.model.visual, "_cached_pos_embeds"):
             delattr(self.vlm.model.visual, "_cached_pos_embeds")
@@ -627,25 +627,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             (logits, context) where logits is (vocab_size,) and context is
             (1, 1, hidden_dim * num_capture_layers).
         """
-        needs_reinit = not hasattr(self, "_dflash_prefill_fn")
-        if not needs_reinit and (
-            self._dp_inputs_embeds.shape != inputs_embeds.shape
-            or self._dp_cache_position.shape != cache_position.shape
-            or any(
-                b.shape != e.shape
-                for b, e in zip(self._dp_deepstack_embeds, deepstack_image_embeds)
-            )
-        ):
-            logger.warning(
-                f"_dflash_prefill: shape changed (embeds {self._dp_inputs_embeds.shape} -> {inputs_embeds.shape}, "
-                f"cache_pos {self._dp_cache_position.shape} -> {cache_position.shape}), reinitializing buffers"
-            )
-            for attr in ("_dflash_prefill_fn", "_compiled_dflash_prefill_fn"):
-                if hasattr(self, attr):
-                    delattr(self, attr)
-            needs_reinit = True
-
-        if needs_reinit:
+        if not hasattr(self, "_dflash_prefill_fn"):
             self._dp_inputs_embeds = torch.empty_like(inputs_embeds)
             self._dp_position_ids = torch.empty_like(position_ids)
             self._dp_cache_position = torch.empty_like(cache_position)
@@ -1292,12 +1274,17 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
             # Slide the context buffer: drop oldest, append newly accepted hidden states.
             # Keeps target_hidden at fixed (1, context_len, D) for _dflash_draft static buffers.
+            context_len = target_hidden.shape[1]
             n_accepted = acceptance_length + 1
             accepted_hidden = verify_context[:, :n_accepted, :]
-            target_hidden = torch.cat([
-                target_hidden[:, n_accepted:, :],
-                accepted_hidden,
-            ], dim=1)
+            if n_accepted >= context_len:
+                # Accepted more tokens than context window — just take the last context_len
+                target_hidden = accepted_hidden[:, -context_len:, :]
+            else:
+                target_hidden = torch.cat([
+                    target_hidden[:, n_accepted:, :],
+                    accepted_hidden,
+                ], dim=1)
 
         # Cleanup output: remove mask tokens, trim to max_length
         output_ids = output_ids[:, :max_length]
