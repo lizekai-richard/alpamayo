@@ -304,16 +304,16 @@ def aggregate_results_across_ranks(
 
 def main():
     ap = argparse.ArgumentParser(description="System-opt eval (non-streaming, torch.compile)")
-    ap.add_argument("--model-path", default="nvidia/Alpamayo-1.5-10B")
+    ap.add_argument("--model-path", default="/root/Alpamayo-1.5-10B")
     ap.add_argument("--clip-ids-file", default="./clips.json")
     ap.add_argument("--num-clips", type=int, default=100)
-    ap.add_argument("--num-traj-samples", type=int, default=6,
+    ap.add_argument("--num-traj-samples", type=int, default=1,
                      help="K for minADE_K (default 6)")
     ap.add_argument("--warmup-steps", type=int, default=3,
                      help="First N steps excluded from metrics")
     ap.add_argument("--output-dir", default="./eval_baseline_results_v1p5")
-    ap.add_argument("--cache-dir", default="/data/scratch/zekaili/hf_cache")
-    ap.add_argument("--dumped-data-dir", default="/data/scratch/zekaili/dumped_eval_data_v1p5")
+    ap.add_argument("--cache-dir", default="~/.cache/huggingface")
+    ap.add_argument("--dumped-data-dir", default="/root/dumped_eval_data_v1p5")
     args = ap.parse_args()
 
     for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir", "dumped_data_dir"):
