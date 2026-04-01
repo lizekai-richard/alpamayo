@@ -36,7 +36,7 @@ sys.modules["alpamayo1_5"] = alpamayo_r1
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from alpamayo_r1.models.alpamayo_r1p5_dit_cache import Alpamayo1_5
+from alpamayo_r1.models.alpamayo_r1p5_flashdrive import Alpamayo1_5FlashDrive
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
 from alpamayo_r1 import helper
 
@@ -249,7 +249,7 @@ def aggregate_results_across_ranks(
             total_steps += len(samples)
             log.info(f"Loaded results from {rank_file.name}: {len(samples)} samples")
         except Exception as e:
-            log.warning(f"Error loading {rank_file}: {e}")
+            log.warning(f"Error loading {rank_file}: {e}", exc_info=True)
             continue
 
     if not all_samples:
@@ -307,13 +307,13 @@ def main():
     ap.add_argument("--model-path", default="nvidia/Alpamayo-1.5-10B")
     ap.add_argument("--clip-ids-file", default="./clips.json")
     ap.add_argument("--num-clips", type=int, default=100)
-    ap.add_argument("--num-traj-samples", type=int, default=6,
+    ap.add_argument("--num-traj-samples", type=int, default=1,
                      help="K for minADE_K (default 6)")
     ap.add_argument("--warmup-steps", type=int, default=3,
                      help="First N steps excluded from metrics")
-    ap.add_argument("--output-dir", default="./system_opt_results_v1p5")
-    ap.add_argument("--cache-dir", default="/data/scratch/zekaili/hf_cache")
-    ap.add_argument("--dumped-data-dir", default="/data/scratch/zekaili/dumped_eval_data_v1p5")
+    ap.add_argument("--output-dir", default="./eval_system_opt_results_v1p5")
+    ap.add_argument("--cache-dir", default="~/.cache/huggingface")
+    ap.add_argument("--dumped-data-dir", default="/root/dumped_eval_data_v1p5")
     args = ap.parse_args()
 
     for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir", "dumped_data_dir"):
@@ -365,7 +365,7 @@ def main():
         return
 
     # --- model (dev branch: torch.compile + static cache, non-streaming) ---
-    model = Alpamayo1_5.from_pretrained(
+    model = Alpamayo1_5FlashDrive.from_pretrained(
         args.model_path, dtype=torch.bfloat16,
     ).to(device)
     processor = helper.get_processor(model.tokenizer)
@@ -398,14 +398,16 @@ def main():
         for si, (t0, inputs) in enumerate(zip(t0s, clip_inputs)):
             try:
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    result = model.sample_trajectories_from_data_with_vlm_rollout(
+                    result = model.sample_trajectories_from_flashdrive(
                         data=helper.to_device(inputs, device),
+                        streaming=False,
+                        dflash=False,
                         num_traj_samples=args.num_traj_samples,
-                        max_generation_length=128,
+                        max_new_tokens=128,
+                        torch_compile="max-autotune",
                         return_extra=True,
                         fuse_qkv=True,
                         fuse_gate_up=True,
-                        torch_compile="max-autotune",
                     )
 
                 pred_xyz, pred_rot, extra = result
@@ -450,7 +452,7 @@ def main():
                     })
 
             except Exception as e:
-                log.warning(f"  Step {si} error: {e}")
+                log.warning(f"  Step {si} error: {e}", exc_info=True)
                 if "CUDA" in str(e):
                     raise SystemExit(1)
 

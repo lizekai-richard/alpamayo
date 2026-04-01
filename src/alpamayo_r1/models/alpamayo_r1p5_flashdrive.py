@@ -569,7 +569,10 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             self._prefill_cache_position = torch.empty_like(cache_position)
             self._prefill_visual_pos_masks = torch.empty_like(visual_pos_masks)
             self._prefill_deepstack_embeds = [torch.empty_like(e) for e in deepstack_image_embeds]
-            self._prefill_streaming_attention_mask = torch.empty_like(streaming_attention_mask)
+            if streaming_attention_mask is not None:
+                self._prefill_streaming_attention_mask = torch.empty_like(streaming_attention_mask)
+            else:
+                self._prefill_streaming_attention_mask = None
 
             def prefill_fn():
                 hidden = self.vlm.model.language_model(
@@ -590,7 +593,10 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         self._prefill_position_ids.copy_(position_ids)
         self._prefill_cache_position.copy_(cache_position)
         self._prefill_visual_pos_masks.copy_(visual_pos_masks)
-        self._prefill_streaming_attention_mask.copy_(streaming_attention_mask)
+
+        if streaming_attention_mask is not None:
+            self._prefill_streaming_attention_mask.copy_(streaming_attention_mask)
+        
         for buf, emb in zip(self._prefill_deepstack_embeds, deepstack_image_embeds):
             buf.copy_(emb)
         
@@ -1274,6 +1280,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
             # Slide the context buffer: drop oldest, append newly accepted hidden states.
             # Keeps target_hidden at fixed (1, context_len, D) for _dflash_draft static buffers.
+            # Clone verify_context to detach from CUDAGraph output buffer before next iteration.
             context_len = target_hidden.shape[1]
             n_accepted = acceptance_length + 1
             accepted_hidden = verify_context[:, :n_accepted, :].clone()
@@ -1591,7 +1598,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         """Non-streaming mode: normal non-streaming inference."""
         self._torch_compile = torch_compile
         if torch_compile and not hasattr(self, "_patched_for_compile"):
-            patch_for_torch_compile(self, mode="non-streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+            patch_for_torch_compile(self, mode="non_streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
             self._patched_for_compile = True
 
         # Extract inputs
@@ -1621,7 +1628,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
         # Initialize KV cache on first call
         self.max_cache_len = seq_len + max_new_tokens + self.num_action_tokens
-        if self._past_key_values is None:
+        if not hasattr(self, "_past_key_values") or self._past_key_values is None:
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
                 max_cache_len=self.max_cache_len,
@@ -1810,7 +1817,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
             # Initialize KV cache on first call
             self.max_cache_len = self.prefill_seq_length + max_new_tokens + block_size + self.num_action_tokens
 
-        if self._past_key_values is None:
+        if not hasattr(self, "_past_key_values") or self._past_key_values is None:
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
                 max_cache_len=self.max_cache_len,
@@ -2035,13 +2042,13 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
 
         # Initialize KV cache (includes space for action tokens)
         cache_len = seq_len + max_new_tokens + block_size + self.num_action_tokens
-        if not hasattr(self, "_past_key_values"):
+        if not hasattr(self, "_past_key_values") or self._past_key_values is None:
             self._past_key_values = StaticCache(
                 config=self.vlm.config,
                 max_cache_len=cache_len,
                 max_batch_size=num_samples * batch_size,
             )
-        self._past_key_values.reset()
+            self._past_key_values.reset()
 
         # Timing events (async, no pipeline stall)
         _ev = [torch.cuda.Event(enable_timing=True) for _ in range(6)]
