@@ -1316,7 +1316,7 @@ def load_dflash_draft_model(
     if str(dflash_path) not in sys.path:
         sys.path.insert(0, str(dflash_path))
 
-    from alpamayo_r1.dflash_model import DFlashDraftModel
+    from alpamayo_r1.utils.dflash.dflash import DFlashDraftModel
 
     logger.info(f"Loading DFlash draft model from {draft_model_name_or_path}")
 
