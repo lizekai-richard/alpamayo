@@ -593,7 +593,10 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         self._prefill_position_ids.copy_(position_ids)
         self._prefill_cache_position.copy_(cache_position)
         self._prefill_visual_pos_masks.copy_(visual_pos_masks)
-        self._prefill_streaming_attention_mask.copy_(streaming_attention_mask)
+
+        if streaming_attention_mask is not None:
+            self._prefill_streaming_attention_mask.copy_(streaming_attention_mask)
+        
         for buf, emb in zip(self._prefill_deepstack_embeds, deepstack_image_embeds):
             buf.copy_(emb)
         
@@ -1595,7 +1598,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         """Non-streaming mode: normal non-streaming inference."""
         self._torch_compile = torch_compile
         if torch_compile and not hasattr(self, "_patched_for_compile"):
-            patch_for_torch_compile(self, mode="non-streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
+            patch_for_torch_compile(self, mode="non_streaming", fuse_qkv=fuse_qkv, fuse_gate_up=fuse_gate_up)
             self._patched_for_compile = True
 
         # Extract inputs
@@ -1632,7 +1635,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
                 max_batch_size=num_samples * batch_size,
                 offloading=False,
             )
-            self._past_key_values.reset()
+        self._past_key_values.reset()
 
         # Compute position_ids
         position_ids, rope_deltas = self.vlm.model.get_rope_index(input_ids, image_grid_thw)
