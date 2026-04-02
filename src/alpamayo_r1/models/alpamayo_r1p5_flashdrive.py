@@ -1522,7 +1522,10 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         num_samples = num_traj_samples * num_traj_sets
 
         # Note: we must add back the truncated input length in the streaming step.
-        action_start_pos = self.prefill_seq_length + (traj_start_pos - streaming_input_len) + 1
+        if not self.is_first_prefill:
+            action_start_pos = self.prefill_seq_length + (traj_start_pos - streaming_input_len) + 1
+        else:
+            action_start_pos = traj_start_pos + 1
 
         # Build attention mask
         indices = torch.arange(self._past_key_values.max_cache_len, device=device).expand(num_samples, -1)
@@ -1559,6 +1562,7 @@ class Alpamayo1_5FlashDrive(ReasoningVLA):
         )
 
         # Update streaming state
+        self._crop_static_cache(self.prefill_seq_length)
         self._update_past_key_values()
 
         if kwargs.get("return_extra", False):
