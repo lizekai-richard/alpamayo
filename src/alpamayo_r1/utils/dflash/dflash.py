@@ -162,7 +162,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.block_size = config.block_size
+        self.block_size = getattr(config, "block_size", 8)
+        self.context_len = getattr(config, "context_len", 1)
         self.post_init()
 
     def forward(
