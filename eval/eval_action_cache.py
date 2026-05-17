@@ -154,7 +154,7 @@ def split_clips_for_rank(clip_ids, rank, world_size):
 
 
 def load_inputs(clip_id, dumped_data_dir):
-    """Load dumped inputs or create them from scratch."""
+    """Load non-streaming timestep windows from disk (no convert_to_streaming_window)."""
     num_steps = 120
     log.info("Loading dumped inputs from %s for clip %s", dumped_data_dir, clip_id)
     windows = helper.load_dumped_inputs(dumped_data_dir, clip_id)
@@ -315,7 +315,11 @@ def main():
                      help="First N steps excluded from metrics")
     ap.add_argument("--output-dir", default="./action_cache_results")
     ap.add_argument("--cache-dir", default="/data/scratch/zekaili/hf_cache")
-    ap.add_argument("--dumped-data-dir", default="/data/scratch/zekaili/dumped_eval_data")
+    ap.add_argument(
+        "--dumped-data-dir",
+        default="",
+        help="If set, load dumped non-streaming windows. If empty, build from physical_ai_av.",
+    )
     args = ap.parse_args()
 
     for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir", "dumped_data_dir"):
@@ -391,12 +395,15 @@ def main():
         log.info(f"  Creating inputs for {len(t0s)} timesteps...")
         clip_inputs = []
         try:
-            # for t0 in t0s:
-            #     data = load_physical_aiavdataset(
-            #         clip_id, t0_us=t0, num_frames=4, avdi=avdi,
-            #     )
-            #     clip_inputs.append(prepare_inputs(data, processor))
-            clip_inputs = load_inputs(clip_id, args.dumped_data_dir)
+            if args.dumped_data_dir:
+                clip_inputs = load_inputs(clip_id, args.dumped_data_dir)
+            else:
+                clip_inputs = []
+                for t0 in t0s:
+                    data = load_physical_aiavdataset(
+                        clip_id, t0_us=t0, num_frames=4, avdi=avdi,
+                    )
+                    clip_inputs.append(prepare_inputs(data, processor))
         except Exception as e:
             log.warning(f"  Error creating inputs: {e}")
             continue

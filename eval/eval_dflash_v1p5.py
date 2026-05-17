@@ -280,11 +280,11 @@ def aggregate_results_across_ranks(
 def main():
     ap = argparse.ArgumentParser(description="DFlash + system-opt eval (non-streaming, torch.compile + speculative decoding)")
     ap.add_argument("--model-path", default="nvidia/Alpamayo-1.5-10B")
-    ap.add_argument("--draft-model", default="/home/zekaili/Alpamayo1_5-DFlash",
+    ap.add_argument("--draft-model", default="/data/scratch/zekaili/Alpamayo1_5-DFlash-B16",
                      help="Path to DFlash draft model")
     ap.add_argument("--clip-ids-file", default="./clips.json")
     ap.add_argument("--num-clips", type=int, default=100)
-    ap.add_argument("--num-traj-samples", type=int, default=6,
+    ap.add_argument("--num-traj-samples", type=int, default=1,
                      help="K for minADE_K (default 6)")
     ap.add_argument("--max-tokens", type=int, default=128,
                      help="Max CoC tokens to generate")

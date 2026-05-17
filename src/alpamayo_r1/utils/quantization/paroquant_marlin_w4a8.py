@@ -340,10 +340,10 @@ def load_paroquant_model(
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda"
 ):
-    from alpamayo_r1.models.alpamayo_r1 import FlashDriveAlpamayoR1
+    from alpamayo_r1.models.alpamayo_r1_flashdrive import AlpamayoR1FlashDrive
     from alpamayo_r1.utils.system import patch_for_torch_compile
 
-    model = FlashDriveAlpamayoR1.from_pretrained(model_path, dtype=dtype)
+    model = AlpamayoR1FlashDrive.from_pretrained(model_path, dtype=dtype)
     patch_for_torch_compile(model, mode=mode, fuse_qkv=False, fuse_gate_up=False)
     model._patched_for_compile = True
 

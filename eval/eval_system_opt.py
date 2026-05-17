@@ -10,6 +10,9 @@ Usage:
     python eval/eval_system_opt.py
     python eval/eval_system_opt.py --num-clips 10 --diffusion-steps 5
     python eval/eval_system_opt.py --num-traj-samples 1
+
+    # Non-streaming dumped windows (no convert_to_streaming_window):
+    python eval/eval_system_opt.py --dumped-data-dir /path/to/dumped_eval_data --clip-ids-file ./clips.json
 """
 
 import argparse
@@ -96,6 +99,13 @@ def validate_clip(clip_id, avdi):
     return True
 
 
+def load_dumped_timestep_inputs(clip_id: str, dumped_data_dir: str, num_steps: int) -> list:
+    """One full-window dict per timestep for non-streaming eval (no streaming conversion)."""
+    log.info("Loading dumped inputs from %s for clip %s", dumped_data_dir, clip_id)
+    windows = helper.load_dumped_inputs(dumped_data_dir, clip_id)
+    return windows[:num_steps]
+
+
 def main():
     ap = argparse.ArgumentParser(description="System-opt eval (non-streaming, torch.compile)")
     ap.add_argument("--model-path", default="/data/scratch/zekaili/Alpamayo-R1-10B")
@@ -108,9 +118,14 @@ def main():
                      help="First N steps excluded from metrics")
     ap.add_argument("--output-dir", default="~/exp/eval_results")
     ap.add_argument("--cache-dir", default="/data/scratch/zekaili/physicalai_av/hf_cache")
+    ap.add_argument(
+        "--dumped-data-dir",
+        default="",
+        help="If set, load clip_id/sliding_window_inputs.pt (full windows per timestep).",
+    )
     args = ap.parse_args()
 
-    for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir"):
+    for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir", "dumped_data_dir"):
         setattr(args, attr, os.path.expanduser(getattr(args, attr)))
 
     run_dir = args.output_dir
@@ -151,11 +166,16 @@ def main():
         log.info(f"  Creating inputs for {len(t0s)} timesteps...")
         clip_inputs = []
         try:
-            for t0 in t0s:
-                data = load_physical_aiavdataset(
-                    clip_id, t0_us=t0, num_frames=4, avdi=avdi,
+            if args.dumped_data_dir:
+                clip_inputs = load_dumped_timestep_inputs(
+                    clip_id, args.dumped_data_dir, len(t0s),
                 )
-                clip_inputs.append(prepare_inputs(data, processor))
+            else:
+                for t0 in t0s:
+                    data = load_physical_aiavdataset(
+                        clip_id, t0_us=t0, num_frames=4, avdi=avdi,
+                    )
+                    clip_inputs.append(prepare_inputs(data, processor))
         except Exception as e:
             log.warning(f"  Error creating inputs: {e}")
             continue

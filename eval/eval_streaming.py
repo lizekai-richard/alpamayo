@@ -11,6 +11,9 @@ Usage:
     python eval/eval_streaming.py
     python eval/eval_streaming.py --num-clips 10 --diffusion-steps 5
     python eval/eval_streaming.py --num-traj-samples 1
+
+    # Dumped sliding_window_inputs (R1: streaming steps use helper.convert_to_streaming_window)
+    python eval/eval_streaming.py --dumped-data-dir /path/to/dumped_eval_data --clip-ids-file ./clips.json
 """
 
 import argparse
@@ -67,12 +70,38 @@ def prepare_inputs(data, processor, is_prefill=False):
     }
 
 
-def create_streaming_inputs(processor, clip_id, avdi):
-    """Create sliding-window streaming inputs for one clip.
+def create_or_load_streaming_inputs(args, tokenizer, processor, clip_id, avdi):
+    """Sliding-window streaming inputs for one clip.
 
-    Window 0 (prefill): 4 cameras x 4 frames = 16 frames
-    Window 1+ (streaming): 4 cameras x 1 new frame = 4 frames
+    If ``args.dumped_data_dir`` is set: load dumped windows and apply
+    ``helper.convert_to_streaming_window`` for steps after prefill (R1).
+
+    Otherwise build inputs from physical_ai_av (live dataset).
     """
+    if args.dumped_data_dir:
+        windows = helper.load_dumped_inputs(args.dumped_data_dir, clip_id)
+        vs_id = tokenizer.encode("<|vision_start|>")[0]
+        ve_id = tokenizer.encode("<|vision_end|>")[0]
+        streaming_inputs = []
+        for i, w in enumerate(windows):
+            if i == 0:
+                streaming_inputs.append({
+                    "tokenized_data": w["tokenized_data"],
+                    "ego_history_xyz": w["ego_history_xyz"],
+                    "ego_history_rot": w["ego_history_rot"],
+                    "is_prefill": True,
+                })
+            else:
+                streaming_inputs.append(
+                    helper.convert_to_streaming_window(w, vs_id, ve_id),
+                )
+        if len(streaming_inputs) > 1:
+            log.info(
+                "Streaming input data shape: %s",
+                streaming_inputs[1]["tokenized_data"]["input_ids"].shape,
+            )
+        return streaming_inputs
+
     all_t0s = list(range(T0_START_US, T0_END_US + 1, STEP_US))
     streaming_inputs = []
 
@@ -170,9 +199,15 @@ def main():
                      help="First N streaming steps per clip excluded from metrics (on top of prefill)")
     ap.add_argument("--output-dir", default="~/exp/eval_results")
     ap.add_argument("--cache-dir", default="/data/scratch/zekaili/physicalai_av/hf_cache")
+    ap.add_argument(
+        "--dumped-data-dir",
+        default="",
+        help="If set, load clip_id/sliding_window_inputs.pt from here; streaming steps use "
+        "helper.convert_to_streaming_window (Alpamayo-R1).",
+    )
     args = ap.parse_args()
 
-    for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir"):
+    for attr in ("model_path", "clip_ids_file", "output_dir", "cache_dir", "dumped_data_dir"):
         setattr(args, attr, os.path.expanduser(getattr(args, attr)))
 
     run_dir = args.output_dir
@@ -192,7 +227,8 @@ def main():
     model = AlpamayoR1FlashDrive.from_pretrained(
         args.model_path, dtype=torch.bfloat16,
     ).to("cuda")
-    processor = helper.get_processor(model.tokenizer)
+    tokenizer = model.tokenizer
+    processor = helper.get_processor(tokenizer)
     log.info("Streaming eval (no DFlash)")
 
     # --- eval loop ---
@@ -216,7 +252,9 @@ def main():
         # Create streaming inputs (prefill + streaming windows)
         log.info(f"  Creating streaming inputs...")
         try:
-            streaming_inputs = create_streaming_inputs(processor, clip_id, avdi)
+            streaming_inputs = create_or_load_streaming_inputs(
+                args, tokenizer, processor, clip_id, avdi,
+            )
         except Exception as e:
             log.warning(f"  Error creating inputs: {e}")
             continue

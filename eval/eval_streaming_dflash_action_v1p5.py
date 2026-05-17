@@ -362,8 +362,8 @@ def aggregate_dflash_results_across_ranks(
 
 def main():
     ap = argparse.ArgumentParser(description="DFlash + streaming eval (torch.compile + speculative decoding + KV reuse)")
-    ap.add_argument("--model-path", default="/data/scratch/zekaili/Alpamayo1_5-Finetuned")
-    ap.add_argument("--draft-model", default="/home/zekaili/Alpamayo1_5-DFlash",
+    ap.add_argument("--model-path", default="/data/scratch/zekaili/Alpamayo1_5-Finetuned-new")
+    ap.add_argument("--draft-model", default="/data/scratch/zekaili/Alpamayo1_5-DFlash-B16",
                      help="Path to DFlash draft model")
     ap.add_argument("--clip-ids-file", default="./clips.json")
     ap.add_argument("--num-clips", type=int, default=100)
@@ -375,7 +375,7 @@ def main():
     ap.add_argument("--cache-steps", type=int, nargs="+", default=[3, 4, 5, 6])
     ap.add_argument("--warmup-steps", type=int, default=3,
                      help="First N streaming steps per clip excluded from metrics (on top of prefill)")
-    ap.add_argument("--output-dir", default="./eval_streaming_dflash_action_v1p5_results")
+    ap.add_argument("--output-dir", default="./eval_streaming_dflash_action_v1p5_results_b16")
     ap.add_argument("--cache-dir", default="/data/scratch/zekaili/physicalai_av/hf_cache")
     ap.add_argument("--dumped-data-dir", default="/data/scratch/zekaili/dumped_eval_data_v1p5")
     ap.add_argument("--keep-frame-labels", action="store_true", default=False)

@@ -1,6 +1,5 @@
 import torch
 from typing import Optional
-from datasets import load_dataset, Features, Sequence, Value
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     if num_draft_layers == 1:
@@ -35,6 +34,9 @@ def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
 
 def load_and_process_dataset(data_name: str):
+    # `datasets` is an offline-eval dependency; lazy-import so inference paths
+    # (e.g. AlpaSim driver) do not require it.
+    from datasets import load_dataset, Features, Sequence, Value
     # Math datasets
     if data_name == "gsm8k":
         dataset = load_dataset("openai/gsm8k", "main", split="test")

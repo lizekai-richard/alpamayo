@@ -7,10 +7,16 @@ MarlinW4A8Linear (INT4 weight x INT8 activation via vLLM Marlin kernel).
 Supports multi-GPU parallelism: clips are split across ranks via env vars.
 
 Usage:
-    # Single GPU
+    # Single GPU — legacy: each clip folder under --data-dir contains sliding_window_inputs.pt
     python eval/eval_all_paro_w4a8.py
     python eval/eval_all_paro_w4a8.py --num-clips 10
     python eval/eval_all_paro_w4a8.py --quantize-VLM-only
+
+    # Dumped layout (same tree as v1p5): root contains <clip_id>/sliding_window_inputs.pt;
+    # clip list from --clip-ids-file; streaming steps use helper.convert_to_streaming_window (R1).
+    python eval/eval_all_paro_w4a8.py \\
+        --dumped-data-dir /path/to/dumped_eval_data \\
+        --clip-ids-file ./clips.json
 
     # Multi-GPU
     torchrun --nproc_per_node=4 eval/eval_all_paro_w4a8.py --num-clips 100
@@ -159,6 +165,12 @@ def fuse_expert_projections(model, mode: str = "streaming"):
 
 # ─── Eval helpers ─────────────────────────────────────────────
 
+def load_clip_ids(path, num_clips):
+    with open(path) as f:
+        ids = json.load(f)
+    return list(dict.fromkeys(ids))[:num_clips]
+
+
 def load_clip_ids_from_data_dir(data_dir, num_clips):
     clip_ids = sorted(
         d.name for d in Path(data_dir).iterdir()
@@ -170,6 +182,51 @@ def load_clip_ids_from_data_dir(data_dir, num_clips):
 def load_streaming_inputs(data_dir, clip_id):
     return torch.load(Path(data_dir) / clip_id / "sliding_window_inputs.pt",
                       map_location="cpu", weights_only=False)
+
+
+def validate_clip(clip_id, avdi):
+    """Check clip has enough egomotion data for the eval range."""
+    ego = avdi.get_clip_feature(
+        clip_id, avdi.features.LABELS.EGOMOTION, maybe_stream=True,
+    )
+    ego_end = int(ego.timestamps[-1])
+    if ego_end <= T0_END_US + 6_400_000:
+        return False
+    return True
+
+
+def create_or_load_streaming_inputs(args, tokenizer, clip_id):
+    """Sliding-window streaming inputs for one clip.
+
+    - If ``args.dumped_data_dir`` is set: load ``sliding_window_inputs.pt`` from
+      that tree (same layout as v1p5 dump). Streaming steps use
+      ``helper.convert_to_streaming_window`` (R1 / non-v1p5).
+    - Else: load pre-built list from ``args.data_dir/<clip_id>/`` (legacy layout).
+    """
+    if args.dumped_data_dir:
+        windows = helper.load_dumped_inputs(args.dumped_data_dir, clip_id)
+        vs_id = tokenizer.encode("<|vision_start|>")[0]
+        ve_id = tokenizer.encode("<|vision_end|>")[0]
+        streaming_inputs = []
+        for i, w in enumerate(windows):
+            if i == 0:
+                data = {
+                    "tokenized_data": w["tokenized_data"],
+                    "ego_history_xyz": w["ego_history_xyz"],
+                    "ego_history_rot": w["ego_history_rot"],
+                    "is_prefill": True,
+                }
+            else:
+                data = helper.convert_to_streaming_window(w, vs_id, ve_id)
+            streaming_inputs.append(data)
+        if len(streaming_inputs) > 1:
+            log.info(
+                "Streaming input data shape: %s",
+                streaming_inputs[1]["tokenized_data"]["input_ids"].shape,
+            )
+        return streaming_inputs
+
+    return load_streaming_inputs(args.data_dir, clip_id)
 
 
 def calc_min_ade(gt_future_xy, pred_xyz):
@@ -304,6 +361,18 @@ def main():
     ap.add_argument("--paro-checkpoint", default="/data/scratch/zekaili/quant_cache/ckpt-paro-w4-vlm-mm.pt")
     ap.add_argument("--draft-model", default="/data/scratch/zekaili/Alpamayo-DFlash")
     ap.add_argument("--data-dir", default="/data/scratch/zekaili/dumped_eval_data")
+    ap.add_argument(
+        "--dumped-data-dir",
+        default="",
+        help="If set, load dumps from this root (clip_id/sliding_window_inputs.pt) and "
+        "apply R1 convert_to_streaming_window for streaming steps; clip IDs from --clip-ids-file.",
+    )
+    ap.add_argument("--clip-ids-file", default="./clips.json")
+    ap.add_argument(
+        "--cache-dir",
+        default="/data/scratch/zekaili/physicalai_av/hf_cache",
+        help="physical_ai_av cache (used for validate_clip when --dumped-data-dir is set).",
+    )
     ap.add_argument("--num-clips", type=int, default=100)
     ap.add_argument("--num-traj-samples", type=int, default=6)
     ap.add_argument("--max-tokens", type=int, default=128)
@@ -314,7 +383,16 @@ def main():
     ap.add_argument("--output-dir", default="~/exp_paro_w4a8")
     args = ap.parse_args()
 
-    for attr in ("model_path", "paro_checkpoint", "draft_model", "data_dir", "output_dir"):
+    for attr in (
+        "model_path",
+        "paro_checkpoint",
+        "draft_model",
+        "data_dir",
+        "output_dir",
+        "dumped_data_dir",
+        "clip_ids_file",
+        "cache_dir",
+    ):
         setattr(args, attr, os.path.expanduser(getattr(args, attr)))
 
     run_started_at_s = time.time()
@@ -337,7 +415,11 @@ def main():
     with open(os.path.join(run_dir, f"config_rank{rank}.json"), "w") as f:
         json.dump(config, f, indent=2)
 
-    all_clip_ids = load_clip_ids_from_data_dir(args.data_dir, args.num_clips)
+    all_clip_ids = (
+        load_clip_ids(args.clip_ids_file, args.num_clips)
+        if args.dumped_data_dir
+        else load_clip_ids_from_data_dir(args.data_dir, args.num_clips)
+    )
     clip_ids = split_clips_for_rank(all_clip_ids, rank, world_size)
     expected_rank_clip_counts = {
         r: len(split_clips_for_rank(all_clip_ids, r, world_size))
@@ -348,6 +430,12 @@ def main():
     if not clip_ids:
         log.warning(f"Rank {rank}: no clips assigned")
         return
+
+    avdi = None
+    if args.dumped_data_dir:
+        import physical_ai_av
+
+        avdi = physical_ai_av.PhysicalAIAVDatasetInterface(cache_dir=args.cache_dir)
 
     # ── Load model ──
     model = load_paroquant_model(
@@ -368,6 +456,8 @@ def main():
     setup_dflash_for_model(model, args.draft_model)
     log.info("DFlash enabled (ParoQuant W4A8 Marlin, streaming, action_cache)")
 
+    tokenizer = model.tokenizer
+
     # ── Eval loop ──
     all_clip_results, all_clip_ade_k, all_clip_ade_1 = [], [], []
     all_clip_timing, all_clip_dflash = [], []
@@ -377,8 +467,12 @@ def main():
         log.info(f"\n[Rank {rank}] Clip {ci+1}/{len(clip_ids)}: {clip_id}")
         reset_clip_state(model)
 
+        if avdi is not None and not validate_clip(clip_id, avdi):
+            log.warning(f"Clip {clip_id}: too short, skipping")
+            continue
+
         try:
-            streaming_inputs = load_streaming_inputs(args.data_dir, clip_id)
+            streaming_inputs = create_or_load_streaming_inputs(args, tokenizer, clip_id)
         except Exception as e:
             log.warning(f"  Error loading inputs: {e}")
             continue
